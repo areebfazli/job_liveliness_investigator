@@ -182,7 +182,7 @@ from rli.models.decision import Decision
 from rli.models.evidence import EvidenceItem
 from rli.models.policy_inputs import UNKNOWN, PolicyInputs
 from rli.models.probe import ProbeResult
-from rli.models.time import to_utc_z
+from rli.models.time import ensure_aware, now_utc, to_utc_z
 from rli.net import NetClient, NetResult, hash_args
 from rli.policy.action import decide, policy_version
 from rli.policy.explain_stub import reasons_from_inputs
@@ -208,6 +208,8 @@ __all__ = [
     "config_hash",
     "decide_and_finish",
     "open_probe_runner",
+    "open_system_runner",
+    "replay_run_shape",
 ]
 
 SystemName = Literal["A", "B", "C", "C2"]
@@ -753,6 +755,83 @@ class ReplayHook:
     open_runner: Callable[
         [sqlite3.Connection, Config, Run, datetime], AbstractContextManager[ProbeRunner]
     ]
+
+    def config_hash_suffix(self) -> str:
+        """The `runs.config_hash` suffix identifying this replay dataset.
+
+        Appended by each system to whatever `config_hash` it would have
+        written live, so one column answers "which config, which rules,
+        which replay dataset" without a join. Defined here rather than in
+        each system so A, B and any future C cannot spell it differently —
+        `rli.eval.baseline.collect_cases` matches on this exact literal, and
+        `rli.replay.mode.ReplayContext.config_hash_suffix` must produce the
+        same string.
+        """
+        return f"|dataset:{self.dataset_id}"
+
+
+# ---------------------------------------------------------------------------
+# The live/replay seam every system shares
+# ---------------------------------------------------------------------------
+
+
+def replay_run_shape(
+    replay: ReplayHook | None, now: datetime | None, config_hash_live: str
+) -> tuple[datetime, Literal["live", "replay"], str, datetime | None]:
+    """`(clock, runs.mode, runs.config_hash, runs.replay_at)` for one run.
+
+    The four `Run` values that differ between a live run and a replay run,
+    derived in ONE place so System A, System B and any future System C
+    cannot disagree about them — spec.md §6 requires that the only thing
+    differing between systems is which probes they choose to run, and a
+    system that recorded its replay identity differently would be
+    incomparable for reasons that have nothing to do with its probes.
+
+    The clock is `replay.replay_at` when replaying and no `now` was given: a
+    replay run's decision clock IS `T` (spec.md §6). An explicit `now` is
+    still honoured rather than silently overridden, because the hook itself
+    rejects a mismatch (`rli.replay.mode.replay_hook`) — a loud failure beats
+    a run whose `runs.replay_at` describes a different instant than the one
+    its evidence gate used.
+    """
+    if replay is not None:
+        moment = ensure_aware(now, "now") if now is not None else replay.replay_at
+        return (
+            moment,
+            "replay",
+            config_hash_live + replay.config_hash_suffix(),
+            replay.replay_at,
+        )
+    moment = ensure_aware(now, "now") if now is not None else now_utc()
+    return moment, "live", config_hash_live, None
+
+
+@contextmanager
+def open_system_runner(
+    conn: sqlite3.Connection,
+    cfg: Config,
+    run: Run,
+    now: datetime,
+    *,
+    replay: ReplayHook | None,
+    sleep: Callable[[float], None] = time.sleep,
+    use_tool_cache: bool = True,
+) -> Iterator[ProbeRunner]:
+    """`open_probe_runner`, or the replay hook's cached-record runner.
+
+    The one branch on "am I replaying?" that a system module contains. It is
+    here rather than in each system for the same reason as
+    `replay_run_shape`, and it keeps `rli.eval` free of any import from
+    `rli.replay` (see `ReplayHook`).
+    """
+    if replay is not None:
+        with replay.open_runner(conn, cfg, run, now) as probes:
+            yield probes
+        return
+    with open_probe_runner(
+        conn, cfg, run, now, sleep=sleep, use_tool_cache=use_tool_cache
+    ) as probes:
+        yield probes
 
 
 # ---------------------------------------------------------------------------

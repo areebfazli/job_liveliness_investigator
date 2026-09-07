@@ -91,13 +91,14 @@ from rli.config import Config
 from rli.eval.case import build_case_state, extend_case_state
 from rli.eval.runner import (
     STEP_PROBE_SKIPPED,
+    ReplayHook,
     Run,
     RunResult,
     config_hash,
     decide_and_finish,
-    open_probe_runner,
+    open_system_runner,
+    replay_run_shape,
 )
-from rli.models.time import ensure_aware, now_utc
 from rli.probes.base import Probe
 from rli.probes.registry import DYNAMIC_PROBES, eligible_probes
 
@@ -123,6 +124,7 @@ def run_system_a(
     sleep: Callable[[float], None] = time.sleep,
     use_tool_cache: bool = True,
     collection_status_csv: str | Path | None = None,
+    replay: ReplayHook | None = None,
 ) -> RunResult:
     """Run System A against `url` and return its `Decision` plus trace handles.
 
@@ -144,20 +146,37 @@ def run_system_a(
             project default, which is a file in the working checkout — pass
             an explicit path to keep a test or a replay from depending on
             whatever that file happens to contain.
+        replay: `None` for a live run. A `rli.eval.runner.ReplayHook` puts
+            this run in replay mode (spec.md §6): the run is recorded with
+            `mode='replay'` and `replay_at=T`, its `config_hash` carries the
+            dataset id, and every probe result comes from the cached
+            full-probe record instead of the network. A is otherwise
+            IDENTICAL — same selection, same policy, same trace — which is
+            the property that makes a replayed A comparable to a live A.
     """
-    moment = ensure_aware(now, "now") if now is not None else now_utc()
+    moment, mode, run_config_hash, replay_at = replay_run_shape(
+        replay, now, f"cfg:{config_hash(cfg)}"
+    )
 
     with Run(
         conn,
         cfg,
         input_url=url,
         system="A",
-        config_hash=f"cfg:{config_hash(cfg)}",
+        config_hash=run_config_hash,
         started_at=moment,
         run_id=run_id,
+        mode=mode,  # type: ignore[arg-type]
+        replay_at=replay_at,
     ) as run:
-        with open_probe_runner(
-            conn, cfg, run, moment, sleep=sleep, use_tool_cache=use_tool_cache
+        with open_system_runner(
+            conn,
+            cfg,
+            run,
+            moment,
+            replay=replay,
+            sleep=sleep,
+            use_tool_cache=use_tool_cache,
         ) as probes:
             case = build_case_state(
                 conn,

@@ -252,15 +252,16 @@ from rli.eval.runner import (
     STEP_PROBE_SKIPPED,
     STEP_ROUTE,
     STEP_SYSTEM_VERSION,
+    ReplayHook,
     Run,
     RunResult,
     config_hash,
     decide_and_finish,
-    open_probe_runner,
+    open_system_runner,
+    replay_run_shape,
 )
 from rli.eval.system_a import ALL_DYNAMIC_INPUTS
 from rli.models.policy_inputs import Unknown
-from rli.models.time import ensure_aware, now_utc
 from rli.probes.base import Probe
 from rli.probes.company_events import CompanyEventsProbe
 from rli.probes.registry import DYNAMIC_PROBES, eligible_probes
@@ -543,26 +544,44 @@ def run_system_b(
     sleep: Callable[[float], None] = time.sleep,
     use_tool_cache: bool = True,
     collection_status_csv: str | Path | None = None,
+    replay: ReplayHook | None = None,
 ) -> RunResult:
     """Run System B against `url`. Same signature and contract as `run_system_a`.
 
     The only differences from A are which probes run (the routing tree
     above), the two extra controller trace rows (`system_version` and
     `route:<rule>`), and the composed `runs.config_hash`.
+
+    `replay` puts the run in replay mode exactly as it does for A (spec.md
+    §6). Note the composition order of `runs.config_hash`: B's rules version
+    stays in the middle and the dataset suffix goes LAST, because
+    `rli.eval.baseline.collect_cases` identifies a dataset by a trailing
+    `|dataset:<id>` match — so B's replay hash reads
+    `cfg:<hash>|b1:<rules hash>|dataset:<id>`.
     """
-    moment = ensure_aware(now, "now") if now is not None else now_utc()
+    moment, mode, run_config_hash, replay_at = replay_run_shape(
+        replay, now, b_config_hash(cfg)
+    )
 
     with Run(
         conn,
         cfg,
         input_url=url,
         system="B",
-        config_hash=b_config_hash(cfg),
+        config_hash=run_config_hash,
         started_at=moment,
         run_id=run_id,
+        mode=mode,  # type: ignore[arg-type]
+        replay_at=replay_at,
     ) as run:
-        with open_probe_runner(
-            conn, cfg, run, moment, sleep=sleep, use_tool_cache=use_tool_cache
+        with open_system_runner(
+            conn,
+            cfg,
+            run,
+            moment,
+            replay=replay,
+            sleep=sleep,
+            use_tool_cache=use_tool_cache,
         ) as probes:
             # Recorded before anything else, so even a run that fails
             # mid-investigation says which rules produced it.

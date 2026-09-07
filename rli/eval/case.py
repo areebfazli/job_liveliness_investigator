@@ -82,6 +82,34 @@ stored `board_absent` claim from a previous run, once replay assembles
 evidence across runs) postdates the resolver's answer.
 
 --------------------------------------------------------------------------
+Replay seams (spec.md §6) — two, and only two
+--------------------------------------------------------------------------
+
+This module is shared verbatim by every system in live mode AND in replay
+mode, so the point-in-time rules of spec.md §6 must reach it without it
+growing a `replay` branch. They do, through the `ProbeRunner` it is already
+handed:
+
+1. **Every claim is persisted through `probes.save_evidence`**, never through
+   `probes.run.save_evidence`. That method is the one choke point
+   `rli.replay.mode.ReplayProbeRunner` overrides to drop every claim whose
+   `available_at` is after `T` (spec.md §6: "expose only evidence with
+   `available_at <= T`"). Live mode delegates it straight to the `Run`, so
+   the two paths are identical outside replay.
+2. **`probes.always_run_extra()` is appended to the always-run evidence.**
+   It is empty in live mode; in replay it carries the archive-derived board
+   state at `T`. See the block where it is called for why that evidence
+   cannot come from a probe.
+
+Related, and easy to get wrong: the two claims this module SYNTHESIZES
+(`posting_state` and `board_present`/`board_absent`) are stamped with
+`observed_at(result.data, now)` — the instant the underlying observation was
+really made — not with the run clock. In live mode those are the same value.
+In replay they are not, and using the run clock would stamp `available_at ==
+T` on an observation made months later, which is both spec.md §3's forbidden
+backdating and a gate that can never fire.
+
+--------------------------------------------------------------------------
 Identity resolution, and why it never creates a row
 --------------------------------------------------------------------------
 
@@ -99,11 +127,29 @@ resolved by this fallback chain, most trustworthy first:
    the company is the same; only the job is new. Deterministically ordered
    by `posting_id` so a tenant that (wrongly) spans two companies resolves
    the same way every time rather than by table order;
+   **and, having learned the company that way, the `postings` row under the
+   archive correlation key `(company_id, ats_job_id)`** — see
+   `_posting_by_correlation_key`;
 3. `rli.resolvers.common.normalize_domain` of the JSON-LD
    `hiringOrganization` domain the resolver extracted — a real observation
    about the posting, but from the page rather than from our own corpus;
 4. `None` — unknown. Every downstream consumer treats that as "no history,
    no events", never as a default company.
+
+**Why step 2's second half exists, and what its absence cost.** A posting
+that this system only ever saw inside a Wayback board capture gets a
+`postings` row from `rli.history.closures` keyed
+`"archive:{company_id}:{job_id}"`, with `ats_tenant_id` NULL, because a board
+capture carries no ATS or tenant. `f"{ats}:{tenant}:{job_id}"` can therefore
+NEVER match it — and without this step the whole archive-collected half of
+the corpus resolves to `posting_row_exists=False`, which means no history
+features, no `evidence.posting_id`, and — because `RepostHistoryProbe.
+eligible` / `RequirementsDriftProbe.eligible` both begin with "is there a
+`postings` row?" — no history probe is ever eligible for it. On the real
+corpus that silently made System A and System B identical on every
+archive-derived posting: the exact comparison spec.md §6 exists to make. The
+lookup is the corpus's own documented correlation key, so this step resolves
+the posting the collector actually committed to rather than inventing one.
 
 At no point does this module INSERT a `companies` or `postings` row. Without
 that rule a single evaluation run could invent a company, and the next run's
@@ -206,6 +252,7 @@ from rli.models.case_file import CaseFile
 from rli.models.evidence import EvidenceItem
 from rli.models.policy_inputs import UNKNOWN, PolicyInputs, Unknown
 from rli.models.probe import ProbeResult
+from rli.models.time import ensure_aware, parse_utc
 from rli.policy.inputs import (
     CLAIM_BOARD_ABSENT,
     CLAIM_POSTING_STATE,
@@ -227,6 +274,7 @@ __all__ = [
     "CaseState",
     "build_case_state",
     "extend_case_state",
+    "observed_at",
 ]
 
 # Self-describing, deliberately non-fetchable `source_url` for a fact whose
@@ -333,6 +381,36 @@ def _company_id_for_tenant(
     return None if row is None else row["company_id"]
 
 
+def _posting_by_correlation_key(
+    conn: sqlite3.Connection, company_id: str | None, job_id: str | None
+) -> sqlite3.Row | None:
+    """Fallback 1b: the collected posting for `(company_id, ats_job_id)`.
+
+    `rli.history.closures` documents `(company_id, ats_job_id)` as THE
+    correlation key between a board capture and a `postings` row, because
+    `board_snapshots` carries no ATS or tenant column. It is also the key
+    under which that module creates archive-only postings, whose ids are
+    `"archive:{company_id}:{job_id}"` and whose `ats_tenant_id` is NULL —
+    ids no resolver can ever reconstruct from a job URL.
+
+    Deterministic tiebreak (lowest `posting_id`) and the accepted collision
+    limitation are `rli.history.closures`' own, restated in one place rather
+    than diverging.
+    """
+    if not company_id or not job_id:
+        return None
+    row = conn.execute(
+        """
+        SELECT posting_id FROM postings
+        WHERE company_id = ? AND ats_job_id = ?
+        ORDER BY posting_id
+        LIMIT 1
+        """,
+        (company_id, job_id),
+    ).fetchone()
+    return None if row is None else posting_row(conn, row["posting_id"])
+
+
 def _resolve_identity(
     conn: sqlite3.Connection, data: dict[str, Any]
 ) -> tuple[str | None, sqlite3.Row | None, str | None]:
@@ -356,6 +434,14 @@ def _resolve_identity(
         return posting_id, row, row["company_id"]
 
     company_id = _company_id_for_tenant(conn, ats, tenant)
+
+    # Fallback 1b: the collected row under the ARCHIVE correlation key. See
+    # `_posting_by_correlation_key`, and the module docstring for why this
+    # step is not optional.
+    collected = _posting_by_correlation_key(conn, company_id, job_id)
+    if collected is not None:
+        return collected["posting_id"], collected, collected["company_id"]
+
     if company_id is None:
         company_id = normalize_domain(data.get("company_domain"))
     return posting_id, None, company_id
@@ -366,17 +452,51 @@ def _resolve_identity(
 # ---------------------------------------------------------------------------
 
 
+def observed_at(data: dict[str, Any] | None, now: datetime) -> datetime:
+    """When the observation behind `data` was REALLY made (spec.md §3).
+
+    Live, that is the run clock: the probe just ran. In replay it is not —
+    `rli.replay.mode.ReplayProbeStore.save` stamps every cached record with
+    `data["observed_at"]`, the build-time instant the live observation was
+    actually made, precisely so the two claims this module synthesizes
+    (`posting_state`, `board_present`/`board_absent`) can carry that instant
+    instead of `T`.
+
+    Stamping `T` would backdate a current discovery onto the replay
+    timeline, which spec.md §3 forbids in as many words ("Do not backdate
+    current discoveries merely because the underlying event happened
+    earlier") — and it would silently defeat the whole point-in-time gate:
+    every synthesized claim would be `available_at == T`, therefore always
+    exposed, and an archive-era replay would decide from an observation made
+    a year in its future.
+
+    A malformed or missing stamp degrades to `now`, the live meaning. It
+    cannot degrade to "expose anyway" by accident: a live run has no stamp
+    and must use `now`, and a replay record always has one.
+    """
+    stamped = (data or {}).get("observed_at")
+    if isinstance(stamped, datetime):
+        return ensure_aware(stamped, "observed_at")
+    if isinstance(stamped, str):
+        try:
+            return parse_utc(stamped)
+        except ValueError:
+            return now
+    return now
+
+
 def _posting_state_claim(data: dict[str, Any], canonical_url: str, now: datetime) -> ProbeClaim:
     state = str(data.get("posting_state") or "unknown")
     ats = data.get("ats")
+    seen_at = observed_at(data, now)
     return ProbeClaim(
         claim_type=CLAIM_POSTING_STATE,
         value=state,
         source_url=canonical_url,
         # An ATS adapter decided the state; JSON-LD alone is page-structured.
         source_quality="ats_native" if ats in _BOARD_ATSES else "page_structured",
-        available_at=now,
-        fetched_at=now,
+        available_at=seen_at,
+        fetched_at=seen_at,
     )
 
 
@@ -502,7 +622,14 @@ def build_case_state(
         failures.append(resolver)
 
     evidence_posting_id = posting_id if posting_row_exists else None
-    evidence = probes.run.save_evidence(
+    # `probes.save_evidence`, never `probes.run.save_evidence`: the runner's
+    # method is the single choke point the point-in-time gate hangs off
+    # (`rli.eval.runner.ProbeRunner.save_evidence`, overridden by
+    # `rli.replay.mode.ReplayProbeRunner` to drop every claim with
+    # `available_at > T`). Going straight to the `Run` would bypass spec.md
+    # §6's first replay rule for the always-run evidence — the evidence that
+    # decides `posting_state` — which is the one place it matters most.
+    evidence = probes.save_evidence(
         probe=ResolvePostingProbe.name,
         # The synthesized `posting_state` claim leads: it is the primary
         # observation, and the contract in `rli.policy.inputs` makes it the
@@ -525,11 +652,15 @@ def build_case_state(
             failures.append(board)
         elif job_id:
             jobs: list[BoardJob] = list((board.data or {}).get("jobs") or [])
-            evidence += probes.run.save_evidence(
+            evidence += probes.save_evidence(
                 probe=BoardSnapshotProbe.name,
                 claims=[
                     _board_claim(
-                        jobs=jobs, ats=str(ats), tenant=str(tenant), job_id=str(job_id), now=now
+                        jobs=jobs,
+                        ats=str(ats),
+                        tenant=str(tenant),
+                        job_id=str(job_id),
+                        now=observed_at(board.data, now),
                     )
                 ],
                 posting_id=evidence_posting_id,
@@ -546,6 +677,21 @@ def build_case_state(
             f"{STEP_PROBE_SKIPPED}:no_board_endpoint",
             probe_name=BoardSnapshotProbe.name,
             error=f"no board-listing endpoint for ats={ats!r} tenant={tenant!r}",
+        )
+
+    # -- evidence contributed by the RUN ENVIRONMENT ----------------------
+    # Empty in live mode. In replay this is the archive-derived board state
+    # at `T` (`rli.replay.build.archive_state_claims`): at an archive-era `T`
+    # the live resolver's answer is not available (its `available_at` is the
+    # build instant, so the gate above dropped it) and the only honest
+    # observable state comes from the board captures that existed at `T`.
+    # It is contributed here rather than by a probe because no probe observes
+    # it — it is a re-reading of captures the collector already took — and it
+    # is attributed to its own probe name so the `evidence` table never
+    # claims `resolve_posting` said something it did not.
+    for extra_probe, extra_claims in probes.always_run_extra():
+        evidence += probes.save_evidence(
+            probe=extra_probe, claims=extra_claims, posting_id=evidence_posting_id
         )
 
     # -- derived state ----------------------------------------------------
@@ -659,7 +805,8 @@ def extend_case_state(
 
         claims = list((result.data or {}).get("evidence") or [])
         if claims:
-            case.evidence += probes.run.save_evidence(
+            # Through `probes`, not `probes.run` — see `build_case_state`.
+            case.evidence += probes.save_evidence(
                 probe=probe_cls.name, claims=claims, posting_id=evidence_posting_id
             )
 
