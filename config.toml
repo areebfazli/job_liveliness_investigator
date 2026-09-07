@@ -1,0 +1,190 @@
+# Role-Liveness Investigator — configuration
+#
+# All values in this file are PLACEHOLDERS for M0 (skeleton milestone).
+# They are not tuned on any data yet. Per spec.md §5, the action policy
+# thresholds must be tuned once on development/temporal-validation data
+# and then frozen (see `[policy].frozen_at`) before final evaluation.
+#
+# Loaded by rli.config.load_config, which resolves this file relative to the
+# repo root (not the process CWD). An installed-package deployment has no
+# repo root and must set $RLI_CONFIG instead.
+#
+# Every table below is validated with `extra = "forbid"`: an unrecognized key
+# is a hard error, not a silently ignored line.
+
+[thresholds]
+# Default recheck interval (days) when no declared expiry exists.
+# spec.md §1: recheck_after_days = min(recheck_cap_days,
+# days_until_validThrough) if a declared expiry exists, else this default.
+recheck_default_days = 14
+
+# Upper bound on recheck_after_days when a declared expiry (validThrough)
+# exists. spec.md §1 writes this rule as `min(14, days_until_validThrough)`;
+# the `14` is configuration, not a literal in the policy code.
+recheck_cap_days = 14
+
+# Max number of dynamic (non-mandatory) probe steps the agent loop may take.
+# spec.md §4: "Start with at most 4 dynamic probe steps."
+max_dynamic_steps = 4
+
+# A posting's publish evidence is considered "recent" if its age in days is
+# <= this value. Used to populate the `publish_recency` policy input.
+# PLACEHOLDER — not yet tuned.
+recent_publish_days = 14
+
+# A posting/board history is considered "long-lived" if its observed history
+# span in days is >= this value. Used for the repost + long-lived branch of
+# the action policy (spec.md §5). PLACEHOLDER — not yet tuned.
+long_lived_days = 180
+
+# Repost/version-match similarity thresholds (spec.md §4: "Match reposted/
+# versioned roles using title, team, location, and description similarity.
+# Keep thresholds configurable and validate match precision on a hand-checked
+# sample of 50 matches."). Values are placeholders pending that validation.
+repost_title_similarity = 0.85
+repost_description_similarity = 0.80
+repost_team_similarity = 0.80
+repost_location_similarity = 0.90
+
+[budgets]
+# Maximum USD cost allowed for a single investigation run (LLM + paid probes).
+# PLACEHOLDER.
+max_cost_usd = 0.50
+
+# Maximum wall-clock latency (seconds) allowed for a single investigation run.
+# PLACEHOLDER.
+max_latency_s = 60.0
+
+# HTTP behaviour for rli.net (spec.md §2: "Structured probe failure ... no
+# uncontrolled retry loops"; spec.md §4: "per-host rate limits with
+# exponential backoff"). These are deliberately config, not call-site
+# defaults, so retry behaviour is auditable in one place.
+[net]
+# Retries AFTER the initial attempt, so total attempts = max_retries + 1.
+# 0 means "attempt once, never retry".
+max_retries = 3
+
+# First backoff step (seconds). Delay ceiling for attempt n is
+# min(max_backoff_s, backoff_base_s * 2**n); full jitter is applied to it.
+backoff_base_s = 0.5
+
+# Hard ceiling (seconds) on any single backoff sleep, including a value
+# taken from a `Retry-After` response header. Must be >= backoff_base_s.
+max_backoff_s = 30.0
+
+# Per-request httpx timeout (seconds), so a hung host cannot consume the
+# run's latency budget (see [budgets].max_latency_s).
+timeout_s = 20.0
+
+# Maximum redirect hops followed. rli.net follows redirects manually and
+# re-checks the allowlist on every hop, so this bounds an attacker-supplied
+# redirect chain.
+max_redirects = 5
+
+# Token-bucket defaults applied to any host without an explicit
+# [rate_limits."<host>"] entry below. Deliberately conservative: an
+# unlisted host is, by definition, one whose published limits we have not
+# checked (this includes every employer career page reached by json_ld).
+default_requests_per_second = 1.0
+default_burst = 3
+
+# Per-host rate limits used by rli.net. Keys are hostnames. Values are
+# placeholders — must be checked against each host's documented/observed
+# rate limits before live collection scales up. Hosts not listed here fall
+# back to [net].default_requests_per_second / default_burst.
+
+# Greenhouse Job Board API (spec.md §3/§10: documented public API,
+# first_published / updated_at -> ats_native).
+[rate_limits."boards-api.greenhouse.io"]
+requests_per_second = 1.0
+burst = 3
+
+# Ashby Public Job Postings API (spec.md §3/§10: publishedAt -> ats_native).
+[rate_limits."api.ashbyhq.com"]
+requests_per_second = 1.0
+burst = 3
+
+# Lever Postings API (spec.md §3: public current postings; undocumented date
+# fields are NOT trusted as ATS-native publish dates).
+[rate_limits."api.lever.co"]
+requests_per_second = 1.0
+burst = 3
+
+# Human-facing board pages, used for canonical URL resolution and JSON-LD.
+[rate_limits."boards.greenhouse.io"]
+requests_per_second = 1.0
+burst = 3
+
+[rate_limits."jobs.ashbyhq.com"]
+requests_per_second = 1.0
+burst = 3
+
+[rate_limits."jobs.lever.co"]
+requests_per_second = 1.0
+burst = 3
+
+# Wayback (spec.md §4: "Snapshot and Wayback CDX jobs use per-host rate
+# limits with exponential backoff"). Kept deliberately conservative — a
+# throttled capture is recorded as a coverage gap, never as an absence, so
+# being throttled costs us history rather than producing a wrong answer.
+[rate_limits."web.archive.org"]
+requests_per_second = 0.5
+burst = 2
+
+# Per-probe domain allowlists (spec.md §2: "Enforce per-probe network-domain
+# allowlists."). Each key is a probe name; the value is the list of hostnames
+# that probe is permitted to contact. Entries are matched EXACTLY against the
+# normalized host by rli.net.check_allowed — a suffix match is not enough, so
+# `evilboards.greenhouse.io` is rejected by the entry `boards.greenhouse.io`.
+# Wildcard subdomain entries (`*.greenhouse.io`) are deliberately unsupported;
+# the only special entry is the bare `"*"` used by json_ld below.
+[allowlists]
+# Resolver + board snapshot reach both the documented ATS APIs (the source of
+# ats_native publish dates) and the corresponding human-facing board pages
+# (canonical URL resolution and the JSON-LD fallback).
+resolve_posting = [
+    "boards-api.greenhouse.io",
+    "api.ashbyhq.com",
+    "api.lever.co",
+    "boards.greenhouse.io",
+    "jobs.ashbyhq.com",
+    "jobs.lever.co",
+]
+board_snapshot = [
+    "boards-api.greenhouse.io",
+    "api.ashbyhq.com",
+    "api.lever.co",
+    "boards.greenhouse.io",
+    "jobs.ashbyhq.com",
+    "jobs.lever.co",
+]
+
+# History probes read only the archive (spec.md §3: "Wayback: archive
+# fallback/history only; always record capture coverage").
+repost_history = ["web.archive.org"]
+requirements_drift = ["web.archive.org"]
+
+# spec.md §3: JSON-LD `JobPosting.datePosted` -> page_structured. It is read
+# from arbitrary employer career pages, which cannot be enumerated in
+# advance, so any host is allowed here — but only over https, and
+# rli.net.check_allowed still rejects userinfo in the URL, IP literals
+# (v4/v6, including private / loopback / link-local / reserved ranges) and
+# non-public single-label or internal-suffix hosts before any request is
+# made.
+json_ld = ["*"]
+
+# Not implemented yet (spec.md §4). Empty list = this probe may contact no
+# host at all, which is the correct fail-closed state for an unimplemented
+# probe.
+company_events = []
+team_signal = []
+
+[policy]
+# Timestamp (ISO 8601, UTC) at which the v1 action policy thresholds were
+# frozen for final evaluation (spec.md §5). TOML has no null literal, so the
+# key is left unset here; rli.config.Policy defaults `frozen_at` to None
+# ("not yet frozen"). Do not set this manually outside of that freeze
+# process (planned for M3) — when set, it must carry an explicit UTC offset
+# (`2026-01-01T00:00:00Z`); a naive TOML datetime is rejected, since it
+# cannot be placed on the point-in-time replay timeline (spec.md §3/§6).
+# frozen_at = 2026-01-01T00:00:00Z

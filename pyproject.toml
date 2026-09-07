@@ -1,0 +1,42 @@
+[project]
+name = "rli"
+version = "0.1.0"
+description = "Role-Liveness Investigator — evidence-backed job posting liveness analysis"
+readme = "README.md"
+authors = [
+    { name = "Areeb Fazli", email = "areebfazli@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "pydantic>=2",
+    "httpx>=0.27",
+    "beautifulsoup4>=4.12",
+    "lifelines>=0.29",
+    "scikit-learn>=1.5",
+    "typer>=0.12",
+]
+
+[project.scripts]
+rli = "rli.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "respx>=0.21",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.28,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = ""
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
