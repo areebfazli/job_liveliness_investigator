@@ -16,7 +16,7 @@ import argparse
 import csv
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -106,14 +106,21 @@ def audit_row(client: httpx.Client, row: dict[str, str]) -> AuditResult:
     ats = row["ats"]
     tenant = row["tenant"]
 
-    checked_at = datetime.now(timezone.utc).isoformat()
+    checked_at = datetime.now(UTC).isoformat()
     url = build_url(ats, tenant)
 
     resp, note = fetch_with_retry(client, url)
 
     if resp is None:
         return AuditResult(
-            company_name, website_domain, ats, tenant, False, "", checked_at, note or "unknown error"
+            company_name,
+            website_domain,
+            ats,
+            tenant,
+            False,
+            "",
+            checked_at,
+            note or "unknown error",
         )
 
     if resp.status_code != 200:

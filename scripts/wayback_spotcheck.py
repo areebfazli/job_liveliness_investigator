@@ -6,7 +6,7 @@ how many capture rows (if any) came back for each. This is a spot-check only
 -- not a full backfill.
 
 Usage:
-    python scripts/wayback_spotcheck.py [--targets path/to/targets.csv] [--output path/to/output.csv] [--sample-size 10]
+    python scripts/wayback_spotcheck.py [--targets T.csv] [--output O.csv] [--sample-size 10]
 """
 
 from __future__ import annotations
@@ -160,7 +160,9 @@ def main() -> None:
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["company_name", "ats", "tenant", "capture_count", "note"])
+        writer = csv.DictWriter(
+            f, fieldnames=["company_name", "ats", "tenant", "capture_count", "note"]
+        )
         writer.writeheader()
         for r in results:
             writer.writerow(asdict(r))

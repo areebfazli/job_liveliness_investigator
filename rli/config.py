@@ -166,6 +166,8 @@ class Allowlists(BaseModel):
     # hardening in rli.net.check_allowed (https-only, no userinfo, no IP
     # literals, no private/loopback/link-local targets) still applies.
     json_ld: list[str] = []
+    # rli/archive backfill (M1 PLAN bullet 4): Wayback CDX + capture fetch.
+    archive_backfill: list[str] = []
 
 
 class Policy(BaseModel):

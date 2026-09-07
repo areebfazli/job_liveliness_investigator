@@ -164,6 +164,9 @@ board_snapshot = [
 repost_history = ["web.archive.org"]
 requirements_drift = ["web.archive.org"]
 
+# rli/archive backfill (M1 PLAN bullet 4): Wayback CDX + capture fetch.
+archive_backfill = ["web.archive.org"]
+
 # spec.md §3: JSON-LD `JobPosting.datePosted` -> page_structured. It is read
 # from arbitrary employer career pages, which cannot be enumerated in
 # advance, so any host is allowed here — but only over https, and
