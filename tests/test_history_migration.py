@@ -25,6 +25,11 @@ def _schema_ext_sql() -> str:
 def _normalized_ddl(text: str) -> str:
     """The repost_links DDL with comments stripped and whitespace collapsed."""
     body = text[text.index(REPOST_LINKS_START) :]
+    # Later schema versions append further tables after repost_links; stop at the
+    # next CREATE TABLE so the comparison covers only the repost_links DDL.
+    nxt = body.find("CREATE TABLE", len(REPOST_LINKS_START))
+    if nxt != -1:
+        body = body[:nxt]
     uncommented = "\n".join(line.split("--")[0] for line in body.splitlines())
     return " ".join(uncommented.split())
 
@@ -77,8 +82,8 @@ def test_fresh_database_is_version_2_with_repost_links(tmp_path: Path) -> None:
 
     conn = connect(path)
     try:
-        assert SCHEMA_VERSION == 2
-        assert schema_version(conn) == 2
+        assert SCHEMA_VERSION >= 2
+        assert schema_version(conn) == SCHEMA_VERSION
         assert "repost_links" in _table_names(conn)
         columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(repost_links)")
@@ -148,7 +153,7 @@ def test_version_1_database_upgrades_cleanly_to_version_2(tmp_path: Path) -> Non
 
     conn = connect(path)
     try:
-        assert schema_version(conn) == 2
+        assert schema_version(conn) == SCHEMA_VERSION
         assert "repost_links" in _table_names(conn)
         # Pre-existing data survives the upgrade untouched.
         assert conn.execute("SELECT COUNT(*) FROM companies").fetchone()[0] == 1
@@ -182,7 +187,8 @@ def test_repeated_init_db_on_a_populated_database_is_a_no_op(tmp_path: Path) -> 
 
 
 def test_migration_1_is_registered_and_reaches_the_current_version() -> None:
-    assert set(MIGRATIONS) == {1}
+    assert 1 in MIGRATIONS
+    assert set(MIGRATIONS) == set(range(1, SCHEMA_VERSION))
     assert max(MIGRATIONS) + 1 == SCHEMA_VERSION
 
 

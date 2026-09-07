@@ -25,6 +25,10 @@ EXPECTED_TABLES = {
     "tool_cache",
     # schema version 2 (rli.history.matching audit trail)
     "repost_links",
+    # schema version 3 (rli.replay point-in-time dataset)
+    "replay_datasets",
+    "replay_cases",
+    "replay_probe_results",
 }
 
 # (table, required columns, forbidden columns)
