@@ -187,7 +187,16 @@ board_snapshot = [
 # History probes read only the archive (spec.md §3: "Wayback: archive
 # fallback/history only; always record capture coverage").
 repost_history = ["web.archive.org"]
-requirements_drift = ["web.archive.org"]
+
+# requirements_drift additionally fetches the CURRENT job content via the
+# posting's own ATS adapter (to diff against the earliest archived capture),
+# so its allowlist adds the documented ATS API hosts alongside web.archive.org.
+requirements_drift = [
+    "web.archive.org",
+    "boards-api.greenhouse.io",
+    "api.ashbyhq.com",
+    "api.lever.co",
+]
 
 # rli/archive backfill (M1 PLAN bullet 4): Wayback CDX + capture fetch.
 archive_backfill = ["web.archive.org"]
@@ -216,3 +225,48 @@ team_signal = []
 # (`2026-01-01T00:00:00Z`); a naive TOML datetime is rejected, since it
 # cannot be placed on the point-in-time replay timeline (spec.md §3/§6).
 # frozen_at = 2026-01-01T00:00:00Z
+
+# spec.md §5: "Terms such as `recent`, `long-lived`, and `material negative
+# event` are configuration with documented frozen thresholds." This table is
+# where the ACTION POLICY's thresholds are frozen. They are read through
+# `rli.policy.action.PolicyThresholds`, never as literals in the policy code,
+# and they are part of `policy_version()` — changing any value here changes
+# the recorded policy version, exactly as changing the policy source does.
+
+# Two `first_published` claims from DIFFERENT sources that disagree by more
+# than this many days are a material contradiction, which forces
+# `evidence_quality` to "mixed" (spec.md §1). Set above zero because
+# `ats_native` and `page_structured` dates legitimately differ by a day or
+# two (timezone/rendering lag), and that is not a conflict.
+# PLACEHOLDER — not yet tuned.
+contradiction_days = 3
+
+# The four keys below are OVERRIDES of the identically named [thresholds]
+# keys, not copies: when unset (the default), the policy reads the
+# [thresholds] value, so there is exactly one source of truth. Set one here
+# only to pin the POLICY's notion of a term at freeze time (spec.md §5)
+# independently of the history/feature layer that shares the name.
+# recent_publish_days = 14
+# long_lived_days = 180
+# recheck_default_days = 14
+# recheck_cap_days = 14
+
+# Numeric cost tiers + rough latency estimates for the dynamic probes
+# (spec.md §4 "Dynamic probes" cost column; PLAN.md M3). rli.probes.registry
+# reads these to rank eligible candidates and check them against
+# [budgets].max_cost_usd / max_latency_s. PLACEHOLDERS pending measurement
+# from real probe runs.
+[probe_costs]
+low = 1
+medium = 3
+high = 10
+latency_low_s = 2.0
+latency_medium_s = 5.0
+latency_high_s = 12.0
+
+# spec.md §4: team_signal has "no licensed enrichment source" yet
+# (rli.probes.team_signal.NullTeamSignalSource). `enabled = false` keeps it
+# out of rli.probes.registry.eligible_probes entirely until a real source is
+# wired in; corroborating_hiring_signal stays UNKNOWN until then.
+[team_signal]
+enabled = false

@@ -36,7 +36,9 @@ __all__ = [
     "Config",
     "Net",
     "Policy",
+    "ProbeCosts",
     "RateLimit",
+    "TeamSignal",
     "Thresholds",
     "load_config",
 ]
@@ -198,12 +200,88 @@ class Allowlists(BaseModel):
     archive_backfill: list[str] = []
 
 
+class ProbeCosts(BaseModel):
+    """Numeric cost + latency estimates per `rli.probes.base.CostTier` (PLAN.md M3).
+
+    `rli.probes.registry` reads these to rank eligible dynamic probes and to
+    check them against `[budgets].max_cost_usd`/`max_latency_s`. Values are
+    PLACEHOLDERS (arbitrary unitless cost points, and rough wall-clock
+    seconds) pending real measurement from live probe runs; all carry
+    defaults so a config predating this table keeps validating, the same
+    convention `Thresholds.negative_event_window_days` established.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    low: int = Field(1, gt=0)
+    medium: int = Field(3, gt=0)
+    high: int = Field(10, gt=0)
+
+    latency_low_s: float = Field(2.0, gt=0.0)
+    latency_medium_s: float = Field(5.0, gt=0.0)
+    latency_high_s: float = Field(12.0, gt=0.0)
+
+    def value_for(self, tier: str) -> int:
+        return {"low": self.low, "medium": self.medium, "high": self.high}[tier]
+
+    def latency_for(self, tier: str) -> float:
+        return {
+            "low": self.latency_low_s,
+            "medium": self.latency_medium_s,
+            "high": self.latency_high_s,
+        }[tier]
+
+
+class TeamSignal(BaseModel):
+    """`team_signal` probe feature flag (spec.md §4; PLAN.md M3).
+
+    No licensed enrichment source exists yet (`rli.probes.team_signal.
+    NullTeamSignalSource`), so this defaults to `False`: an unlicensed
+    deployment never attempts the probe, and `corroborating_hiring_signal`
+    (spec.md §5) stays the `UNKNOWN` sentinel. Flip to `True` only once a
+    real `TeamSignalSource` is wired in.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    enabled: bool = False
+
+
 class Policy(BaseModel):
-    """Action-policy freeze state (spec.md §5)."""
+    """Action-policy freeze state and frozen policy thresholds (spec.md §5).
+
+    spec.md §5: "Terms such as `recent`, `long-lived`, and `material negative
+    event` are configuration with documented frozen thresholds." This table
+    is where those get frozen.
+
+    Only ONE knob here is genuinely new — `contradiction_days`, which no
+    other layer needs. The remaining four are `None`-by-default **overrides**
+    of the identically named `[thresholds]` keys, not copies of them:
+    `rli.policy.action.PolicyThresholds.from_config` reads `[thresholds]`
+    unless `[policy]` names a value. Duplicating the numbers outright would
+    create two sources of truth that silently disagree; leaving them only in
+    `[thresholds]` would make it impossible to freeze the policy's notion of
+    "recent" (spec.md §5) without also moving the history layer's. The
+    override keeps one default and one auditable place to pin it.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     frozen_at: datetime | None = None
+
+    # Two `first_published` claims from different sources are treated as a
+    # material contradiction (-> evidence_quality "mixed") when they differ
+    # by more than this many days. Not an override: only the policy layer
+    # has any use for it. Defaults so configs predating it (inline TOML
+    # fixtures in tests) keep validating, matching the convention used by
+    # `Thresholds.negative_event_window_days`.
+    contradiction_days: int = Field(3, ge=0)
+
+    # `None` = inherit the `[thresholds]` value of the same name.
+    recent_publish_days: int | None = Field(None, ge=0)
+    long_lived_days: int | None = Field(None, ge=0)
+    recheck_default_days: int | None = Field(None, ge=1)
+    recheck_cap_days: int | None = Field(None, ge=1)
 
     @field_validator("frozen_at")
     @classmethod
@@ -227,6 +305,8 @@ class Config(BaseModel):
     rate_limits: dict[str, RateLimit]
     allowlists: Allowlists
     policy: Policy
+    probe_costs: ProbeCosts = Field(default_factory=ProbeCosts)
+    team_signal: TeamSignal = Field(default_factory=TeamSignal)
 
 
 def _resolve_config_path(path: str | Path | None) -> Path:
