@@ -82,7 +82,8 @@ contradiction when two groups differ by more than `policy.contradiction_days`.
 
 **C2 — open, but missing from a fresher board snapshot.** The newest
 `posting_state` claim says `"open"` while a `board_absent` claim (the posting's
-job id was not in a board capture) has a strictly later `available_at`. Order
+job id was not in a board capture) has an equal or later `available_at` (equal
+covers the same-run case where both always-run probes share one `now`). Order
 is by `available_at`, the timestamp spec.md §3 defines the replay window on,
 so the comparison means the same thing live and in replay. The reverse order
 is deliberately *not* a contradiction: an absence followed by a fresher
@@ -223,7 +224,7 @@ def find_contradictions(
         fresher_absences = [
             e
             for e in evidence
-            if e.claim_type == CLAIM_BOARD_ABSENT and e.available_at > state_claim.available_at
+            if e.claim_type == CLAIM_BOARD_ABSENT and e.available_at >= state_claim.available_at
         ]
         absence = _newest(fresher_absences)
         if absence is not None:

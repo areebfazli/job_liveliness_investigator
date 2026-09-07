@@ -443,8 +443,11 @@ def _classify_repost_pattern(
             "cannot be supported",
         )
 
-    title_ok = title is not None and title >= cfg.thresholds.repost_title_similarity
-    if description >= cfg.thresholds.repost_description_similarity and title_ok:
+    # `[matching]` is authoritative for every repost threshold (see
+    # `rli.config.Matching`); the superseded `[thresholds].repost_*` keys are
+    # no longer read here.
+    title_ok = title is not None and title >= cfg.matching.title_min
+    if description >= cfg.matching.description_min and title_ok:
         return (
             "repeated_unchanged",
             f"repost link with matching description hash (score={description}) and "

@@ -6,13 +6,21 @@ hand-checked sample of 50 matches." PLAN.md M2 sends that hand-check to
 one row per candidate pair, the component scores that produced it, and an
 empty `human_verdict` column.
 
+Three verdict columns are exported, not one, because a candidate can be
+rejected for two very different reasons and a hand-checker needs to tell
+them apart: `passes_thresholds` is the score-only verdict, `is_match` is the
+final verdict after `rli.history.matching`'s one-to-one assignment, and
+`reject_reason` (`"thresholds"` / `"assignment"`) says which stage rejected
+it. `corroborated` / `title_only` show whether anything beyond the title
+supported the match.
+
 Judgment call (GUESSED): the export takes the top `n` candidates by combined
 score across ALL companies — including candidates BELOW the match threshold,
 each flagged in the `is_match` column — rather than only the accepted
 matches. Precision is then computed over the `is_match=true` rows exactly as
 the spec asks, while the near-misses sitting just under the threshold are
 right there in the same file, which is the only cheap way to see whether
-`repost_combined_min` is set too high or too low. Pass `matches_only=True`
+`[matching].combined_min` is set too high or too low. Pass `matches_only=True`
 for the strict "50 accepted matches" reading.
 
 `human_verdict` is left empty for a person to fill with
@@ -50,7 +58,11 @@ MATCH_SAMPLE_COLUMNS = [
     "location_score",
     "description_score",
     "combined_score",
+    "corroborated",
+    "title_only",
+    "passes_thresholds",
     "is_match",
+    "reject_reason",
     "human_verdict",
 ]
 
@@ -102,7 +114,11 @@ def export_match_sample(
                     _fmt(candidate.components.location),
                     _fmt(candidate.components.description),
                     _fmt(candidate.combined),
+                    "true" if candidate.corroborated else "false",
+                    "true" if candidate.title_only else "false",
+                    "true" if candidate.passes_thresholds else "false",
                     "true" if candidate.is_match else "false",
+                    candidate.reject_reason or "",
                     "",  # human_verdict: true_positive / false_positive / unsure
                 ]
             )

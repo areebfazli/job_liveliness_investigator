@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import httpx
@@ -202,3 +203,89 @@ def test_snapshot_status_command_after_snapshot_run(tmp_path: Path) -> None:
     assert "acme.com" in result.stdout
     assert "coverage_status=complete" in result.stdout
     assert "coverage gaps (failed capture_attempts): 0" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# `rli run` / `rli runs-summary` (rli.eval; spec.md §1/§6)
+# ---------------------------------------------------------------------------
+
+RUN_CLI_JOB = {
+    "id": 42,
+    "title": "CLI Backend Engineer",
+    "absolute_url": "https://boards.greenhouse.io/acme/jobs/42",
+    "content": "desc",
+    "departments": [{"name": "Engineering"}],
+    "offices": [{"name": "Remote"}],
+}
+RUN_CLI_URL = "https://boards.greenhouse.io/acme/jobs/42"
+
+# spec.md §1's exact output shape and field order: `Decision.model_dump`
+# follows declaration order in `rli.models.decision.Decision`.
+EXPECTED_DECISION_KEYS = [
+    "posting_state",
+    "recommended_action",
+    "recheck_after_days",
+    "evidence_quality",
+    "hypotheses",
+    "reason",
+    "evidence",
+]
+
+
+def _mock_run_cli_greenhouse() -> None:
+    respx.get("https://boards-api.greenhouse.io/v1/boards/acme/jobs/42").mock(
+        return_value=httpx.Response(200, json=RUN_CLI_JOB)
+    )
+    respx.get(RUN_CLI_URL).mock(return_value=httpx.Response(200, text="<html></html>"))
+    respx.get("https://boards-api.greenhouse.io/v1/boards/acme/jobs").mock(
+        return_value=httpx.Response(200, json={"jobs": [RUN_CLI_JOB]})
+    )
+
+
+def test_run_command_prints_decision_json_with_spec_key_order(tmp_path: Path) -> None:
+    db_path = tmp_path / "rli.db"
+
+    with respx.mock:
+        _mock_run_cli_greenhouse()
+        result = runner.invoke(
+            app, ["run", "--system", "A", "--url", RUN_CLI_URL, "--db", str(db_path)]
+        )
+
+    assert result.exit_code == 0, result.output
+    # CliRunner may merge stderr (the "run_id=..." trace line) into the same
+    # stream as stdout depending on the click/typer version, so the decision
+    # JSON is not necessarily the whole output — parse it from the first
+    # "{" onward rather than assuming stdout is pure JSON. This still pins
+    # the field ORDER spec.md §1 requires, which is the point of the test.
+    start = result.output.index("{")
+    payload = json.loads(result.output[start:])
+    assert list(payload.keys()) == EXPECTED_DECISION_KEYS
+
+
+def test_run_command_bogus_system_exits_nonzero(tmp_path: Path) -> None:
+    db_path = tmp_path / "rli.db"
+
+    result = runner.invoke(
+        app, ["run", "--system", "bogus", "--url", RUN_CLI_URL, "--db", str(db_path)]
+    )
+
+    assert result.exit_code != 0
+
+
+def test_runs_summary_command_prints_action_distribution_after_a_run(tmp_path: Path) -> None:
+    db_path = tmp_path / "rli.db"
+
+    with respx.mock:
+        _mock_run_cli_greenhouse()
+        run_result = runner.invoke(
+            app, ["run", "--system", "A", "--url", RUN_CLI_URL, "--db", str(db_path)]
+        )
+    assert run_result.exit_code == 0, run_result.output
+
+    summary_result = runner.invoke(app, ["runs-summary", "--system", "A", "--db", str(db_path)])
+
+    assert summary_result.exit_code == 0, summary_result.output
+    assert "actions:" in summary_result.stdout
+    start = run_result.output.index("{")
+    decision_payload = json.loads(run_result.output[start:])
+    assert decision_payload["recommended_action"] in summary_result.stdout

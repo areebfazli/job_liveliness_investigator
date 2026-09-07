@@ -5,15 +5,9 @@ description similarity. Keep thresholds configurable and validate match
 precision on a hand-checked sample of 50 matches." `rli.history.sample`
 produces that sample from the ranked output of this module.
 
-CONFIG CHOICE (option (a) of the two offered): the per-component minimums
-already in `[thresholds]` — `repost_title_similarity`,
-`repost_description_similarity`, `repost_team_similarity`,
-`repost_location_similarity` — are reused as-is rather than duplicated into
-a near-identical `[matching]` table, and only the two genuinely new knobs
-are added to the SAME `Thresholds` model / `[thresholds]` table:
-`repost_combined_min` and `repost_max_gap_days`. Both are given defaults in
-`rli.config.Thresholds` so configs that predate them keep validating
-(`extra="forbid"` is untouched).
+CONFIG: every knob lives in the `[matching]` table (`rli.config.Matching`).
+That table is authoritative; the older `[thresholds].repost_*` keys it
+replaced are no longer read here.
 
 Scoring (all GUESSED weights/shapes, placeholders pending the hand-checked
 50-match validation in PLAN.md M2):
@@ -43,44 +37,92 @@ mode spec.md §4 forbids for coverage gaps.
 Combined score = weighted mean over KNOWN components with weights
 `title 0.45, description 0.25, team 0.15, location 0.15`.
 
-Match decision (`is_match`), in order:
+--------------------------------------------------------------------------
+Hard gates, applied BEFORE scoring
+--------------------------------------------------------------------------
 
-1. Hard gates, applied before scoring — a candidate failing any of these is
-   never scored or returned at all:
-   - **same `company_id`** (a cross-company candidate is excluded outright,
-     regardless of how well it scores),
-   - the candidate is a different job than the old posting,
-   - the old posting actually disappeared (`first_seen_absent` is set),
-   - the candidate first appeared strictly AFTER the old posting's
-     `last_seen_open` (a repost cannot predate the original's last open
-     sighting),
-   - `gap_days` = (candidate `first_observed` - old `first_seen_absent`) in
-     days is `<= repost_max_gap_days`. There is deliberately no lower bound
-     beyond the previous rule: a repost may legitimately appear inside the
-     old posting's censoring interval `(last_seen_open, first_seen_absent]`,
-     which yields a small negative gap.
-   - both sides have a title (title is the mandatory component; a titleless
-     candidate can never be matched).
-2. `title >= thresholds.repost_title_similarity` AND
-   `combined >= thresholds.repost_combined_min`.
+A candidate failing any of these is never scored and never appears in the
+ranking at all. They encode facts, not tuning:
 
-The remaining three per-component thresholds are NOT additional veto gates —
-requiring, say, an exact location match would reject the very common
-"same role reposted with a broadened location" case. They are used to record
-which components INDEPENDENTLY corroborate a match (`MatchCandidate.passed`,
-persisted in `repost_links.component_scores` and exported in the hand-check
-CSV), and `rli.history.features` uses `passed['title']` + `passed
-['description']` to distinguish a `'repeated_unchanged'` repost from a
-`'changed'` one.
+1. **Same company.** A cross-company pair is not constructed by
+   `rank_matches` and is rejected outright by `score_pair`.
+2. **Not the same job — the version rule.** spec.md §4 distinguishes a
+   *repost* (the role comes back under a NEW ATS job id) from a *version*
+   (the SAME ATS job id stays live while its content hash changes). A
+   version is a single continuous posting and must never be linked to
+   itself as a repost. Two guards enforce it: the pair must have different
+   `job_id`s (one `PostingInterval` is derived per `(company_id, job_id)`,
+   so a content-hash change under a stable id produces exactly one
+   interval, which is never absent and so is never even a candidate `old`),
+   and, defensively, the pair must not share a canonical `url`.
+3. **The old posting actually disappeared** (`first_seen_absent` is set).
+4. **Temporal ordering.** The candidate's `first_observed` must be strictly
+   AFTER the old posting's `last_seen_open`: a role cannot be reposted
+   before the last time we saw the original open.
+5. **Ordering relative to the observed absence.** `gap_days` (the
+   candidate's `first_observed` minus the old posting's
+   `first_seen_absent`, in days) must satisfy
+   `-pre_absence_tolerance_days < gap_days <= max_gap_days`. The upper
+   bound is the "how long can a repost gap be" knob. The lower bound is the
+   tolerance for a repost that first appeared INSIDE the old posting's
+   censoring interval `(last_seen_open, first_seen_absent]` — with sparse
+   Wayback captures the very common shape is one capture that shows the old
+   job gone and the new one present, which is `gap_days == 0`.
+6. **No coexistence.** If any single capture listed BOTH jobs, they are
+   coexisting roles, not a role and its repost. This is implied by gate (4)
+   for as long as that gate stays strict, but it is enforced independently
+   over `PostingInterval.present_snapshot_ids` so that relaxing the
+   timestamp comparison can never silently readmit side-by-side postings.
+7. **Both sides carry a usable title.** Title is the mandatory component,
+   and "usable" means `rli.history.titles.is_junk_title` says no: scraped
+   board pages yield link text like `"Apply"` / `"View"` / `""` rather than
+   a role name, and a page of those produces N postings that all score 1.0
+   against one another. The same module gates the archive HTML extractor,
+   so junk is normally never persisted; this gate covers rows written
+   before that fix.
+
+--------------------------------------------------------------------------
+Match decision
+--------------------------------------------------------------------------
+
+A candidate that survives the gates `passes_thresholds` when:
+
+* `title >= matching.title_min`, AND
+* `combined >= matching.combined_min`, AND
+* **at least one other component corroborates it** — some component among
+  team / location / description that is KNOWN for both sides meets its own
+  minimum (`team_min` / `location_min` / `description_min`). Corroboration
+  is required rather than each component being a veto: requiring an exact
+  location match would reject the very common "same role reposted with a
+  broadened location", but requiring *something* beyond the title stops two
+  unrelated postings from linking on a generic title alone.
+* When NO other component is known for both sides, there is nothing to
+  corroborate with, so the title bar is raised to `matching.title_only_min`
+  instead (and the corroboration requirement is waived rather than made
+  unsatisfiable).
+
+`passes_thresholds` is necessary but not sufficient. A final **one-to-one
+assignment** is applied over the whole ranking: candidates are considered in
+descending combined-score order (ties broken by `(old_job_id, new_job_id)`
+for reproducibility) and greedily accepted only while neither side has been
+used, so **each disappeared posting links to at most one repost and each
+repost is claimed by at most one disappeared posting**. Without it, one
+capture that introduces five "Software Engineer" postings after five closed
+"Software Engineer" postings produces 25 mutual links. `is_match` reflects
+the assignment; `passes_thresholds` reflects only the scores, and
+`reject_reason` says which of the two rejected a candidate — all three are
+exported to the hand-check CSV.
 
 `link_reposts` write rules:
 
-* Candidates are applied in DESCENDING combined-score order, so within a run
-  the BEST match wins for a given old posting.
-* An existing non-NULL `postings.replacement_job_id` is NEVER overwritten —
-  whether it was set by an earlier run of this function or by another part
-  of the system. Re-running is therefore idempotent and non-destructive; to
-  re-link, clear the column first.
+* Only assigned matches (`is_match`) are written.
+* The one-to-one invariant is upheld ACROSS runs as well as within one: a
+  `postings` row that already has a `replacement_job_id`, and a posting that
+  is already some other posting's `replacement_job_id`, are both treated as
+  taken.
+* An existing non-NULL `postings.replacement_job_id` is NEVER overwritten.
+  Re-running is therefore idempotent and non-destructive; to re-link, clear
+  the derived columns first — that is what `rli.history.cli rebuild` does.
 * `reappeared_at` is set on the disappeared posting (only when NULL) to the
   matched candidate's `first_observed`. Semantic note: `reappeared_at`
   strictly means "this same job id was listed again"; a repost is a
@@ -104,15 +146,18 @@ from difflib import SequenceMatcher
 
 from pydantic import BaseModel, ConfigDict
 
-from rli.config import Config
+from rli.config import Config, Matching
 from rli.history.closures import PostingInterval, build_intervals
+from rli.history.titles import is_junk_title
 from rli.models.time import now_utc, to_utc_z
 
 __all__ = [
     "COMPONENT_WEIGHTS",
+    "CORROBORATING_COMPONENTS",
     "ComponentScores",
     "MatchCandidate",
     "RepostLinkSummary",
+    "assign_one_to_one",
     "link_reposts",
     "normalize_text",
     "rank_matches",
@@ -131,7 +176,14 @@ COMPONENT_WEIGHTS: dict[str, float] = {
     "location": 0.15,
 }
 
-_NON_ALNUM = re.compile(r"[^0-9a-z]+")
+# The components that may INDEPENDENTLY corroborate a title match. Title is
+# excluded by construction: it cannot corroborate itself.
+CORROBORATING_COMPONENTS: tuple[str, ...] = ("description", "team", "location")
+
+# Unicode-aware, and identical to `rli.history.titles`'s pattern by
+# construction: the junk-title policy and the similarity scorer must agree
+# on what a string is. See that module for why an ASCII-only class is wrong.
+_NON_ALNUM = re.compile(r"[\W_]+")
 
 
 def normalize_text(value: str | None) -> str:
@@ -140,7 +192,8 @@ def normalize_text(value: str | None) -> str:
     Deliberately crude and dependency-free: it folds punctuation and casing
     ("Sr. Engineer (Remote)" -> "sr engineer remote") without stemming or a
     stopword list, both of which would need tuning data this project does
-    not have yet.
+    not have yet. Identical to `rli.history.titles.normalize_title`, so the
+    junk-title policy and the similarity scorer agree on what a string is.
     """
     if value is None:
         return ""
@@ -172,6 +225,22 @@ def _description_score(left: str | None, right: str | None) -> float | None:
     if not left or not right:
         return None
     return 1.0 if left == right else 0.0
+
+
+def _same_underlying_job(old: PostingInterval, new: PostingInterval) -> bool:
+    """True when the two intervals describe ONE job — a version, not a repost.
+
+    See gate (2) in the module docstring. `job_id` equality is the primary
+    test (and is structurally sufficient, since `build_intervals` derives
+    exactly one interval per `(company_id, job_id)` however many times the
+    job's content hash changed). Equal canonical URLs are a second, cheap
+    guard for an ATS that re-issues an id while keeping the posting URL.
+    """
+    if old.job_id == new.job_id:
+        return True
+    if old.url and new.url and old.url.strip().rstrip("/") == new.url.strip().rstrip("/"):
+        return True
+    return False
 
 
 class ComponentScores(BaseModel):
@@ -214,14 +283,27 @@ class MatchCandidate(BaseModel):
     components: ComponentScores
     combined: float
     # Per-component "does this component independently corroborate the
-    # match" flags, from the `[thresholds].repost_*_similarity` minimums.
+    # match" flags, from the `[matching]` per-component minimums.
     # Components that are unknown are absent from this mapping.
     passed: dict[str, bool]
+    # True when some component OTHER than title is known for both sides and
+    # meets its own minimum. False both when nothing corroborates and when
+    # there was nothing available to corroborate with (see `title_only`).
+    corroborated: bool
+    # True when title was the only component known for both sides, so the
+    # stricter `matching.title_only_min` bar applied.
+    title_only: bool
     # Days from the old posting's `first_seen_absent` to the candidate's
-    # `first_observed`. May be negative when the repost appeared inside the
-    # old posting's censoring interval.
+    # `first_observed`. May be negative (bounded by
+    # `matching.pre_absence_tolerance_days`) when the repost appeared inside
+    # the old posting's censoring interval.
     gap_days: float
+    # Score-only verdict, before the one-to-one assignment.
+    passes_thresholds: bool
+    # Final verdict: `passes_thresholds` AND won the one-to-one assignment.
     is_match: bool
+    # None when `is_match`; otherwise "thresholds" or "assignment".
+    reject_reason: str | None = None
 
 
 @dataclass
@@ -236,6 +318,9 @@ class RepostLinkSummary:
     replacements_kept: int = 0
     reappeared_at_set: int = 0
     unresolved_postings: int = 0
+    # Assigned matches skipped because the candidate repost was already
+    # claimed by a DIFFERENT disappeared posting in an earlier run.
+    new_posting_taken: int = 0
 
     def describe(self) -> str:
         return (
@@ -245,6 +330,7 @@ class RepostLinkSummary:
             f"replacement_set={self.replacements_set} "
             f"replacement_kept={self.replacements_kept} "
             f"reappeared_at_set={self.reappeared_at_set} "
+            f"new_taken={self.new_posting_taken} "
             f"unresolved={self.unresolved_postings}"
         )
 
@@ -257,29 +343,49 @@ class RepostLinkSummary:
 # ---------------------------------------------------------------------------
 
 
+def _component_minimums(matching: Matching) -> dict[str, float]:
+    return {
+        "title": matching.title_min,
+        "team": matching.team_min,
+        "location": matching.location_min,
+        "description": matching.description_min,
+    }
+
+
 def score_pair(old: PostingInterval, new: PostingInterval, cfg: Config) -> MatchCandidate | None:
     """Score one candidate pair, or return None if a hard gate rejects it.
 
-    Hard gates (see module docstring): same company, different job, the old
-    posting really disappeared, the candidate appeared after the old
-    posting's last open sighting, the gap is within
-    `repost_max_gap_days`, and both sides carry a title.
+    The gates are enumerated in the module docstring; each is applied here
+    in the same order, cheapest and most structural first.
     """
-    thresholds = cfg.thresholds
+    matching = cfg.matching
 
+    # (1) same company
     if old.company_id != new.company_id:
         return None
-    if old.job_id == new.job_id:
+    # (2) a version (one job) is not a repost (two jobs)
+    if _same_underlying_job(old, new):
         return None
+    # (3) the old posting actually disappeared
     if old.first_seen_absent is None:
         return None
+    # (4) temporal ordering
     if new.first_observed <= old.last_seen_open:
         return None
-    if not old.title or not new.title:
-        return None
-
+    # (5) ordering relative to the observed absence
     gap_days = (new.first_observed - old.first_seen_absent).total_seconds() / 86400.0
-    if gap_days > thresholds.repost_max_gap_days:
+    if gap_days <= -matching.pre_absence_tolerance_days:
+        return None
+    if gap_days > matching.max_gap_days:
+        return None
+    # (6) never listed together in one capture
+    if old.coexists_with(new):
+        return None
+    # (7) both sides carry a usable, non-junk title
+    min_chars = matching.junk_title_min_chars
+    if is_junk_title(old.title, min_chars=min_chars):
+        return None
+    if is_junk_title(new.title, min_chars=min_chars):
         return None
 
     components = ComponentScores(
@@ -297,15 +403,19 @@ def score_pair(old: PostingInterval, new: PostingInterval, cfg: Config) -> Match
     weight_total = sum(COMPONENT_WEIGHTS[name] for name in known)
     combined = sum(COMPONENT_WEIGHTS[name] * value for name, value in known.items()) / weight_total
 
-    minimums = {
-        "title": thresholds.repost_title_similarity,
-        "team": thresholds.repost_team_similarity,
-        "location": thresholds.repost_location_similarity,
-        "description": thresholds.repost_description_similarity,
-    }
+    minimums = _component_minimums(matching)
     passed = {name: value >= minimums[name] for name, value in known.items()}
 
-    is_match = passed["title"] and combined >= thresholds.repost_combined_min
+    available = [name for name in CORROBORATING_COMPONENTS if name in known]
+    title_only = not available
+    corroborated = any(passed[name] for name in available)
+
+    title_bar = matching.title_only_min if title_only else matching.title_min
+    passes_thresholds = (
+        known["title"] >= title_bar
+        and combined >= matching.combined_min
+        and (title_only or corroborated)
+    )
 
     return MatchCandidate(
         company_id=old.company_id,
@@ -321,9 +431,62 @@ def score_pair(old: PostingInterval, new: PostingInterval, cfg: Config) -> Match
         components=components,
         combined=combined,
         passed=passed,
+        corroborated=corroborated,
+        title_only=title_only,
         gap_days=gap_days,
-        is_match=is_match,
+        passes_thresholds=passes_thresholds,
+        # Provisional; `assign_one_to_one` has the final say.
+        is_match=passes_thresholds,
+        reject_reason=None if passes_thresholds else "thresholds",
     )
+
+
+def assign_one_to_one(candidates: list[MatchCandidate]) -> list[MatchCandidate]:
+    """Resolve `passes_thresholds` candidates into a one-to-one assignment.
+
+    `candidates` must already be in descending combined-score order with a
+    deterministic tiebreak (`rank_matches` sorts them). Candidates are taken
+    greedily in that order and accepted only while NEITHER side has been
+    used, so the best-scoring pairing wins and every posting appears on at
+    most one accepted link — as an old posting or as a new one, never both
+    ways round.
+
+    Returns a NEW list in the same order with `is_match` / `reject_reason`
+    finalized. Candidates that never passed the thresholds keep
+    `reject_reason="thresholds"`; those that passed but lost the assignment
+    get `reject_reason="assignment"`.
+
+    Greedy (rather than an optimal assignment) is a deliberate choice: it is
+    O(n) after the sort, it is stable and explainable ("the best available
+    pairing was taken first"), and with a hard `title_min` the score matrix
+    is far too sparse for the optimal solution to differ often. Postings are
+    keyed by `(company_id, job_id)` so identical job ids under different
+    companies cannot collide.
+    """
+    used_old: set[tuple[str, str]] = set()
+    used_new: set[tuple[str, str]] = set()
+    resolved: list[MatchCandidate] = []
+
+    for candidate in candidates:
+        if not candidate.passes_thresholds:
+            resolved.append(
+                candidate.model_copy(update={"is_match": False, "reject_reason": "thresholds"})
+            )
+            continue
+
+        old_key = (candidate.company_id, candidate.old_job_id)
+        new_key = (candidate.company_id, candidate.new_job_id)
+        if old_key in used_old or new_key in used_new:
+            resolved.append(
+                candidate.model_copy(update={"is_match": False, "reject_reason": "assignment"})
+            )
+            continue
+
+        used_old.add(old_key)
+        used_new.add(new_key)
+        resolved.append(candidate.model_copy(update={"is_match": True, "reject_reason": None}))
+
+    return resolved
 
 
 def rank_matches(
@@ -341,12 +504,15 @@ def rank_matches(
     alone scored. Ties are broken by `(old_job_id, new_job_id)` so the
     ranking is reproducible for the hand-checked sample.
 
+    The returned list is the ASSIGNED ranking: `is_match` is true only for
+    candidates that both pass the thresholds and win the one-to-one
+    assignment (see `assign_one_to_one`). `matches_only=True` filters to
+    those.
+
     `intervals` may be supplied to avoid recomputing closures when the
     caller already has them; otherwise they are derived here.
     """
-    all_intervals = (
-        intervals if intervals is not None else build_intervals(conn, company_id)
-    )
+    all_intervals = intervals if intervals is not None else build_intervals(conn, company_id)
 
     by_company: dict[str, list[PostingInterval]] = {}
     for interval in all_intervals:
@@ -362,17 +528,38 @@ def rank_matches(
                 scored = score_pair(old, new, cfg)
                 if scored is None:
                     continue
-                if matches_only and not scored.is_match:
-                    continue
                 candidates.append(scored)
 
     candidates.sort(key=lambda c: (-c.combined, c.old_job_id, c.new_job_id))
-    return candidates
+    assigned = assign_one_to_one(candidates)
+    if matches_only:
+        return [c for c in assigned if c.is_match]
+    return assigned
 
 
 # ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------
+
+
+def _claimed_replacements(
+    conn: sqlite3.Connection, company_id: str | None
+) -> tuple[dict[str, str], set[str]]:
+    """`(old_posting_id -> replacement_job_id, {claimed new posting ids})`.
+
+    Read once per run so the cross-run half of the one-to-one invariant can
+    be enforced without a query per candidate.
+    """
+    sql = "SELECT posting_id, replacement_job_id FROM postings WHERE replacement_job_id IS NOT NULL"
+    params: tuple[str, ...] = ()
+    if company_id is not None:
+        sql += " AND company_id = ?"
+        params = (company_id,)
+
+    existing: dict[str, str] = {}
+    for row in conn.execute(sql, params):
+        existing[row["posting_id"]] = row["replacement_job_id"]
+    return existing, set(existing.values())
 
 
 def link_reposts(
@@ -390,12 +577,17 @@ def link_reposts(
     `postings.replacement_job_id` and `repost_links` are foreign keys into
     `postings`. Such candidates are skipped and counted in
     `unresolved_postings` rather than silently dropped.
+
+    Idempotent: a second run over unchanged data writes nothing (every link
+    is already present and every `replacement_job_id` is already set).
     """
     reference = now or now_utc()
     summary = RepostLinkSummary()
 
     ranked = rank_matches(conn, cfg, company_id)
     summary.candidates_scored = len(ranked)
+
+    replaced_by, claimed_new = _claimed_replacements(conn, company_id)
 
     for candidate in ranked:
         if not candidate.is_match:
@@ -408,9 +600,18 @@ def link_reposts(
         if candidate.old_posting_id == candidate.new_posting_id:
             continue
 
+        old_id = candidate.old_posting_id
+        new_id = candidate.new_posting_id
+
+        # Cross-run half of the one-to-one invariant: a repost already
+        # claimed by a DIFFERENT disappeared posting is not available.
+        if new_id in claimed_new and replaced_by.get(old_id) != new_id:
+            summary.new_posting_taken += 1
+            continue
+
         existing = conn.execute(
             "SELECT replacement_job_id, reappeared_at FROM postings WHERE posting_id = ?",
-            (candidate.old_posting_id,),
+            (old_id,),
         ).fetchone()
         if existing is None:  # pragma: no cover - resolved ids always exist
             summary.unresolved_postings += 1
@@ -418,7 +619,7 @@ def link_reposts(
 
         already_linked = conn.execute(
             "SELECT 1 FROM repost_links WHERE old_posting_id = ? AND new_posting_id = ?",
-            (candidate.old_posting_id, candidate.new_posting_id),
+            (old_id, new_id),
         ).fetchone()
         if already_linked is None:
             conn.execute(
@@ -430,14 +631,17 @@ def link_reposts(
                 """,
                 (
                     candidate.company_id,
-                    candidate.old_posting_id,
-                    candidate.new_posting_id,
+                    old_id,
+                    new_id,
                     candidate.combined,
                     json.dumps(
                         {
                             "scores": candidate.components.as_dict(),
                             "passed": candidate.passed,
+                            "corroborated": candidate.corroborated,
+                            "title_only": candidate.title_only,
                             "gap_days": candidate.gap_days,
+                            "new_first_observed": to_utc_z(candidate.new_first_observed),
                         },
                         sort_keys=True,
                     ),
@@ -451,13 +655,15 @@ def link_reposts(
         if existing["replacement_job_id"] is None:
             conn.execute(
                 "UPDATE postings SET replacement_job_id = ?, updated_at = ? WHERE posting_id = ?",
-                (candidate.new_posting_id, to_utc_z(reference), candidate.old_posting_id),
+                (new_id, to_utc_z(reference), old_id),
             )
             summary.replacements_set += 1
+            replaced_by[old_id] = new_id
+            claimed_new.add(new_id)
             if existing["reappeared_at"] is None:
                 conn.execute(
                     "UPDATE postings SET reappeared_at = ? WHERE posting_id = ?",
-                    (to_utc_z(candidate.new_first_observed), candidate.old_posting_id),
+                    (to_utc_z(candidate.new_first_observed), old_id),
                 )
                 summary.reappeared_at_set += 1
         else:

@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import json
+
 import typer
 
 from rli.archive.cli import app as archive_app
 from rli.config import load_config
 from rli.db import connect, init_db
+from rli.eval.report import summarize_runs
+from rli.eval.system_a import run_system_a
+from rli.eval.system_b import run_system_b
+from rli.history.cli import app as history_app
 from rli.models.time import now_utc
 from rli.snapshots.daily import run_daily_snapshot
 from rli.snapshots.targets import DEFAULT_TARGETS_PATH, load_targets, upsert_companies
@@ -17,6 +23,7 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(archive_app, name="archive")
+app.add_typer(history_app, name="history")
 
 # Default DB path shared by every command below, for consistency.
 _DEFAULT_DB_PATH = "./data/rli.db"
@@ -153,6 +160,92 @@ def snapshot_status_command(
             "SELECT COUNT(*) AS n FROM capture_attempts WHERE ok = 0"
         ).fetchone()["n"]
         typer.echo(f"coverage gaps (failed capture_attempts): {gap_count}")
+    finally:
+        conn.close()
+
+
+# The spec.md §6 systems this CLI can drive. C / C2 land in PLAN.md M5.
+_SYSTEMS = ("A", "B")
+
+
+def _normalized_system(system: str) -> str:
+    """Validate `--system`, accepting either case, or raise a typer error.
+
+    `typer.BadParameter` rather than a bare `ValueError` so the user gets the
+    usual "Invalid value for '--system'" message and exit code 2, instead of
+    a traceback.
+    """
+    normalized = system.strip().upper()
+    if normalized not in _SYSTEMS:
+        raise typer.BadParameter(
+            f"unknown system {system!r}; expected one of {', '.join(_SYSTEMS)}",
+            param_hint="--system",
+        )
+    return normalized
+
+
+@app.command("run")
+def run_command(
+    system: str = typer.Option(
+        ...,
+        "--system",
+        help="Which system to run: A (full probes) or B (deterministic rules).",
+    ),
+    url: str = typer.Option(..., "--url", help="The job posting URL to investigate."),
+    db: str = typer.Option(
+        _DEFAULT_DB_PATH,
+        "--db",
+        help="Path to the SQLite database file.",
+    ),
+) -> None:
+    """Investigate one URL and print the spec.md §1 decision as JSON.
+
+    STDOUT carries the decision JSON and nothing else, so the command can be
+    piped into `jq` or a benchmark harness; the run id (an internal trace
+    handle, spec.md §1: "The internal run trace, not the user output") goes
+    to stderr.
+
+    Key order matches spec.md §1 exactly because it is
+    `Decision.model_dump(mode="json")` and `rli.models.decision.Decision`
+    declares its fields in that order.
+    """
+    chosen = _normalized_system(system)
+    cfg = load_config()
+    init_db(db)
+    conn = connect(db)
+    try:
+        runner = run_system_a if chosen == "A" else run_system_b
+        result = runner(conn, cfg, url)
+        typer.echo(
+            f"run_id={result.run_id} system={result.system} "
+            f"probes={','.join(result.probes_run) or '(none)'}"
+            + (f" route={result.route_rule}" if result.route_rule else ""),
+            err=True,
+        )
+        typer.echo(json.dumps(result.decision.model_dump(mode="json"), indent=2))
+    finally:
+        conn.close()
+
+
+@app.command("runs-summary")
+def runs_summary_command(
+    system: str = typer.Option(
+        ...,
+        "--system",
+        help="Which system to summarize: A or B.",
+    ),
+    db: str = typer.Option(
+        _DEFAULT_DB_PATH,
+        "--db",
+        help="Path to the SQLite database file.",
+    ),
+) -> None:
+    """Print the spec.md §6 baseline figures for one system's recorded runs."""
+    chosen = _normalized_system(system)
+    init_db(db)
+    conn = connect(db)
+    try:
+        typer.echo(summarize_runs(conn, chosen).describe())
     finally:
         conn.close()
 

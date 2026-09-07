@@ -34,6 +34,7 @@ __all__ = [
     "Allowlists",
     "Budgets",
     "Config",
+    "Matching",
     "Net",
     "Policy",
     "ProbeCosts",
@@ -73,27 +74,6 @@ class Thresholds(BaseModel):
     recent_publish_days: int = Field(ge=0)
     long_lived_days: int = Field(ge=0)
 
-    # Similarity scores are ratios in [0, 1] (spec.md §4 repost matching).
-    repost_title_similarity: float = Field(ge=0.0, le=1.0)
-    repost_description_similarity: float = Field(ge=0.0, le=1.0)
-    repost_team_similarity: float = Field(ge=0.0, le=1.0)
-    repost_location_similarity: float = Field(ge=0.0, le=1.0)
-
-    # Added for rli.history.matching (PLAN.md M2 #2). The four
-    # `repost_*_similarity` knobs above stay the per-component minimums; only
-    # these two genuinely new knobs are added, rather than duplicating them
-    # into a separate `[matching]` table. Both carry defaults so a config
-    # predating them (e.g. an inline TOML fixture) keeps validating, the same
-    # convention `negative_event_window_days` below follows.
-    #
-    # Minimum weighted-mean similarity across the KNOWN components for a
-    # repost link to be accepted. PLACEHOLDER — pending the hand-checked
-    # 50-match precision validation in spec.md §4.
-    repost_combined_min: float = Field(0.70, ge=0.0, le=1.0)
-    # Maximum days from a posting's `first_seen_absent` to a candidate
-    # repost's `first_observed` for that candidate to be considered at all.
-    repost_max_gap_days: int = Field(120, ge=0)
-
     # Minimum observed history span (days) before rli.history.features will
     # express an opinion on a history-derived input such as `repost_pattern`.
     # Below it the feature is the `rli.models.policy_inputs.UNKNOWN` sentinel,
@@ -106,6 +86,87 @@ class Thresholds(BaseModel):
     # Defaults to 180 so configs that predate this field (e.g. inline TOML
     # fixtures in tests) keep validating unchanged.
     negative_event_window_days: int = Field(180, ge=1)
+
+
+class Matching(BaseModel):
+    """`[matching]` — repost/version matching knobs (spec.md §4).
+
+    spec.md §4: "Match reposted/versioned roles using title, team, location,
+    and description similarity. Keep thresholds configurable and validate
+    match precision on a hand-checked sample of 50 matches." This table is
+    where those thresholds are kept, and it is AUTHORITATIVE for
+    `rli.history.matching` / `rli.history.features`.
+
+    Relationship to `[thresholds]`: the older `[thresholds].repost_*` keys
+    are superseded by the keys here and are no longer read by any code
+    path. They are left in place (and still validated) so that an existing
+    `config.toml` keeps loading unchanged; a future cleanup can delete them
+    from both files in one commit.
+
+    Every value carries a default so a config predating this table (an
+    inline TOML fixture in a test, for instance) keeps validating — the same
+    convention `Thresholds.negative_event_window_days` established.
+
+    All numbers here are PLACEHOLDERS pending the hand-checked 50-match
+    precision validation spec.md §4 requires.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    # --- similarity gates -------------------------------------------------
+    # Mandatory minimum on the title component. Title is the only component
+    # guaranteed to exist, so it is always a hard gate.
+    title_min: float = Field(0.85, ge=0.0, le=1.0)
+    # Higher bar applied when title is the ONLY known component (no team,
+    # location or description hash on either side). With nothing to
+    # corroborate it, a merely "similar" title is not evidence of a repost —
+    # two unrelated "Software Engineer" postings would otherwise link.
+    title_only_min: float = Field(0.95, ge=0.0, le=1.0)
+    # Per-component minimums that count as INDEPENDENT corroboration of a
+    # match. At least one of them must be met (on a component that is known
+    # for both sides) before a link is accepted.
+    team_min: float = Field(0.80, ge=0.0, le=1.0)
+    location_min: float = Field(0.90, ge=0.0, le=1.0)
+    description_min: float = Field(0.80, ge=0.0, le=1.0)
+    # Minimum weighted-mean similarity over the KNOWN components.
+    combined_min: float = Field(0.70, ge=0.0, le=1.0)
+
+    # --- temporal gates ---------------------------------------------------
+    # Maximum days from the old posting's `first_seen_absent` to the
+    # candidate's `first_observed`.
+    max_gap_days: int = Field(120, ge=0)
+    # How far BEFORE the old posting's first observed absence a candidate
+    # may already have been live and still count as its repost. Captures are
+    # sparse, so a repost can legitimately first appear inside the censoring
+    # interval `(last_seen_open, first_seen_absent]`; this bounds how far
+    # into that interval the match may reach. 0.0 means "the repost must be
+    # first observed strictly after we saw the old posting gone", which also
+    # rejects the common case of one capture showing the old job absent and
+    # the new job present.
+    pre_absence_tolerance_days: float = Field(7.0, ge=0.0)
+
+    # --- title quality (shared with `rli.archive.backfill`) ---------------
+    # Minimum normalized length for a string to be accepted as a job title.
+    junk_title_min_chars: int = Field(3, ge=1)
+    # A scraped page whose most common title covers more than this fraction
+    # of its jobs is treated as an extraction failure (coverage gap), not as
+    # a board on which every role has the same name.
+    page_shared_title_max_fraction: float = Field(0.60, gt=0.0, le=1.0)
+    # Below this many jobs the fraction above is arithmetically meaningless
+    # (1 of 1 job is always 100%), so it is not applied.
+    page_shared_title_min_jobs: int = Field(3, ge=2)
+
+    @model_validator(mode="after")
+    def _check_title_bars(self) -> Matching:
+        # Cross-field rule: the uncorroborated bar must be at least as
+        # strict as the corroborated one, or `title_only_min` would silently
+        # LOOSEN the gate it exists to tighten.
+        if self.title_only_min < self.title_min:
+            raise ValueError(
+                f"matching.title_only_min ({self.title_only_min}) must be >= "
+                f"matching.title_min ({self.title_min})"
+            )
+        return self
 
 
 class Budgets(BaseModel):
@@ -300,6 +361,7 @@ class Config(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     thresholds: Thresholds
+    matching: Matching = Field(default_factory=Matching)
     budgets: Budgets
     net: Net
     rate_limits: dict[str, RateLimit]

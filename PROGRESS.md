@@ -6,8 +6,8 @@ Tracks milestone status against PLAN.md (which is frozen). Update this file only
 |---|---|---|
 | M0 Skeleton | done | 146 tests, ruff clean, `rli init-db` idempotent, 13 tables (9 spec + llm_cache, tool_cache, board_snapshot_jobs, capture_attempts) |
 | M1 Data foundation | nearly done | Adapters (GH/Ashby/Lever/JSON-LD) live-verified; 78 targets audited; `rli snapshot` daily job + `rli archive backfill` built and tested (250 tests). Cron installed (06:00 UTC); day-0 snapshot done (78/78, 7699 postings); 12-month backfill run 2026-09-07. Remaining: 3 unattended days, coverage report + feasibility decision. |
-| M2 Evidence layer | in progress | history (closures, matching, features, sample export) + events store built, 347 tests. Remaining: hand-check 50 matches -> data/match_precision.md; event collection covers only 15/78 companies (web-search cap), rerun in a fresh session. |
-| M3 Probes, policy, baselines | in progress | 4 dynamic probes + registry, policy inputs/quality/action/splits built (595 tests). Remaining: Systems A/B runners, policy tuning + freeze on temporal-validation data. |
+| M2 Evidence layer | in progress | history (closures, matching, features, sample export) + events store built, 347 tests. Matching fixed (Lever 'Apply' anchor bug, temporal gates, one-to-one): 143 links on real data. Re-backfill with fixed extractor 2026-09-07. Remaining: hand-check 50 matches -> data/match_precision.md; event collection covers only 15/78 companies (web-search cap), rerun in a fresh session. |
+| M3 Probes, policy, baselines | nearly done | Probes, registry, policy, splits, Systems A/B (`rli run --system A|B`), 707 tests; live A/B agree on 3 URLs. Remaining: policy tuning + freeze on temporal-validation data (needs collection window). |
 | M4 Replay | todo | |
 | M5 Agent | todo | |
 | M6 Evaluation | todo | |
@@ -24,3 +24,4 @@ Tracks milestone status against PLAN.md (which is frozen). Update this file only
 - 2026-09-07 M3: policy precedence P1 closed→skip; P2 posting_state unknown→wait (addition to §5 table so resolver failures never yield quick_apply); P3a freeze→wait; P3b declared expiry + not(open∧strong)→wait; P4 repeated_unchanged+long_lived+corroborating False→skip; P5 open+recent+strong+not known-negative→apply_now; P6 mixed/weak→quick_apply; P7 default quick_apply. `material_negative_event` Unknown does not block apply_now (bounded by requiring strong quality); one-token flip documented in rli/policy/action.py.
 - 2026-09-07 M3: recheck_after_days = floor(min(cap, days_until_expiry)), clamped at 0 when expiry passed.
 - 2026-09-07 M3: team_signal disabled (no licensed source). The "repost/long-lived branch reachable" eligibility condition lives in the controller (M5), not the probe.
+- 2026-09-07 M3: System B routing tree b1 documented in rli/eval/system_b.py; version recorded in runs.config_hash. C2 contradiction uses >= so same-run resolver-open vs board-absent counts as mixed.

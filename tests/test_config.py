@@ -20,10 +20,6 @@ recheck_cap_days = 14
 max_dynamic_steps = 4
 recent_publish_days = 14
 long_lived_days = 180
-repost_title_similarity = 0.85
-repost_description_similarity = 0.80
-repost_team_similarity = 0.80
-repost_location_similarity = 0.90
 
 [budgets]
 max_cost_usd = 0.50
@@ -174,7 +170,7 @@ def _mutated(mutate) -> dict[str, Any]:
             id="net_max_backoff_below_base",
         ),
         pytest.param(
-            lambda d: d["thresholds"].__setitem__("repost_title_similarity", 1.5),
+            lambda d: d["matching"].__setitem__("title_min", 1.5),
             id="similarity_above_one",
         ),
     ],

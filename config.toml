@@ -37,28 +37,6 @@ recent_publish_days = 14
 # the action policy (spec.md §5). PLACEHOLDER — not yet tuned.
 long_lived_days = 180
 
-# Repost/version-match similarity thresholds (spec.md §4: "Match reposted/
-# versioned roles using title, team, location, and description similarity.
-# Keep thresholds configurable and validate match precision on a hand-checked
-# sample of 50 matches."). Values are placeholders pending that validation.
-repost_title_similarity = 0.85
-repost_description_similarity = 0.80
-repost_team_similarity = 0.80
-repost_location_similarity = 0.90
-
-# Minimum combined (weighted-mean) similarity for rli.history.matching to
-# accept a repost link, and the maximum days from a posting's
-# `first_seen_absent` to a candidate repost's `first_observed` for that
-# candidate to be considered at all. The four per-component knobs above are
-# reused as-is by that module rather than duplicated into a [matching]
-# table; only these two are new. PLACEHOLDERS pending the hand-checked
-# 50-match precision validation (spec.md §4). At 0.70, a role reposted with
-# the same title/team/location but a changed description (score 0.75) is
-# still linked — that is the "changed repost" case spec.md §5 needs — while a
-# similar-title/different-team/different-location near miss (~0.33) is not.
-repost_combined_min = 0.70
-repost_max_gap_days = 120
-
 # Minimum observed board-history span (days) before rli.history.features
 # will express an opinion on a history-derived policy input such as
 # `repost_pattern`. Below this, the feature is the UNKNOWN sentinel, never a
@@ -70,6 +48,64 @@ min_history_days = 30
 # `company_events` row can still populate the `material_negative_event` /
 # `freeze_or_pause` policy inputs (spec.md §5). PLACEHOLDER — not yet tuned.
 negative_event_window_days = 180
+
+[matching]
+# Repost/version matching (spec.md §4: "Match reposted/versioned roles using
+# title, team, location, and description similarity. Keep thresholds
+# configurable and validate match precision on a hand-checked sample of 50
+# matches."). This table is AUTHORITATIVE for rli.history.matching and
+# rli.history.features; it supersedes the older [thresholds].repost_* keys
+# above, which are now unread by any code path and are kept only so an
+# existing config keeps loading. Everything here is a PLACEHOLDER pending
+# the hand-checked 50-match precision validation.
+
+# --- similarity gates -------------------------------------------------------
+# Mandatory minimum on the title component (title is the only component
+# guaranteed to be present, so it is always a hard gate).
+title_min = 0.85
+# Stricter bar used when title is the ONLY component known for both sides —
+# with no team, location or description hash to corroborate it, a merely
+# "similar" title is not evidence of a repost. Two unrelated "Software
+# Engineer" postings would otherwise link at 1.0.
+title_only_min = 0.95
+# Per-component minimums that count as INDEPENDENT corroboration. At least
+# one must be met (on a component known for both sides) before a link is
+# accepted; they are not vetoes, so "same role reposted with a broadened
+# location" still matches on team or description.
+team_min = 0.80
+location_min = 0.90
+description_min = 0.80
+# Minimum weighted-mean similarity over the KNOWN components. At 0.70 a role
+# reposted with the same title/team/location but a changed description is
+# still linked (the "changed repost" case spec.md §5 needs), while a
+# similar-title/different-team/different-location near miss is not.
+combined_min = 0.70
+
+# --- temporal gates ---------------------------------------------------------
+# Maximum days from the old posting's `first_seen_absent` to the candidate's
+# `first_observed`.
+max_gap_days = 120
+# How far BEFORE the old posting's first observed absence the candidate may
+# already have been live and still count as its repost. Captures are sparse,
+# so a repost can legitimately first appear inside the censoring interval
+# `(last_seen_open, first_seen_absent]`; this bounds how far into it a match
+# may reach. 0.0 would also reject the very common archive case of a single
+# capture that shows the old job gone and the new job present.
+pre_absence_tolerance_days = 7.0
+
+# --- title quality (shared with the rli.archive HTML extractor) -------------
+# Minimum normalized length for a string to be accepted as a job title. Junk
+# link text ("Apply", "View") is rejected by rli.history.titles both at
+# extraction time and at match time.
+junk_title_min_chars = 3
+# A scraped board page whose most common title covers more than this fraction
+# of its jobs is an extraction failure, not a board where every role has the
+# same name: the jobs are dropped and the capture is recorded as
+# coverage_status='partial' (a coverage gap, never an absence).
+page_shared_title_max_fraction = 0.60
+# Below this many jobs the fraction above is arithmetically meaningless
+# (1 of 1 job is always 100%), so it is not applied.
+page_shared_title_min_jobs = 3
 
 [budgets]
 # Maximum USD cost allowed for a single investigation run (LLM + paid probes).

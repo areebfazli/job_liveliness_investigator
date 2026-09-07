@@ -57,6 +57,10 @@ GUESSED / judgment calls made in this module:
 * **Job facts (title/team/location/description_hash/url) are taken from the
   most recent capture that listed the job**, not the first, so downstream
   repost matching compares the posting as it last appeared.
+* **`present_snapshot_ids` is carried on every interval** (the ids of the
+  captures that listed the job). It is the evidence `rli.history.matching`
+  uses to refuse to call two jobs a repost pair when some capture listed
+  both of them at once.
 * **Archive-only postings** (a `(company_id, job_id)` seen in snapshots that
   matches no `postings` row) get a row created by `apply_to_postings` with
   `posting_id = "archive:{company_id}:{job_id}"`, so the synthetic identity
@@ -175,6 +179,18 @@ class PostingInterval(BaseModel):
     # captures did. `archive_only` drives posting-row creation.
     sources: tuple[str, ...] = ()
     capture_count: int = 0
+
+    # `board_snapshots.id` of every capture that LISTED this job, oldest
+    # first. Carried so that `rli.history.matching` can reject a candidate
+    # repost that was ever seen in the SAME capture as the posting it would
+    # replace: two jobs listed side by side on one board are coexisting
+    # roles, not a role and its repost. Derived rather than re-queried
+    # because `build_intervals` already has the presence index in hand.
+    present_snapshot_ids: tuple[int, ...] = ()
+
+    def coexists_with(self, other: PostingInterval) -> bool:
+        """True when both jobs were listed together in at least one capture."""
+        return bool(set(self.present_snapshot_ids) & set(other.present_snapshot_ids))
 
     @property
     def archive_only(self) -> bool:
@@ -341,6 +357,7 @@ def _interval_for_job(
         gap_days=gap_days,
         sources=tuple(sorted({captures[i].source for i in present})),
         capture_count=len(present),
+        present_snapshot_ids=tuple(captures[i].snapshot_id for i in present),
     )
 
 
