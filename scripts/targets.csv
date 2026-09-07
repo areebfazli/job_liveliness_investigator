@@ -1,0 +1,79 @@
+company_name,website_domain,ats,tenant,open_job_count,checked_at
+Affirm,affirm.com,greenhouse,affirm,204,2026-09-07T03:22:59.492376+00:00
+Airbnb,airbnb.com,greenhouse,airbnb,167,2026-09-07T03:23:00.748903+00:00
+Airtable,airtable.com,greenhouse,airtable,16,2026-09-07T03:23:01.936787+00:00
+Asana,asana.com,greenhouse,asana,115,2026-09-07T03:23:03.159483+00:00
+Brex,brex.com,greenhouse,brex,282,2026-09-07T03:23:04.375676+00:00
+Carta,carta.com,greenhouse,carta,61,2026-09-07T03:23:05.627885+00:00
+Chime,chime.com,greenhouse,chime,65,2026-09-07T03:23:07.254470+00:00
+Coinbase,coinbase.com,greenhouse,coinbase,192,2026-09-07T03:23:08.486506+00:00
+Discord,discord.com,greenhouse,discord,48,2026-09-07T03:23:09.925260+00:00
+Duolingo,duolingo.com,greenhouse,duolingo,89,2026-09-07T03:23:11.382685+00:00
+Elastic,elastic.co,greenhouse,elastic,365,2026-09-07T03:23:12.522876+00:00
+Faire,faire.com,greenhouse,faire,60,2026-09-07T03:23:13.979925+00:00
+Figma,figma.com,greenhouse,figma,157,2026-09-07T03:23:15.121206+00:00
+GitLab,gitlab.com,greenhouse,gitlab,229,2026-09-07T03:23:16.377928+00:00
+Grafana Labs,grafana.com,greenhouse,grafanalabs,131,2026-09-07T03:23:17.825490+00:00
+Gusto,gusto.com,greenhouse,gusto,95,2026-09-07T03:23:19.026155+00:00
+Instacart,instacart.com,greenhouse,instacart,110,2026-09-07T03:23:20.270066+00:00
+LaunchDarkly,launchdarkly.com,greenhouse,launchdarkly,48,2026-09-07T03:23:21.420508+00:00
+Mercury,mercury.com,greenhouse,mercury,58,2026-09-07T03:23:22.766514+00:00
+Miro,miro.com,greenhouse,realtimeboardglobal,38,2026-09-07T03:23:23.998864+00:00
+Okta,okta.com,greenhouse,okta,313,2026-09-07T03:23:25.140157+00:00
+PagerDuty,pagerduty.com,greenhouse,pagerduty,43,2026-09-07T03:23:26.292792+00:00
+Pinterest,pinterest.com,greenhouse,pinterest,189,2026-09-07T03:23:27.434061+00:00
+Postman,postman.com,greenhouse,postman,63,2026-09-07T03:23:28.661586+00:00
+Reddit,reddit.com,greenhouse,reddit,148,2026-09-07T03:23:29.887200+00:00
+Robinhood,robinhood.com,greenhouse,robinhood,128,2026-09-07T03:23:31.079675+00:00
+Scale AI,scale.com,greenhouse,scaleai,215,2026-09-07T03:23:32.347361+00:00
+Twilio,twilio.com,greenhouse,twilio,147,2026-09-07T03:23:33.494786+00:00
+Vercel,vercel.com,greenhouse,vercel,86,2026-09-07T03:23:34.704989+00:00
+Webflow,webflow.com,greenhouse,webflow,29,2026-09-07T03:23:35.855444+00:00
+Ramp,ramp.com,ashby,ramp,142,2026-09-07T03:23:37.059980+00:00
+Linear,linear.app,ashby,linear,29,2026-09-07T03:23:38.461004+00:00
+Modal Labs,modal.com,ashby,modal,30,2026-09-07T03:23:39.615661+00:00
+Replit,replit.com,ashby,replit,71,2026-09-07T03:23:40.762944+00:00
+Notion,notion.com,ashby,notion,133,2026-09-07T03:23:41.987129+00:00
+Temporal Technologies,temporal.io,ashby,temporal,66,2026-09-07T03:23:43.209942+00:00
+PostHog,posthog.com,ashby,posthog,9,2026-09-07T03:23:44.407829+00:00
+incident.io,incident.io,ashby,incident,20,2026-09-07T03:23:45.658465+00:00
+Pinecone,pinecone.io,ashby,pinecone,6,2026-09-07T03:23:46.805779+00:00
+Baseten,baseten.co,ashby,baseten,88,2026-09-07T03:23:47.945044+00:00
+Attio,attio.com,ashby,attio,48,2026-09-07T03:23:49.166895+00:00
+Vanta,vanta.com,ashby,vanta,111,2026-09-07T03:23:50.333269+00:00
+Drata,drata.com,ashby,drata,37,2026-09-07T03:23:51.551259+00:00
+Middesk,middesk.com,ashby,middesk,20,2026-09-07T03:23:52.719272+00:00
+Watershed,watershed.com,ashby,watershed,32,2026-09-07T03:23:53.904921+00:00
+Ironclad,ironcladapp.com,ashby,ironcladhq,33,2026-09-07T03:23:55.425024+00:00
+Merge,merge.dev,ashby,merge,17,2026-09-07T03:23:56.601583+00:00
+Zip,zip.com,ashby,zip,122,2026-09-07T03:23:57.745379+00:00
+Anrok,anrok.com,ashby,anrok,22,2026-09-07T03:23:58.986023+00:00
+Perplexity AI,perplexity.ai,ashby,perplexity,112,2026-09-07T03:24:00.133843+00:00
+Cognition Labs,cognition.com,ashby,cognition,91,2026-09-07T03:24:01.453418+00:00
+Sierra,sierra.ai,ashby,Sierra,212,2026-09-07T03:24:02.644178+00:00
+Harvey AI,harvey.ai,ashby,harvey,348,2026-09-07T03:24:03.939816+00:00
+ElevenLabs,elevenlabs.io,ashby,elevenlabs,252,2026-09-07T03:24:05.271985+00:00
+Runway,runwayml.com,ashby,runway-ml,40,2026-09-07T03:24:06.591619+00:00
+Gamma,gamma.app,ashby,gamma,32,2026-09-07T03:24:07.789286+00:00
+Clay,clay.com,ashby,claylabs,57,2026-09-07T03:24:08.940654+00:00
+Mistral AI,mistral.ai,ashby,mistral.ai,178,2026-09-07T03:24:10.116095+00:00
+Cursor (Anysphere),cursor.com,ashby,cursor,124,2026-09-07T03:24:11.392326+00:00
+Palantir Technologies,palantir.com,lever,palantir,310,2026-09-07T03:24:12.720030+00:00
+Binance,binance.com,lever,binance,286,2026-09-07T03:24:18.225827+00:00
+Included Health,includedhealth.com,lever,includedhealth,149,2026-09-07T03:24:19.993664+00:00
+HighLevel,gohighlevel.com,lever,gohighlevel,88,2026-09-07T03:24:21.517421+00:00
+Jeeves,tryjeeves.com,lever,tryjeeves,71,2026-09-07T03:24:23.290350+00:00
+Hive,thehive.ai,lever,hive,76,2026-09-07T03:24:24.518012+00:00
+Crypto.com,crypto.com,lever,crypto,56,2026-09-07T03:24:25.775818+00:00
+Ro,ro.co,lever,ro,47,2026-09-07T03:24:27.257596+00:00
+Capital.com,capital.com,lever,capital,38,2026-09-07T03:24:28.508106+00:00
+Rover,rover.com,lever,rover,28,2026-09-07T03:24:29.747164+00:00
+AngelList,angellist.com,lever,angellist,26,2026-09-07T03:24:31.244503+00:00
+Swile,swile.co,lever,swile,25,2026-09-07T03:24:32.461886+00:00
+MoonPay,moonpay.com,lever,moonpay,22,2026-09-07T03:24:33.797827+00:00
+Sword Health,swordhealth.com,lever,swordhealth,19,2026-09-07T03:24:35.236481+00:00
+Voltus,voltus.co,lever,voltus,19,2026-09-07T03:24:36.454572+00:00
+Level AI,thelevel.ai,lever,levelai,19,2026-09-07T03:24:37.682368+00:00
+Arcadia,arcadia.io,lever,arcadia,18,2026-09-07T03:24:38.961548+00:00
+Deputy,deputy.com,lever,deputy,11,2026-09-07T03:24:40.183494+00:00
+JustWatch,justwatch.com,lever,justwatch,10,2026-09-07T03:24:41.468348+00:00
