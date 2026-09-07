@@ -31,10 +31,13 @@ from rli.models.time import ensure_aware
 __all__ = [
     "DEFAULT_CONFIG_FILENAME",
     "REPO_ROOT",
+    "Agent",
     "Allowlists",
     "Budgets",
     "Config",
+    "Llm",
     "Matching",
+    "ModelPrice",
     "Net",
     "Policy",
     "ProbeCosts",
@@ -355,6 +358,146 @@ class Policy(BaseModel):
         return ensure_aware(value, "policy.frozen_at")
 
 
+class ModelPrice(BaseModel):
+    """Per-million-token list price for one model id (cost accounting only).
+
+    These numbers are never sent to the API and never participate in any
+    prompt or cache key: they exist so `rli.llm.client` can turn the token
+    counts an API response reports into the `cost_usd` column the run trace
+    and the `[budgets]` ledger are denominated in (spec.md §4).
+
+    Consequence of that separation: a price change re-prices FUTURE runs but
+    does not invalidate the LLM cache, which is correct — the cached model
+    output is unchanged, only our accounting of what it cost is.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    input_usd_per_mtok: float = Field(ge=0.0)
+    output_usd_per_mtok: float = Field(ge=0.0)
+
+
+class Llm(BaseModel):
+    """`[llm]` — model selection, request knobs, and the cost price table (spec.md §2).
+
+    Every field carries a default, and the whole table defaults on `Config`,
+    so a configuration that predates this table (notably the inline-TOML
+    fixtures in `tests/`) keeps validating unchanged — the convention
+    `Thresholds.negative_event_window_days` established.
+
+    `model_id` is deliberately part of the LLM cache key
+    (`rli.llm.client.CachedClient` keys on `(model_id, prompt_hash,
+    structured_input_hash)`, spec.md §2), so pointing this at a different
+    model does NOT silently reuse the previous model's answers.
+
+    `max_retries` is the retry count handed to the Anthropic SDK client, i.e.
+    transport-level retries of a single call. It is unrelated to
+    `[agent].max_probe_retries`, which is the agent loop's retry of a failed
+    PROBE.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    model_id: str = "claude-sonnet-5"
+    max_tokens: int = Field(4096, gt=0)
+    timeout_s: float = Field(60.0, gt=0.0)
+    max_retries: int = Field(2, ge=0)
+
+    # Cost accounting only — never sent to the API (see `ModelPrice`).
+    prices: dict[str, ModelPrice] = Field(
+        default_factory=lambda: {
+            "claude-sonnet-5": ModelPrice(input_usd_per_mtok=2.0, output_usd_per_mtok=10.0),
+            "claude-opus-5": ModelPrice(input_usd_per_mtok=5.0, output_usd_per_mtok=25.0),
+            "claude-haiku-4-5": ModelPrice(input_usd_per_mtok=1.0, output_usd_per_mtok=5.0),
+        }
+    )
+
+    def price_for(self, model_id: str) -> ModelPrice | None:
+        """Price row for `model_id`, or None when the id is not in the table.
+
+        Returning None rather than raising is deliberate: an unpriced model
+        must cost `0.0` and keep the run going (see
+        `rli.llm.client.AnthropicClient`). A run that dies because someone
+        pointed `[llm].model_id` at a model whose price we have not recorded
+        would trade a wrong number for no answer at all, and the price table
+        is accounting, not a safety control.
+        """
+        return self.prices.get(model_id)
+
+
+class Agent(BaseModel):
+    """`[agent]` — System C loop caps and the ranking cost model (spec.md §4; PLAN.md M5).
+
+    Two groups of knobs live here.
+
+    **Caps.** `max_cost_usd`, `max_latency_s` and `max_dynamic_steps` are
+    `None`-by-default OVERRIDES of the identically named keys in
+    `[budgets]` / `[thresholds]`, exactly the convention `Policy` already
+    uses for its four threshold overrides: `None` means "inherit", so there
+    is one source of truth and no pair of numbers that can silently
+    disagree. Set one here only to run System C under a tighter (or
+    deliberately looser) cap than the shared one — e.g. a cheap smoke run —
+    without moving the budget every other system is measured against.
+    Resolve them with `effective_max_cost_usd(cfg)` and friends; do not read
+    the raw fields.
+
+    **Ranking cost model.** `probe_cost_usd_per_point`,
+    `latency_cost_usd_per_s`, `failure_rate_placeholder` and
+    `failure_cost_usd` convert `[probe_costs]`' unitless cost POINTS and a
+    probe's latency estimate into one dollar-denominated number, so the
+    controller's value/cost ranking and the run's budget ledger share a
+    single unit. Every one of them is an unmeasured PLACEHOLDER: they encode
+    a preference ordering (a `high`-tier probe should look ~10x a `low`-tier
+    one), not a measured price. Do not read them as a cost forecast.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    # `None` = inherit the `[budgets]` / `[thresholds]` key of the same name.
+    max_cost_usd: float | None = Field(None, gt=0.0)
+    max_latency_s: float | None = Field(None, gt=0.0)
+    max_dynamic_steps: int | None = Field(None, ge=0)
+
+    # ONE retry at most on a RETRYABLE structured probe failure (spec.md §2:
+    # "no uncontrolled retry loops"; spec.md §4). `0` disables retrying.
+    max_probe_retries: int = Field(1, ge=0)
+
+    # --- ranking cost model (all PLACEHOLDERS, unmeasured) ----------------
+    latency_cost_usd_per_s: float = Field(0.002, ge=0.0)
+    failure_rate_placeholder: float = Field(0.1, ge=0.0, le=1.0)
+    failure_cost_usd: float = Field(0.01, ge=0.0)
+    # Conversion of a `[probe_costs]` cost POINT into dollars, so the agent's
+    # ledger has one unit for LLM spend and probe spend alike.
+    probe_cost_usd_per_point: float = Field(0.002, gt=0.0)
+
+    # Truncation applied to an untrusted `raw_excerpt` before it is placed in
+    # an `<untrusted>` block in the investigator prompt. Bounds both the
+    # token bill and how much attacker-controlled text a single evidence item
+    # can inject (spec.md §2). `0` means "no excerpt text at all".
+    max_excerpt_chars: int = Field(400, ge=0)
+
+    # Upper bound on how many proposed probe candidates the controller will
+    # even look at. The investigator is untrusted for control flow
+    # (spec.md §2: "Never rely on the LLM alone for ... stopping"), so the
+    # length of its candidate list must not be able to drive the controller's
+    # work; extras are rejected, not silently truncated.
+    max_candidates: int = Field(8, ge=1)
+
+    def effective_max_cost_usd(self, cfg: Config) -> float:
+        """`[agent].max_cost_usd`, falling back to `[budgets].max_cost_usd`."""
+        return self.max_cost_usd if self.max_cost_usd is not None else cfg.budgets.max_cost_usd
+
+    def effective_max_latency_s(self, cfg: Config) -> float:
+        """`[agent].max_latency_s`, falling back to `[budgets].max_latency_s`."""
+        return self.max_latency_s if self.max_latency_s is not None else cfg.budgets.max_latency_s
+
+    def effective_max_dynamic_steps(self, cfg: Config) -> int:
+        """`[agent].max_dynamic_steps`, falling back to `[thresholds].max_dynamic_steps`."""
+        if self.max_dynamic_steps is not None:
+            return self.max_dynamic_steps
+        return cfg.thresholds.max_dynamic_steps
+
+
 class Config(BaseModel):
     """Root configuration object produced by `load_config`."""
 
@@ -369,6 +512,8 @@ class Config(BaseModel):
     policy: Policy
     probe_costs: ProbeCosts = Field(default_factory=ProbeCosts)
     team_signal: TeamSignal = Field(default_factory=TeamSignal)
+    llm: Llm = Field(default_factory=Llm)
+    agent: Agent = Field(default_factory=Agent)
 
 
 def _resolve_config_path(path: str | Path | None) -> Path:

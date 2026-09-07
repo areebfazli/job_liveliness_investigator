@@ -35,7 +35,10 @@ BUSY_TIMEOUT_MS = 5000
 
 # The schema version this checkout knows how to produce/upgrade to.
 # 1 -> 2: added the `repost_links` table (rli.history.matching audit trail).
-SCHEMA_VERSION = 2
+# 2 -> 3: added the replay tables (`replay_datasets`, `replay_cases`,
+#         `replay_probe_results`) — the cached full-probe record spec.md §6
+#         requires replay to read instead of making live tool calls.
+SCHEMA_VERSION = 3
 
 # from-version -> SQL script that upgrades that version to version + 1.
 # `schema.sql` describes only the newest version; every prior jump needed to
@@ -61,6 +64,67 @@ CREATE TABLE IF NOT EXISTS repost_links (
 );
 
 CREATE INDEX IF NOT EXISTS idx_repost_links_company_id ON repost_links (company_id);
+"""
+
+# 2 -> 3: the replay tables (PLAN.md M4). spec.md §6: "live **tool** calls are
+# forbidden in replay; results come only from the cached full-probe record".
+# `replay_probe_results` IS that record; `replay_datasets` / `replay_cases`
+# name the (posting, T) subjects it was collected for. This DDL is duplicated
+# verbatim in rli/db/schema.sql (the fresh-database path);
+# tests/test_replay_migration.py asserts the two stay in sync. A migration's
+# text is frozen once shipped, which is why it is spelled out here rather than
+# read back from that file.
+#
+# JUDGMENT CALL: `replay_cases.posting_id` / `replay_probe_results.posting_id`
+# carry NO foreign key to `postings`, unlike every other posting-scoped table
+# in this schema. A replay subject is identified by the resolver's
+# `"{ats}:{tenant}:{job_id}"` convention, and `rli.eval` is forbidden from
+# creating a `postings` row it has not collected (see `rli.eval.runner`'s write
+# invariant) — so a dataset must be able to name a posting the collector has
+# never committed a row for. The alternative (an FK) would force the dataset
+# builder to write to the collection corpus, which is exactly what makes an
+# A/B/C comparison invalid.
+MIGRATIONS[2] = """
+CREATE TABLE IF NOT EXISTS replay_datasets (
+    dataset_id      TEXT PRIMARY KEY,
+    created_at      TEXT NOT NULL,
+    split_kind      TEXT NOT NULL CHECK (split_kind IN ('temporal', 'company')),
+    split_name      TEXT NOT NULL CHECK (split_name IN ('dev', 'validation', 'test')),
+    grid_step_days  INTEGER NOT NULL,
+    postings        INTEGER NOT NULL,
+    companies       INTEGER NOT NULL,
+    cases           INTEGER NOT NULL,
+    notes           TEXT
+);
+
+CREATE TABLE IF NOT EXISTS replay_cases (
+    dataset_id      TEXT NOT NULL REFERENCES replay_datasets (dataset_id),
+    posting_id      TEXT NOT NULL,
+    replay_at       TEXT NOT NULL,
+    company_id      TEXT NOT NULL,
+    canonical_url   TEXT NOT NULL,
+    built_at        TEXT NOT NULL,
+    PRIMARY KEY (dataset_id, posting_id, replay_at)
+);
+
+CREATE TABLE IF NOT EXISTS replay_probe_results (
+    dataset_id   TEXT NOT NULL,
+    posting_id   TEXT NOT NULL,
+    replay_at    TEXT NOT NULL,
+    probe_name   TEXT NOT NULL,
+    args_hash    TEXT NOT NULL,
+    observed_at  TEXT NOT NULL,
+    ok           INTEGER NOT NULL CHECK (ok IN (0, 1)),
+    error        TEXT,
+    retryable    INTEGER NOT NULL DEFAULT 0 CHECK (retryable IN (0, 1)),
+    data         TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    PRIMARY KEY (dataset_id, posting_id, replay_at, probe_name, args_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_replay_probe_results_lookup
+    ON replay_probe_results (dataset_id, posting_id, replay_at);
+CREATE INDEX IF NOT EXISTS idx_replay_cases_dataset ON replay_cases (dataset_id);
 """
 
 

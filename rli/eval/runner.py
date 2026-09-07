@@ -115,6 +115,12 @@ A partially-cached probe is `'miss'`, the pessimistic reading: the claim
 * `system_version` — component `'controller'`; System B's frozen rules
   version (spec.md §6: "Freeze/version B before evaluating C").
 
+`rli.replay.mode` adds two more under the same convention —
+`replay_dataset:<dataset id>` and `replay_violation:<kind>` — so a replay
+run's dataset and any attempted rule breach are visible in the canonical
+trace. They are named there rather than here because this module must not
+depend on `rli.replay` (see `ReplayHook`).
+
 The columns keep their declared meanings: `args_hash` holds an argument
 hash and nothing else, `probe_name` holds a probe name and nothing else.
 Anything that is neither goes into `decision_type` (queryable, above) or
@@ -162,7 +168,7 @@ import json
 import sqlite3
 import time
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from types import TracebackType
@@ -195,6 +201,7 @@ __all__ = [
     "STEP_SYSTEM_VERSION",
     "CacheStatus",
     "ProbeRunner",
+    "ReplayHook",
     "Run",
     "RunResult",
     "SystemName",
@@ -646,6 +653,28 @@ class ProbeRunner:
         )
         return result
 
+    def save_evidence(
+        self, *, probe: str, claims: Sequence[ProbeClaim], posting_id: str | None = None
+    ) -> list[EvidenceItem]:
+        """Persist claims for this run. Replay overrides this to apply the
+        spec.md §3 `available_at <= T` gate (see rli.replay.mode).
+
+        Every system's evidence goes through this one method rather than
+        through `self.run.save_evidence` directly, so the point-in-time gate
+        has exactly one place to live and a future system cannot forget it.
+        Live mode delegates unchanged.
+        """
+        return self.run.save_evidence(probe=probe, claims=claims, posting_id=posting_id)
+
+    def always_run_extra(self) -> list[tuple[str, list[ProbeClaim]]]:
+        """Extra always-run claims contributed by the environment. Empty in live
+        mode; in replay this is the archive-derived board state for T.
+
+        Returned as `(probe name, claims)` pairs so the contributed evidence
+        is attributed in the `evidence` table like any other probe's.
+        """
+        return []
+
     def note(
         self,
         decision_type: str,
@@ -698,6 +727,32 @@ def open_probe_runner(
         yield ProbeRunner(run=run, ctx=ctx, cfg=cfg, now=now, pool=pool)
     finally:
         pool.close()
+
+
+@dataclass(frozen=True)
+class ReplayHook:
+    """Everything a system needs to run in replay mode (spec.md §6).
+
+    Passed as the single `replay=` keyword `run_system_a` / `run_system_b`
+    accept. It is defined HERE, not in `rli.replay`, so that `rli.eval` never
+    imports `rli.replay` — the dependency runs one way only (replay knows
+    about the systems; the systems know only this three-field record), which
+    is what keeps the import graph acyclic and keeps a live run's code path
+    free of any replay machinery.
+
+    * `replay_at` — spec.md §6's historical time `T`. Written to
+      `runs.replay_at` and used as the run's decision clock.
+    * `dataset_id` — appended to `runs.config_hash` as `|dataset:<id>`, so
+      one column identifies "this config, these rules, this replay dataset".
+    * `open_runner` — builds the `ProbeRunner` that serves probe results from
+      the cached full-probe record instead of the network.
+    """
+
+    replay_at: datetime
+    dataset_id: str
+    open_runner: Callable[
+        [sqlite3.Connection, Config, Run, datetime], AbstractContextManager[ProbeRunner]
+    ]
 
 
 # ---------------------------------------------------------------------------

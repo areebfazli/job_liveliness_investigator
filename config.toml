@@ -306,3 +306,99 @@ latency_high_s = 12.0
 # wired in; corroborating_hiring_signal stays UNKNOWN until then.
 [team_signal]
 enabled = false
+
+# spec.md §2: "one structured-output-capable LLM API" (spec.md §7), with LLM
+# outputs cached by `(model_id, prompt_hash, structured_input_hash)` for exact
+# benchmark replay. `model_id` below is part of that cache key, so changing it
+# does NOT silently reuse the previous model's answers.
+[llm]
+# Anthropic model id used by System C's investigator and explanation calls.
+model_id = "claude-sonnet-5"
+
+# Per-call output cap. Both System C prompts return a small structured object,
+# so this is a guard against a runaway generation, not a target length.
+max_tokens = 4096
+
+# Per-request timeout (seconds) handed to the Anthropic SDK client. Kept well
+# under [budgets].max_latency_s so a single hung call cannot silently consume
+# the whole run's latency budget.
+timeout_s = 60.0
+
+# Transport-level retries of ONE API call, applied by the SDK
+# (spec.md §2: "no uncontrolled retry loops"). This is unrelated to
+# [agent].max_probe_retries, which retries a failed PROBE.
+max_retries = 2
+
+# Price table used ONLY for cost accounting — these numbers are never sent to
+# the API and never enter a prompt or cache key, so editing them re-prices
+# future runs without invalidating any cached model output. Rates are list
+# price per MILLION tokens. A model id absent from this table costs 0.0 and
+# does not raise (rli.config.Llm.price_for): an unpriced model must produce a
+# wrong number rather than no answer, since this table is accounting, not a
+# safety control.
+[llm.prices."claude-sonnet-5"]
+input_usd_per_mtok = 2.0
+output_usd_per_mtok = 10.0
+
+[llm.prices."claude-opus-5"]
+input_usd_per_mtok = 5.0
+output_usd_per_mtok = 25.0
+
+[llm.prices."claude-haiku-4-5"]
+input_usd_per_mtok = 1.0
+output_usd_per_mtok = 5.0
+
+# System C (LLM investigator + deterministic controller, spec.md §4/§6;
+# PLAN.md M5). spec.md §2: "Never rely on the LLM alone for budgets,
+# probabilities, stopping, permissions, or the final action" — every cap in
+# this table is enforced by the controller, never by the model.
+[agent]
+# The three caps below are OVERRIDES of [budgets].max_cost_usd,
+# [budgets].max_latency_s and [thresholds].max_dynamic_steps, not copies:
+# unset (the default) means "inherit", so there is exactly one source of
+# truth. This is the same convention the [policy] overrides above use. Set
+# one here only to run System C under a different cap than the shared one
+# (a cheap smoke run, say) without moving the budget A and B are measured
+# against.
+# max_cost_usd = 0.50
+# max_latency_s = 60.0
+# max_dynamic_steps = 4
+
+# Retries of a RETRYABLE structured probe failure inside one agent step.
+# One, deliberately: spec.md §2 forbids uncontrolled retry loops, and a
+# second attempt at the same probe with the same arguments is already the
+# last one worth paying for. 0 disables retrying.
+max_probe_retries = 1
+
+# --- ranking cost model -----------------------------------------------------
+# These four convert [probe_costs]' unitless cost POINTS and a probe's latency
+# estimate into one dollar-denominated number, so the controller's value/cost
+# ranking and the run's budget ledger share a single unit. All PLACEHOLDERS,
+# unmeasured: they encode a preference ordering (a `high`-tier probe should
+# look about 10x a `low`-tier one), not a measured price. Do not read the
+# resulting figure as a cost forecast.
+#
+# Dollars charged per unit of a probe's estimated wall-clock latency, so a
+# slow probe is penalized in the same unit as an expensive one.
+latency_cost_usd_per_s = 0.002
+# Assumed probability that any given probe fails outright. Uniform across
+# probes because no per-probe failure rate has been measured yet.
+failure_rate_placeholder = 0.1
+# Dollars charged for that expected failure (the wasted step).
+failure_cost_usd = 0.01
+# Dollars per [probe_costs] cost point.
+probe_cost_usd_per_point = 0.002
+
+# --- prompt shaping ---------------------------------------------------------
+# Truncation applied to an untrusted `raw_excerpt` before it is placed in an
+# <untrusted source="..."> block in the investigator prompt (spec.md §2:
+# "Treat job pages/news as untrusted data; delimit them in prompts"). Bounds
+# both the token bill and how much attacker-controlled text one evidence item
+# can inject. 0 means "no excerpt text reaches the prompt at all".
+max_excerpt_chars = 400
+
+# Upper bound on how many proposed probe candidates the controller will even
+# look at; extras are rejected with a recorded reason, never silently
+# truncated. The investigator is untrusted for control flow, so the length of
+# its candidate list must not be able to drive the controller's work.
+max_candidates = 8
