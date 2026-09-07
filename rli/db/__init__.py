@@ -34,12 +34,34 @@ __all__ = [
 BUSY_TIMEOUT_MS = 5000
 
 # The schema version this checkout knows how to produce/upgrade to.
-SCHEMA_VERSION = 1
+# 1 -> 2: added the `repost_links` table (rli.history.matching audit trail).
+SCHEMA_VERSION = 2
 
 # from-version -> SQL script that upgrades that version to version + 1.
 # `schema.sql` describes only the newest version; every prior jump needed to
 # reach it from an older on-disk database lives here instead.
 MIGRATIONS: dict[int, str] = {}
+
+# 1 -> 2: `repost_links`, the audit trail for rli.history.matching.link_reposts.
+# This DDL is duplicated verbatim in rli/db/schema.sql (so a FRESH database gets
+# it from the executescript path above) and in rli/history/schema_ext.sql (the
+# owning module's copy); tests/test_history_migration.py asserts the three stay
+# in sync. A migration's text is frozen once shipped, which is why it is spelled
+# out here rather than read back from either file.
+MIGRATIONS[1] = """
+CREATE TABLE IF NOT EXISTS repost_links (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    company_id          TEXT NOT NULL REFERENCES companies (company_id),
+    old_posting_id      TEXT NOT NULL REFERENCES postings (posting_id),
+    new_posting_id      TEXT NOT NULL REFERENCES postings (posting_id),
+    combined_score      REAL NOT NULL,
+    component_scores    TEXT NOT NULL,   -- JSON: per-component scores + pass flags
+    matched_at          TEXT NOT NULL,
+    UNIQUE (old_posting_id, new_posting_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_repost_links_company_id ON repost_links (company_id);
+"""
 
 
 def _schema_sql() -> str:

@@ -77,6 +77,34 @@ class Thresholds(BaseModel):
     repost_team_similarity: float = Field(ge=0.0, le=1.0)
     repost_location_similarity: float = Field(ge=0.0, le=1.0)
 
+    # Added for rli.history.matching (PLAN.md M2 #2). The four
+    # `repost_*_similarity` knobs above stay the per-component minimums; only
+    # these two genuinely new knobs are added, rather than duplicating them
+    # into a separate `[matching]` table. Both carry defaults so a config
+    # predating them (e.g. an inline TOML fixture) keeps validating, the same
+    # convention `negative_event_window_days` below follows.
+    #
+    # Minimum weighted-mean similarity across the KNOWN components for a
+    # repost link to be accepted. PLACEHOLDER — pending the hand-checked
+    # 50-match precision validation in spec.md §4.
+    repost_combined_min: float = Field(0.70, ge=0.0, le=1.0)
+    # Maximum days from a posting's `first_seen_absent` to a candidate
+    # repost's `first_observed` for that candidate to be considered at all.
+    repost_max_gap_days: int = Field(120, ge=0)
+
+    # Minimum observed history span (days) before rli.history.features will
+    # express an opinion on a history-derived input such as `repost_pattern`.
+    # Below it the feature is the `rli.models.policy_inputs.UNKNOWN` sentinel,
+    # never a guessed value (spec.md §4: "missing history never means flat
+    # hiring"). PLACEHOLDER — not yet tuned.
+    min_history_days: int = Field(30, ge=0)
+
+    # spec.md §5: lookback window (days) within which a `company_events` row
+    # can still populate `material_negative_event` / `freeze_or_pause`.
+    # Defaults to 180 so configs that predate this field (e.g. inline TOML
+    # fixtures in tests) keep validating unchanged.
+    negative_event_window_days: int = Field(180, ge=1)
+
 
 class Budgets(BaseModel):
     """Hard caps on cost/latency for a single investigation run (spec.md §4)."""

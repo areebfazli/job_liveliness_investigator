@@ -46,6 +46,31 @@ repost_description_similarity = 0.80
 repost_team_similarity = 0.80
 repost_location_similarity = 0.90
 
+# Minimum combined (weighted-mean) similarity for rli.history.matching to
+# accept a repost link, and the maximum days from a posting's
+# `first_seen_absent` to a candidate repost's `first_observed` for that
+# candidate to be considered at all. The four per-component knobs above are
+# reused as-is by that module rather than duplicated into a [matching]
+# table; only these two are new. PLACEHOLDERS pending the hand-checked
+# 50-match precision validation (spec.md §4). At 0.70, a role reposted with
+# the same title/team/location but a changed description (score 0.75) is
+# still linked — that is the "changed repost" case spec.md §5 needs — while a
+# similar-title/different-team/different-location near miss (~0.33) is not.
+repost_combined_min = 0.70
+repost_max_gap_days = 120
+
+# Minimum observed board-history span (days) before rli.history.features
+# will express an opinion on a history-derived policy input such as
+# `repost_pattern`. Below this, the feature is the UNKNOWN sentinel, never a
+# guessed value — spec.md §4: "missing history never means flat hiring".
+# PLACEHOLDER — not yet tuned.
+min_history_days = 30
+
+# Lookback window (days), counted back from `as_of`, within which a
+# `company_events` row can still populate the `material_negative_event` /
+# `freeze_or_pause` policy inputs (spec.md §5). PLACEHOLDER — not yet tuned.
+negative_event_window_days = 180
+
 [budgets]
 # Maximum USD cost allowed for a single investigation run (LLM + paid probes).
 # PLACEHOLDER.

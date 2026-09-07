@@ -297,3 +297,26 @@ CREATE TABLE IF NOT EXISTS tool_cache (
 );
 
 CREATE INDEX IF NOT EXISTS idx_tool_cache_lookup ON tool_cache (probe, args_hash, fetched_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- repost_links (schema version 2)
+--
+-- Audit trail for rli.history.matching.link_reposts: postings keeps only the
+-- winning replacement_job_id, while this table records every accepted
+-- (old -> new) repost link together with the component scores that produced
+-- it, so a linking decision stays explicable after the [thresholds] change.
+-- The same DDL lives in rli/history/schema_ext.sql and in
+-- rli.db.MIGRATIONS[1] (which upgrades an existing version-1 database).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS repost_links (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    company_id          TEXT NOT NULL REFERENCES companies (company_id),
+    old_posting_id      TEXT NOT NULL REFERENCES postings (posting_id),
+    new_posting_id      TEXT NOT NULL REFERENCES postings (posting_id),
+    combined_score      REAL NOT NULL,
+    component_scores    TEXT NOT NULL,   -- JSON: per-component scores + pass flags
+    matched_at          TEXT NOT NULL,
+    UNIQUE (old_posting_id, new_posting_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_repost_links_company_id ON repost_links (company_id);

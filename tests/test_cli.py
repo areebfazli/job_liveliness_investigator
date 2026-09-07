@@ -27,6 +27,8 @@ EXPECTED_TABLES = {
     "outcomes",
     "llm_cache",
     "tool_cache",
+    # schema version 2 (rli.history.matching audit trail)
+    "repost_links",
 }
 
 
