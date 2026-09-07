@@ -423,6 +423,48 @@ class Budget:
             dynamic_steps=self.dynamic_steps + 1,
         )
 
+    def with_probe_retry(self, probe_cls: type[Probe], cfg: Config) -> Budget:
+        """Charge one RE-execution of a probe already charged a step: money, not a step.
+
+        `rli.agent.loop` retries a probe at most `[agent].max_probe_retries`
+        times, and only while the last result was a RETRYABLE structured
+        failure (spec.md §2: `{ok:false,error,retryable}`, "no uncontrolled
+        retry loops"). This is how that retry is paid for.
+
+        **The asymmetry with `with_probe` is the point, not an oversight.**
+        The two caps in spec.md §4's hard-stop list bound different things:
+
+        * the STEP cap ("Start with at most `4` dynamic probe steps") bounds
+          how many distinct investigations the agent may open. Re-running
+          `repost_history` after a transient failure does not open a fifth
+          question; it re-asks the fourth. Charging it a step would mean a
+          run that met one flaky probe silently investigated LESS than an
+          identical run that did not, and spec.md §6 would see that as a
+          worse decision rather than as the cost it actually is — which is
+          precisely the "recovery after failures" metric it asks us to
+          measure.
+        * the COST and LATENCY caps bound spend on the world. A retry is a
+          second real call: a second HTTP request, a second wait, a second
+          charge. So it is charged in full, from the same `probe_cost_usd` /
+          `latency_estimate_s` estimates `with_probe` uses, for the same
+          reason (the gate and the ledger must price a probe identically).
+
+        Together with the hard retry count in `[agent].max_probe_retries`,
+        that makes retrying bounded twice over: by attempts, and by budget.
+
+        Deliberately a `Budget` method rather than a `dataclasses.replace`
+        call in the loop. The ledger is this class's invariant; a caller that
+        reached in to adjust two of its six fields would be free to get the
+        step accounting wrong, and the reasoning above would live in a
+        comment at a call site instead of next to the field it governs.
+        """
+        return replace(
+            self,
+            spent_cost_usd=self.spent_cost_usd + probe_cost_usd(probe_cls, cfg),
+            spent_latency_s=self.spent_latency_s + latency_estimate_s(probe_cls, cfg),
+            # dynamic_steps deliberately unchanged — see the docstring.
+        )
+
 
 # ---------------------------------------------------------------------------
 # Ranking (spec.md §4: "v1: deterministic cost-aware ranking")

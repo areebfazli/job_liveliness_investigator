@@ -6,6 +6,7 @@ import json
 
 import typer
 
+from rli.agent.cli import app as agent_app
 from rli.archive.cli import app as archive_app
 from rli.config import load_config
 from rli.db import connect, init_db
@@ -36,6 +37,7 @@ eval_app = typer.Typer(
     help="Evaluation reports (spec.md §6): A/B baseline metrics and posting-behavior curves.",
     no_args_is_help=True,
 )
+app.add_typer(agent_app, name="agent")
 app.add_typer(archive_app, name="archive")
 app.add_typer(history_app, name="history")
 app.add_typer(replay_app, name="replay")

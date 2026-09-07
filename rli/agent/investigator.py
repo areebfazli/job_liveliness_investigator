@@ -149,6 +149,11 @@ __all__ = [
 # than `null` — see the module docstring.
 UNKNOWN_INPUT_MARKER = "unknown_unpopulated"
 
+# Decimal places the two advisory budget floats are rounded to before they
+# reach the hashed `structured_input`. See `build_investigator_input`'s
+# caller contract for why any float that reaches the cache key is a hazard.
+_BUDGET_PRECISION = 6
+
 
 # ---------------------------------------------------------------------------
 # The investigator's output schema (spec.md §2: "Schema-validate model outputs")
@@ -418,6 +423,23 @@ def build_investigator_input(
             anything: spec.md §2's "Never rely on the LLM alone for budgets
             ... or stopping" means the caps are re-checked in code whatever
             the model does with these numbers.
+
+            CALLER CONTRACT, and it is load-bearing: these three values land
+            in the hashed `structured_input`, so each must be a pure
+            function of the case and the loop position. A MEASURED quantity
+            here — wall-clock latency, or dollars that a cache hit charges
+            differently from a live call — makes the prompt for step 2
+            onwards differ between two identical runs, and between a run and
+            its replay. The result is a permanent `llm_cache` miss on every
+            multi-step run, which defeats spec.md §2's cache and spec.md
+            §6's exact replay while looking merely expensive rather than
+            broken. `rli.agent.loop` therefore passes probe-only remainders
+            derived from `[probe_costs]`/`[agent]` estimates, and documents
+            why at length. The two floats are additionally rounded to
+            `_BUDGET_PRECISION` here, as defence in depth for a future
+            caller that forgets: rounding cannot rescue a value that is
+            wrong by dollars, but it does kill the float-noise class of the
+            bug at the one place that feeds the hash.
     """
     case_file = case.case_file()
 
@@ -477,8 +499,12 @@ def build_investigator_input(
         ],
         "budget": {
             "steps_remaining": steps_remaining,
-            "cost_remaining_usd": cost_remaining_usd,
-            "latency_remaining_s": latency_remaining_s,
+            # Rounded, never passed through raw — see the caller contract in
+            # this function's docstring. `_BUDGET_PRECISION` is far finer
+            # than any budget decision made from these numbers and coarser
+            # than the float noise a measured quantity carries.
+            "cost_remaining_usd": round(cost_remaining_usd, _BUDGET_PRECISION),
+            "latency_remaining_s": round(latency_remaining_s, _BUDGET_PRECISION),
         },
     }
 

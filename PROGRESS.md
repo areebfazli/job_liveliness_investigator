@@ -8,8 +8,8 @@ Tracks milestone status against PLAN.md (which is frozen). Update this file only
 | M1 Data foundation | nearly done | Adapters (GH/Ashby/Lever/JSON-LD) live-verified; 78 targets audited; `rli snapshot` daily job + `rli archive backfill` built and tested (250 tests). Cron installed (06:00 UTC); day-0 snapshot done (78/78, 7699 postings); 12-month backfill run 2026-09-07. Remaining: 3 unattended days, coverage report + feasibility decision. |
 | M2 Evidence layer | in progress | history (closures, matching, features, sample export) + events store built, 347 tests. Matching fixed (Lever 'Apply' anchor bug, temporal gates, one-to-one): 143 links on real data. Re-backfill with fixed extractor 2026-09-07. Remaining: hand-check 50 matches -> data/match_precision.md; event collection covers only 15/78 companies (web-search cap), rerun in a fresh session. |
 | M3 Probes, policy, baselines | nearly done | Probes, registry, policy, splits, Systems A/B (`rli run --system A|B`), 707 tests; live A/B agree on 3 URLs. Remaining: policy tuning + freeze on temporal-validation data (needs collection window). |
-| M4 Replay | todo | |
-| M5 Agent | todo | |
+| M4 Replay | done (code) | PIT replay dataset builder, replay runner, leakage checker (0 violations on real data), lifelines survival curves, baseline/behavior reports, `rli replay build|run|check`, `rli eval baseline|behavior`. Data caveat: 117/118 dev cases are archive-era and therefore `weak`; A/B agreement 100% is near-trivial until live-era snapshots accumulate. |
+| M5 Agent | done (code) | LLM client (Anthropic + scripted + cache), investigator, deterministic controller, bounded loop, evidence-cited explanation with fallback, `rli agent run|trace`, 984 tests. Not exercised live: no ANTHROPIC_API_KEY in env. |
 | M6 Evaluation | todo | |
 | M7 Product shell | todo | |
 
@@ -25,3 +25,8 @@ Tracks milestone status against PLAN.md (which is frozen). Update this file only
 - 2026-09-07 M3: recheck_after_days = floor(min(cap, days_until_expiry)), clamped at 0 when expiry passed.
 - 2026-09-07 M3: team_signal disabled (no licensed source). The "repost/long-lived branch reachable" eligibility condition lives in the controller (M5), not the probe.
 - 2026-09-07 M3: System B routing tree b1 documented in rli/eval/system_b.py; version recorded in runs.config_hash. C2 contradiction uses >= so same-run resolver-open vs board-absent counts as mixed.
+- 2026-09-08 M4: replay corpus is point-in-time via SQLite temp-schema views filtered to <= T; lifecycle columns re-derived at T with rli.history.closures. Archive-era T uses a synthetic `archive_board_state` source (capture-time stamped) and never backdates ATS publish dates.
+- 2026-09-08 M4: the full-probe record is collected once per posting; `company_events` is re-run per T because its args include as_of. `test` split is refused at build time.
+- 2026-09-08 M4: found and fixed two bugs: case builder bypassed the replay gate (saved evidence via Run instead of ProbeRunner); archive-only postings never matched their corpus row, so history probes were always ineligible and A == B trivially.
+- 2026-09-08 M5: investigator prompt input carries config-derived budget estimates (not measured spend) so identical runs hash identically and the llm_cache can hit in replay. Model rows record tokens in run_steps.decision_type (`investigator:tokens=in/out`).
+- 2026-09-08 M5: run_steps.cost_usd mixes dollars (model rows) and cost points (probe rows); M6 reports must split by component. A runs all dynamic probes while C is gated by could_change_action, so the probe-count gate flatters C structurally; M6 must report this.
