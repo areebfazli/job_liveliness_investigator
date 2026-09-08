@@ -513,5 +513,172 @@ def eval_behavior_command(
         conn.close()
 
 
+def _validated_split_kind(value: str | None) -> str | None:
+    """Validate `--split-kind`, or `None` to let the dataset row decide.
+
+    `typer.BadParameter` rather than a bare `ValueError` so a typo produces
+    the usual "Invalid value for '--split-kind'" message and exit code 2
+    instead of a traceback, matching `replay build` above.
+    """
+    if value is None:
+        return None
+    if value not in ("temporal", "company"):
+        raise typer.BadParameter(
+            f"unknown split kind {value!r}; expected 'temporal' or 'company'",
+            param_hint="--split-kind",
+        )
+    return value
+
+
+@eval_app.command("run")
+def eval_run_command(
+    dataset: str = typer.Option(..., "--dataset", help="Replay dataset id to evaluate."),
+    # Mirrors `rli.eval.evaluate.DEFAULT_REPORT_PATH`. Spelled as a literal
+    # because a Typer default is evaluated at import time, and importing the
+    # evaluation stack on every `rli --help` is exactly what the lazy imports
+    # inside the command bodies exist to avoid.
+    out: str = typer.Option(
+        "reports/evaluation.md", "--out", help="Path to write the Markdown report to."
+    ),
+    with_c: bool = typer.Option(
+        False,
+        "--with-c",
+        help="Also evaluate System C. Without an ANTHROPIC_API_KEY (or an injected "
+        "client) C is recorded as 'not run: no API key' and no live call is attempted.",
+    ),
+    split_kind: str | None = typer.Option(
+        None,
+        "--split-kind",
+        help="Split to gate on. Defaults to the one recorded on the dataset.",
+    ),
+    cutoff: str | None = typer.Option(
+        None,
+        "--cutoff",
+        help="Temporal-split cutoff (ISO 8601 UTC). Defaults to the dataset's created_at, "
+        "which reproduces the assignment the build used.",
+    ),
+    validation_cutoff: str | None = typer.Option(
+        None, "--validation-cutoff", help="Temporal-split validation cutoff (ISO 8601 UTC)."
+    ),
+    rerun: bool = typer.Option(
+        False,
+        "--rerun/--no-rerun",
+        help="Re-run every system through the offline replay instead of reusing the "
+        "dataset's existing runs.",
+    ),
+    survival: bool = typer.Option(
+        True,
+        "--survival/--no-survival",
+        help="Include the corpus-wide posting-behaviour summary. --no-survival skips the "
+        "lifelines import entirely.",
+    ),
+    db: str = typer.Option(_DEFAULT_DB_PATH, "--db", help="Path to the SQLite database file."),
+) -> None:
+    """Write the spec.md §6 final evaluation report for one replay dataset (PLAN.md M6).
+
+    Makes no network calls and never builds a dataset: a system with no runs
+    for the dataset is replayed offline, and everything else is reused.
+
+    This is the final evaluation, so it READS the `test` holdout when the
+    dataset's cases fall in it, and records that read in the run trace, in
+    the agent gate's notes and in the report's Limitations. The build-time
+    refusals in `rli.replay.build` and `rli.eval.baseline` are untouched.
+    """
+    # Imported here, not at module scope: the evaluation stack reaches
+    # lifelines (survival) and scikit-learn (the C2 ranker), both of which
+    # cost seconds to import and neither of which any other command needs.
+    from rli.eval.evaluate import evaluate, write_evaluation_report
+
+    cfg = load_config()
+    init_db(db)
+    conn = connect(db)
+    try:
+        report = evaluate(
+            conn,
+            cfg,
+            dataset_id=dataset,
+            split_kind=_validated_split_kind(split_kind),  # type: ignore[arg-type]
+            cutoff=_optional_moment(cutoff, "--cutoff"),
+            validation_cutoff=_optional_moment(validation_cutoff, "--validation-cutoff"),
+            with_c=with_c,
+            rerun=rerun,
+            include_survival=survival,
+        )
+        path = write_evaluation_report(out, report)
+        typer.echo(report.describe())
+        typer.echo(f"wrote {path}", err=True)
+    except LookupError as exc:
+        # `run_replay` raises this for a dataset with no cases — i.e. a
+        # dataset id that was never built. A bad parameter, not a crash.
+        raise typer.BadParameter(str(exc), param_hint="--dataset") from exc
+    finally:
+        conn.close()
+
+
+@eval_app.command("gates")
+def eval_gates_command(
+    dataset: str = typer.Option(..., "--dataset", help="Replay dataset id to grade."),
+    split_kind: str | None = typer.Option(
+        None,
+        "--split-kind",
+        help="Split to gate on. Defaults to the one recorded on the dataset.",
+    ),
+    cutoff: str | None = typer.Option(
+        None,
+        "--cutoff",
+        help="Temporal-split cutoff (ISO 8601 UTC). Defaults to the dataset's created_at.",
+    ),
+    db: str = typer.Option(_DEFAULT_DB_PATH, "--db", help="Path to the SQLite database file."),
+) -> None:
+    """Print the two spec.md §6 gate verdicts for one replay dataset.
+
+    Always exits 0: a failing — or unproven, or ungraded — gate is a FINDING
+    to be read, not a CLI error to be swallowed by a shell's `set -e`. The
+    verdict line says which it is.
+
+    Skips the survival summary (nothing in either gate reads it), so this is
+    the cheap way to ask "where do the gates stand".
+    """
+    from rli.eval.evaluate import evaluate
+
+    cfg = load_config()
+    init_db(db)
+    conn = connect(db)
+    try:
+        report = evaluate(
+            conn,
+            cfg,
+            dataset_id=dataset,
+            split_kind=_validated_split_kind(split_kind),  # type: ignore[arg-type]
+            cutoff=_optional_moment(cutoff, "--cutoff"),
+            include_survival=False,
+        )
+        typer.echo(f"agent gate: {report.agent_gate.status.upper()}")
+        typer.echo(report.agent_gate.describe())
+        typer.echo("")
+        typer.echo(f"product gate: {report.product_gate.status.upper()}")
+        typer.echo(report.product_gate.describe())
+    except LookupError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--dataset") from exc
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     app()
+
+
+@app.command("load-events")
+def load_events(
+    path: str = typer.Option("data/events/company_events.csv", "--path", help="Events CSV."),
+    db: str = typer.Option(_DEFAULT_DB_PATH, "--db", help="SQLite database path."),
+) -> None:
+    """Load pre-collected dated company events (spec.md §4) into `company_events`."""
+    from rli.events.store import load_events_csv
+
+    conn = connect(db)
+    try:
+        n = load_events_csv(path, conn)
+    finally:
+        conn.close()
+    typer.echo(f"Loaded {n} events from {path}")

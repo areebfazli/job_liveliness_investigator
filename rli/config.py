@@ -498,6 +498,23 @@ class Agent(BaseModel):
         return cfg.thresholds.max_dynamic_steps
 
 
+class Ranker(BaseModel):
+    """`[ranker]` — optional learned probe ranking (spec.md §4, PLAN.md M6 C2).
+
+    Kept only if it materially beats deterministic ranking on held-out data.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    min_rows: int = Field(200, ge=1)
+    test_fraction: float = Field(0.25, gt=0.0, lt=1.0)
+    min_auc_gain: float = Field(0.05, ge=0.0)
+    min_accuracy_gain: float = Field(0.0, ge=0.0)
+    seed: int = 20260607
+    max_iter: int = Field(1000, ge=1)
+    c: float = Field(1.0, gt=0.0)
+
+
 class Config(BaseModel):
     """Root configuration object produced by `load_config`."""
 
@@ -512,6 +529,7 @@ class Config(BaseModel):
     policy: Policy
     probe_costs: ProbeCosts = Field(default_factory=ProbeCosts)
     team_signal: TeamSignal = Field(default_factory=TeamSignal)
+    ranker: Ranker = Field(default_factory=Ranker)
     llm: Llm = Field(default_factory=Llm)
     agent: Agent = Field(default_factory=Agent)
 

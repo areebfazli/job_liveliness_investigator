@@ -10,7 +10,7 @@ Tracks milestone status against PLAN.md (which is frozen). Update this file only
 | M3 Probes, policy, baselines | nearly done | Probes, registry, policy, splits, Systems A/B (`rli run --system A|B`), 707 tests; live A/B agree on 3 URLs. Remaining: policy tuning + freeze on temporal-validation data (needs collection window). |
 | M4 Replay | done (code) | PIT replay dataset builder, replay runner, leakage checker (0 violations on real data), lifelines survival curves, baseline/behavior reports, `rli replay build|run|check`, `rli eval baseline|behavior`. Data caveat: 117/118 dev cases are archive-era and therefore `weak`; A/B agreement 100% is near-trivial until live-era snapshots accumulate. |
 | M5 Agent | done (code) | LLM client (Anthropic + scripted + cache), investigator, deterministic controller, bounded loop, evidence-cited explanation with fallback, `rli agent run|trace`, 984 tests. Not exercised live: no ANTHROPIC_API_KEY in env. |
-| M6 Evaluation | todo | |
+| M6 Evaluation | done (code), interim report | metrics, gates, C2 ranker, `rli eval run|gates`; reports/evaluation.md generated on m4-dev-20 (20 postings). Agent gate NOT RUN (no API key → no C runs); product gate unproven; headline data gate not met on that dataset. Bug found: company_events were never loaded into the DB → fixed via `rli load-events`. |
 | M7 Product shell | todo | |
 
 ## Decisions log
@@ -30,3 +30,4 @@ Tracks milestone status against PLAN.md (which is frozen). Update this file only
 - 2026-09-08 M4: found and fixed two bugs: case builder bypassed the replay gate (saved evidence via Run instead of ProbeRunner); archive-only postings never matched their corpus row, so history probes were always ineligible and A == B trivially.
 - 2026-09-08 M5: investigator prompt input carries config-derived budget estimates (not measured spend) so identical runs hash identically and the llm_cache can hit in replay. Model rows record tokens in run_steps.decision_type (`investigator:tokens=in/out`).
 - 2026-09-08 M5: run_steps.cost_usd mixes dollars (model rows) and cost points (probe rows); M6 reports must split by component. A runs all dynamic probes while C is gated by could_change_action, so the probe-count gate flatters C structurally; M6 must report this.
+- 2026-09-08 M6: `rli load-events` added; events must be loaded before any run. Ranker config `[ranker]` added. Evaluation must be regenerated on a larger dataset from data/rli.db after backfill.

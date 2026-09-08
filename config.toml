@@ -402,3 +402,14 @@ max_excerpt_chars = 400
 # truncated. The investigator is untrusted for control flow, so the length of
 # its candidate list must not be able to drive the controller's work.
 max_candidates = 8
+
+# Optional learned probe ranker (C2). Removed if it does not beat deterministic
+# ranking on held-out replay data (spec.md §4).
+[ranker]
+min_rows = 200
+test_fraction = 0.25
+min_auc_gain = 0.05
+min_accuracy_gain = 0.0
+seed = 20260607
+max_iter = 1000
+c = 1.0
