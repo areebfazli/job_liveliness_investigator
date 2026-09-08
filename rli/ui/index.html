@@ -1,0 +1,496 @@
+<title>Role-Liveness Investigator</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --fg: #1a1a1a;
+    --muted: #666666;
+    --border: #dddddd;
+    --panel: #f7f7f8;
+    --accent: #2454ff;
+    --good: #1a7f37;
+    --warn: #b7791f;
+    --bad: #c0362c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #16171a;
+      --fg: #eaeaea;
+      --muted: #9a9a9a;
+      --border: #33343a;
+      --panel: #1f2024;
+      --accent: #6690ff;
+      --good: #4caf6a;
+      --warn: #d9a441;
+      --bad: #e06259;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #16171a;
+    --fg: #eaeaea;
+    --muted: #9a9a9a;
+    --border: #33343a;
+    --panel: #1f2024;
+    --accent: #6690ff;
+    --good: #4caf6a;
+    --warn: #d9a441;
+    --bad: #e06259;
+  }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 24px 20px 80px;
+    line-height: 1.5;
+  }
+  h1 { font-size: 1.4rem; margin-bottom: 4px; }
+  .subtitle { color: var(--muted); margin-top: 0; margin-bottom: 24px; font-size: 0.9rem; }
+  h2 { font-size: 1.05rem; margin: 0 0 10px; }
+  section {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 18px;
+    margin-bottom: 18px;
+  }
+  label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 4px; }
+  input[type="text"], input[type="url"], select, textarea {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--fg);
+    font-size: 0.95rem;
+    margin-bottom: 12px;
+  }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
+  .row > div { flex: 1; min-width: 180px; }
+  button {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 9px 16px;
+    font-size: 0.9rem;
+    cursor: pointer;
+  }
+  button.secondary { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  .banner {
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin-bottom: 14px;
+    font-size: 0.9rem;
+    font-weight: 600;
+  }
+  .banner.degraded { background: color-mix(in srgb, var(--warn) 20%, transparent); color: var(--warn); border: 1px solid var(--warn); }
+  .banner.error { background: color-mix(in srgb, var(--bad) 20%, transparent); color: var(--bad); border: 1px solid var(--bad); }
+  .banner.ok { background: color-mix(in srgb, var(--good) 20%, transparent); color: var(--good); border: 1px solid var(--good); }
+  .stat-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 10px;
+    margin-bottom: 12px;
+  }
+  .stat {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    background: var(--bg);
+  }
+  .stat .label { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.03em; color: var(--muted); }
+  .stat .value { font-size: 1.15rem; font-weight: 700; margin-top: 2px; }
+  .action-apply_now { color: var(--good); }
+  .action-quick_apply { color: var(--good); }
+  .action-wait { color: var(--warn); }
+  .action-skip { color: var(--bad); }
+  ul.plain { list-style: none; padding: 0; margin: 0; }
+  ul.plain li { padding: 8px 0; border-bottom: 1px solid var(--border); }
+  ul.plain li:last-child { border-bottom: none; }
+  .hyp-box {
+    background: color-mix(in srgb, var(--warn) 10%, transparent);
+    border: 1px dashed var(--warn);
+    border-radius: 8px;
+    padding: 10px 12px;
+  }
+  .hyp-box .caption { font-size: 0.78rem; color: var(--muted); margin-bottom: 6px; }
+  .reason-links a { margin-right: 6px; font-size: 0.8rem; }
+  .ev-item { padding: 10px 0; border-bottom: 1px solid var(--border); scroll-margin-top: 20px; }
+  .ev-item:last-child { border-bottom: none; }
+  .ev-item.highlight { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  .ev-meta { font-size: 0.78rem; color: var(--muted); }
+  .ev-value { font-weight: 600; }
+  small.hint { color: var(--muted); }
+  #outcome-msg, #watch-msg { font-size: 0.85rem; margin-top: 8px; }
+  a { color: var(--accent); }
+  #watch-due-list li { font-size: 0.85rem; }
+</style>
+
+<h1>Role-Liveness Investigator</h1>
+<p class="subtitle">Evidence-backed job posting liveness analysis.</p>
+
+<section>
+  <h2>Investigate a posting</h2>
+  <div class="row">
+    <div style="flex: 3;">
+      <label for="url-input">Job posting URL</label>
+      <input type="url" id="url-input" placeholder="https://boards.greenhouse.io/acme/jobs/12345" />
+    </div>
+    <div>
+      <label for="system-select">System</label>
+      <select id="system-select">
+        <option value="">Auto (C, default)</option>
+        <option value="B">B — rules</option>
+        <option value="A">A — full probes</option>
+      </select>
+    </div>
+    <div style="flex: 0;">
+      <button id="investigate-btn">Investigate</button>
+    </div>
+  </div>
+  <div class="row">
+    <button class="secondary" id="watch-btn" type="button">Watch this URL</button>
+    <button class="secondary" id="watch-due-btn" type="button">Check due watches</button>
+  </div>
+  <div id="watch-msg"></div>
+  <ul class="plain" id="watch-due-list"></ul>
+</section>
+
+<div id="result-area" hidden>
+  <div id="degraded-banner" class="banner degraded" hidden></div>
+
+  <section>
+    <h2>Decision</h2>
+    <div class="stat-grid">
+      <div class="stat">
+        <div class="label">Recommended action</div>
+        <div class="value" id="stat-action">—</div>
+      </div>
+      <div class="stat">
+        <div class="label">Posting state</div>
+        <div class="value" id="stat-state">—</div>
+      </div>
+      <div class="stat">
+        <div class="label">Recheck after</div>
+        <div class="value" id="stat-recheck">—</div>
+      </div>
+      <div class="stat">
+        <div class="label">Evidence quality</div>
+        <div class="value" id="stat-quality">—</div>
+      </div>
+    </div>
+    <small class="hint" id="run-meta"></small>
+  </div>
+
+  <section id="hyp-section" hidden>
+    <h2>Hypotheses <small class="hint">(not facts)</small></h2>
+    <div class="hyp-box">
+      <div class="caption">
+        Unobservable interpretations the system considered — not evidence,
+        not verified. Do not treat these as facts about the posting.
+      </div>
+      <ul class="plain" id="hyp-list"></ul>
+    </div>
+  </section>
+
+  <section id="reason-section">
+    <h2>Reasons</h2>
+    <ul class="plain" id="reason-list"></ul>
+  </section>
+
+  <section id="evidence-section">
+    <h2>Evidence timeline</h2>
+    <ul class="plain" id="evidence-list"></ul>
+  </section>
+
+  <section>
+    <h2>Record an outcome</h2>
+    <div class="row">
+      <div>
+        <label for="outcome-select">Outcome</label>
+        <select id="outcome-select">
+          <option value="applied">applied</option>
+          <option value="reply">reply</option>
+          <option value="screen">screen</option>
+          <option value="interview">interview</option>
+          <option value="offer">offer</option>
+          <option value="rejection">rejection</option>
+          <option value="silence">silence</option>
+        </select>
+      </div>
+      <div style="flex: 2;">
+        <label for="outcome-note">Note (optional)</label>
+        <input type="text" id="outcome-note" placeholder="e.g. applied via referral" />
+      </div>
+      <div style="flex: 0;">
+        <button id="outcome-btn">Save outcome</button>
+      </div>
+    </div>
+    <div id="outcome-msg"></div>
+  </section>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var lastRunId = null;
+  var lastUrl = null;
+
+  var el = {
+    urlInput: document.getElementById("url-input"),
+    systemSelect: document.getElementById("system-select"),
+    investigateBtn: document.getElementById("investigate-btn"),
+    watchBtn: document.getElementById("watch-btn"),
+    watchDueBtn: document.getElementById("watch-due-btn"),
+    watchMsg: document.getElementById("watch-msg"),
+    watchDueList: document.getElementById("watch-due-list"),
+    resultArea: document.getElementById("result-area"),
+    degradedBanner: document.getElementById("degraded-banner"),
+    statAction: document.getElementById("stat-action"),
+    statState: document.getElementById("stat-state"),
+    statRecheck: document.getElementById("stat-recheck"),
+    statQuality: document.getElementById("stat-quality"),
+    runMeta: document.getElementById("run-meta"),
+    hypSection: document.getElementById("hyp-section"),
+    hypList: document.getElementById("hyp-list"),
+    reasonList: document.getElementById("reason-list"),
+    evidenceList: document.getElementById("evidence-list"),
+    outcomeSelect: document.getElementById("outcome-select"),
+    outcomeNote: document.getElementById("outcome-note"),
+    outcomeBtn: document.getElementById("outcome-btn"),
+    outcomeMsg: document.getElementById("outcome-msg"),
+  };
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  function evidenceSortKey(ev) {
+    return ev.source_event_at || ev.available_at || "";
+  }
+
+  function renderResult(data) {
+    lastRunId = data.run_id;
+
+    if (data.degraded) {
+      el.degradedBanner.hidden = false;
+      el.degradedBanner.textContent = "DEGRADED: " + (data.degraded_reason || "unspecified reason");
+    } else {
+      el.degradedBanner.hidden = true;
+      el.degradedBanner.textContent = "";
+    }
+
+    el.statAction.textContent = data.recommended_action;
+    el.statAction.className = "value action-" + data.recommended_action;
+    el.statState.textContent = data.posting_state;
+    el.statRecheck.textContent =
+      data.recheck_after_days === null || data.recheck_after_days === undefined
+        ? "n/a"
+        : data.recheck_after_days + " days";
+    el.statQuality.textContent = data.evidence_quality;
+    el.runMeta.textContent =
+      "run_id: " + data.run_id + " · system used: " + data.system_used;
+
+    // Hypotheses
+    if (data.hypotheses && data.hypotheses.length) {
+      el.hypSection.hidden = false;
+      el.hypList.innerHTML = data.hypotheses
+        .map(function (h) { return "<li>" + escapeHtml(h) + "</li>"; })
+        .join("");
+    } else {
+      el.hypSection.hidden = true;
+      el.hypList.innerHTML = "";
+    }
+
+    // Evidence, sorted
+    var evidence = (data.evidence || []).slice().sort(function (a, b) {
+      return evidenceSortKey(a) < evidenceSortKey(b) ? -1 : evidenceSortKey(a) > evidenceSortKey(b) ? 1 : 0;
+    });
+    el.evidenceList.innerHTML = evidence
+      .map(function (ev) {
+        var ts = ev.source_event_at || ev.available_at;
+        return (
+          '<li class="ev-item" id="ev-' + escapeHtml(ev.id) + '">' +
+          '<div class="ev-value">' + escapeHtml(ev.probe) + " — " + escapeHtml(ev.claim_type) + "</div>" +
+          "<div>" + escapeHtml(ev.value) + "</div>" +
+          '<div class="ev-meta">' +
+          escapeHtml(ts) + " · " +
+          '<a href="' + escapeHtml(ev.source_url) + '" target="_blank" rel="noopener">source</a>' +
+          "</div>" +
+          "</li>"
+        );
+      })
+      .join("") || '<li><small class="hint">No evidence recorded.</small></li>';
+
+    // Reasons
+    el.reasonList.innerHTML = (data.reason || [])
+      .map(function (r) {
+        var links = (r.evidence_ids || [])
+          .map(function (id) {
+            return '<a href="#ev-' + escapeHtml(id) + '" data-ev-link="' + escapeHtml(id) + '">[' + escapeHtml(id) + "]</a>";
+          })
+          .join(" ");
+        return (
+          "<li>" +
+          "<div>" + escapeHtml(r.text) + "</div>" +
+          '<div class="reason-links">' + links + "</div>" +
+          "</li>"
+        );
+      })
+      .join("") || '<li><small class="hint">No reasons recorded.</small></li>';
+
+    el.resultArea.hidden = false;
+  }
+
+  el.reasonList.addEventListener("click", function (evt) {
+    var link = evt.target.closest("[data-ev-link]");
+    if (!link) return;
+    evt.preventDefault();
+    var id = link.getAttribute("data-ev-link");
+    var target = document.getElementById("ev-" + id);
+    if (!target) return;
+    document.querySelectorAll(".ev-item.highlight").forEach(function (n) {
+      n.classList.remove("highlight");
+    });
+    target.classList.add("highlight");
+    target.scrollIntoView({ behavior: "smooth", block: "center" });
+  });
+
+  async function investigate() {
+    var url = el.urlInput.value.trim();
+    if (!url) return;
+    lastUrl = url;
+    el.investigateBtn.disabled = true;
+    el.investigateBtn.textContent = "Investigating…";
+    try {
+      var body = { url: url };
+      if (el.systemSelect.value) body.system = el.systemSelect.value;
+      var resp = await fetch("/investigate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      var data = await resp.json();
+      if (!resp.ok) {
+        el.resultArea.hidden = false;
+        el.degradedBanner.hidden = false;
+        el.degradedBanner.className = "banner error";
+        el.degradedBanner.textContent = "Error: " + (data.detail || resp.statusText);
+        return;
+      }
+      el.degradedBanner.className = "banner degraded";
+      renderResult(data);
+    } catch (err) {
+      el.resultArea.hidden = false;
+      el.degradedBanner.hidden = false;
+      el.degradedBanner.className = "banner error";
+      el.degradedBanner.textContent = "Request failed: " + err;
+    } finally {
+      el.investigateBtn.disabled = false;
+      el.investigateBtn.textContent = "Investigate";
+    }
+  }
+
+  async function saveOutcome() {
+    if (!lastRunId) {
+      el.outcomeMsg.textContent = "Investigate a URL first.";
+      return;
+    }
+    el.outcomeBtn.disabled = true;
+    try {
+      var resp = await fetch("/outcomes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          run_id: lastRunId,
+          outcome: el.outcomeSelect.value,
+          note: el.outcomeNote.value || null,
+        }),
+      });
+      var data = await resp.json();
+      if (!resp.ok) {
+        el.outcomeMsg.textContent = "Error: " + (data.detail || resp.statusText);
+        el.outcomeMsg.style.color = "var(--bad)";
+      } else {
+        el.outcomeMsg.textContent = "Saved (id " + data.id + ").";
+        el.outcomeMsg.style.color = "var(--good)";
+        el.outcomeNote.value = "";
+      }
+    } catch (err) {
+      el.outcomeMsg.textContent = "Request failed: " + err;
+      el.outcomeMsg.style.color = "var(--bad)";
+    } finally {
+      el.outcomeBtn.disabled = false;
+    }
+  }
+
+  async function watchUrl() {
+    var url = el.urlInput.value.trim();
+    if (!url) return;
+    el.watchBtn.disabled = true;
+    try {
+      var resp = await fetch("/watch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: url }),
+      });
+      var data = await resp.json();
+      if (!resp.ok) {
+        el.watchMsg.textContent = "Error: " + (data.detail || resp.statusText);
+      } else {
+        el.watchMsg.textContent =
+          "Watching " + data.url + " (state: " + data.last_posting_state + ")";
+      }
+    } catch (err) {
+      el.watchMsg.textContent = "Request failed: " + err;
+    } finally {
+      el.watchBtn.disabled = false;
+    }
+  }
+
+  async function checkDueWatches() {
+    el.watchDueBtn.disabled = true;
+    try {
+      var resp = await fetch("/watch/due");
+      var data = await resp.json();
+      if (!resp.ok) {
+        el.watchDueList.innerHTML =
+          "<li>Error: " + escapeHtml(data.detail || resp.statusText) + "</li>";
+        return;
+      }
+      if (!data.length) {
+        el.watchDueList.innerHTML = "<li><small class=\"hint\">No watches are due.</small></li>";
+        return;
+      }
+      el.watchDueList.innerHTML = data
+        .map(function (r) {
+          var change = r.changed
+            ? '<strong>changed</strong>: ' + escapeHtml(r.previous_state) + "/" + escapeHtml(r.previous_action) +
+              " → " + escapeHtml(r.new_state) + "/" + escapeHtml(r.new_action)
+            : "no change (" + escapeHtml(r.new_state) + "/" + escapeHtml(r.new_action) + ")";
+          return "<li>" + escapeHtml(r.url) + " — " + change + "</li>";
+        })
+        .join("");
+    } catch (err) {
+      el.watchDueList.innerHTML = "<li>Request failed: " + escapeHtml(String(err)) + "</li>";
+    } finally {
+      el.watchDueBtn.disabled = false;
+    }
+  }
+
+  el.investigateBtn.addEventListener("click", investigate);
+  el.outcomeBtn.addEventListener("click", saveOutcome);
+  el.watchBtn.addEventListener("click", watchUrl);
+  el.watchDueBtn.addEventListener("click", checkDueWatches);
+  el.urlInput.addEventListener("keydown", function (evt) {
+    if (evt.key === "Enter") investigate();
+  });
+})();
+</script>

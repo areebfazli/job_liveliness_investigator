@@ -16,6 +16,7 @@ dependencies = [
     "scikit-learn>=1.5",
     "typer>=0.12",
     "anthropic>=1.0",
+    "uvicorn>=0.30",
 ]
 
 [project.scripts]

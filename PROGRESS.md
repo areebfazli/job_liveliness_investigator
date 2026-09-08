@@ -11,7 +11,7 @@ Tracks milestone status against PLAN.md (which is frozen). Update this file only
 | M4 Replay | done (code) | PIT replay dataset builder, replay runner, leakage checker (0 violations on real data), lifelines survival curves, baseline/behavior reports, `rli replay build|run|check`, `rli eval baseline|behavior`. Data caveat: 117/118 dev cases are archive-era and therefore `weak`; A/B agreement 100% is near-trivial until live-era snapshots accumulate. |
 | M5 Agent | done (code) | LLM client (Anthropic + scripted + cache), investigator, deterministic controller, bounded loop, evidence-cited explanation with fallback, `rli agent run|trace`, 984 tests. Not exercised live: no ANTHROPIC_API_KEY in env. |
 | M6 Evaluation | done (code), interim report | metrics, gates, C2 ranker, `rli eval run|gates`; reports/evaluation.md generated on m4-dev-20 (20 postings). Agent gate NOT RUN (no API key → no C runs); product gate unproven; headline data gate not met on that dataset. Bug found: company_events were never loaded into the DB → fixed via `rli load-events`. |
-| M7 Product shell | todo | |
+| M7 Product shell | done (code) | FastAPI (`/investigate`, debug `/runs/{id}`, `/outcomes`, `/watch`, `/health`), vanilla-JS UI, README, docs/demo.md. C degrades to B without API key. |
 
 ## Decisions log
 - 2026-09-07 M0: `evidence_quality` is computed by the policy layer from evidence, not stored in `PolicyInputs` (it is a derived output per spec §1). The action policy still receives it as an argument, matching spec §5.
