@@ -1,6 +1,6 @@
 # Evaluation report (spec.md §6 / PLAN.md M6)
 
-Dataset: `dev-300` (`split_name=dev`, `split_kind=temporal`) · Splits read: `dev, validation, test` · `allow_test=True` · Policy version: `policy-v1:5ccbe192950455723f079c957b64965a` · Generated: `2026-09-08T00:24:06.734994Z`
+Dataset: `dev-300` (`split_name=dev`, `split_kind=temporal`) · Splits read: `dev, validation, test` · `allow_test=True` · Policy version: `policy-v1:5ccbe192950455723f079c957b64965a` · Generated: `2026-09-08T15:43:38.972344Z`
 
 ## Headline gate (sample sizes)
 
@@ -104,8 +104,8 @@ System C has no confusion matrix: not run: no API key.
 
 | system | runs | probe steps | probe cost POINTS (total) | probe cost POINTS (mean/run) | model steps | model cost USD (total) | model cost USD (mean/run) | tokens in/out | latency ms (total) | latency ms (mean/run) |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| A | 1185 | 5051 | 8917.00 | 7.52 | 0 | $0.0000 | $0.0000 | 0/0 | 1236 | 1 |
-| B | 1185 | 4672 | 8026.00 | 6.77 | 0 | $0.0000 | $0.0000 | 0/0 | 1127 | 1 |
+| A | 1185 | 5051 | 8917.00 | 7.52 | 0 | $0.0000 | $0.0000 | 0/0 | 2073 | 2 |
+| B | 1185 | 4672 | 8026.00 | 6.77 | 0 | $0.0000 | $0.0000 | 0/0 | 1582 | 1 |
 
 **These are two different units and are NEVER summed.** `run_steps.cost_usd` holds unitless placeholder cost POINTS on `component='probe'` rows (configured in `[probe_costs]`: low=1, medium=3, high=10) and REAL DOLLARS on `component='model'` rows. `runs.total_cost_usd` adds the two together, which is why it is not quoted anywhere in this report and why no combined 'total cost' column exists. A probe-heavy system and a model-heavy system are not comparable on one axis.
 
@@ -262,7 +262,7 @@ Note: train or holdout labels are a single class; AUC is undefined for this spli
 
 - Archive-era cases are weak by construction. For any replay case whose T predates this project's own daily snapshots, the only observation available is a Wayback capture, so `board_snapshot` evidence is sparse, `source_quality='archive'`, and often absent entirely. Those cases are scored, but a decision made on an archive-only corpus is a decision made on much less evidence than a present-day one, and the agreement figures average the two together.
 - `team_signal` is unlicensed and disabled (`[team_signal].enabled = false`; spec.md §4 records that there is no licensed enrichment source). It is the only probe that populates the team-shrink input, so the action policy's P4 branch is UNREACHABLE in every number in this report. No system is penalised or credited for it, and the high-cost tier is effectively empty.
-- Company-event coverage is partial: 11/78 companies in this database carry any `company_events` row at all (the M6 collection reached 15/78 companies at its fullest). `company_events` is a medium-cost probe and a policy input, so for the uncovered majority the material-negative-event and hiring-freeze inputs are the UNKNOWN sentinel rather than a negative finding (spec.md §4: missing history never means flat hiring).
+- Company-event coverage is partial: 64/78 companies in this database carry any `company_events` row at all (the M6 collection reached 15/78 companies at its fullest). `company_events` is a medium-cost probe and a policy input, so for the uncovered majority the material-negative-event and hiring-freeze inputs are the UNKNOWN sentinel rather than a negative finding (spec.md §4: missing history never means flat hiring).
 - Sample sizes vs. spec.md §6 targets — evaluated dataset: 300 postings (target >=300), 78 companies (target >=40), 1278 replay cases; collection corpus: 14879 postings, 78 companies, 7183 closure events (target >=100). The corpus may clear the targets while the evaluated replay dataset is a far smaller slice of it; the headline gate is judged on what was ACTUALLY evaluated, and it is MET. The closure-event leg has no dataset-scoped equivalent (a replay dataset's unit is a (posting, T) grid point, not a closure) and is therefore corpus-wide.
 - Probe cost POINTS and model DOLLARS are different units and are never summed. `run_steps.cost_usd` holds placeholder cost points on `component='probe'` rows and real USD on `component='model'` rows; `runs.total_cost_usd` adds them, which is why no single 'total cost' figure appears anywhere in this report.
 - STRUCTURAL CAVEAT: System A is not a neutral upper bound. `rli.eval.system_a` calls `eligible_probes(..., unpopulated_inputs=set(ALL_DYNAMIC_INPUTS))`, which makes spec.md §4's unresolved-question gate vacuous for A: A runs every dynamic probe that survives the history and licensing gates, whether or not that probe could change the action. System C is gated by `rli.policy.inputs.could_change_action` and therefore skips probes A always runs. Every probe-count comparison against A (medium/high probe use, cost points, latency, 'unnecessary probes', early-stop regret) is biased in the leaner system's favour BY CONSTRUCTION, not by measurement. This is why spec.md §6's agent gate measures probe use against System B rather than against A. Read agreement-with-A as an accuracy figure, and probe-count-vs-A as an upper bound on achievable savings — never as evidence that A wasted work.
