@@ -958,6 +958,7 @@ def test_data_quality_records_the_leakage_audit(
 
 
 def test_every_metric_degrades_cleanly_on_an_empty_database(
+    tmp_path: Path,
     conn: sqlite3.Connection, cfg: Config
 ) -> None:
     case_set = collect_system_runs(
@@ -989,7 +990,14 @@ def test_every_metric_degrades_cleanly_on_an_empty_database(
     assert metrics.cost.model_cost_usd == 0.0
     assert metrics.describe()
 
-    quality = data_quality(conn, cfg, dataset_id="nothing-here", splits={}, systems=("A",))
+    quality = data_quality(
+        conn,
+        cfg,
+        dataset_id="nothing-here",
+        splits={},
+        systems=("A",),
+        match_precision_path=tmp_path / "no-precision-file.md",
+    )
     assert quality.runs_checked == 0
     assert quality.ats_resolution_rate is None
     assert quality.publish_date_coverage is None
