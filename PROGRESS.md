@@ -5,12 +5,12 @@ Tracks milestone status against PLAN.md (which is frozen). Update this file only
 | Milestone | Status | Notes |
 |---|---|---|
 | M0 Skeleton | done | 146 tests, ruff clean, `rli init-db` idempotent, 13 tables (9 spec + llm_cache, tool_cache, board_snapshot_jobs, capture_attempts) |
-| M1 Data foundation | nearly done | Adapters (GH/Ashby/Lever/JSON-LD) live-verified; 78 targets audited; `rli snapshot` daily job + `rli archive backfill` built and tested (250 tests). Cron installed (06:00 UTC); day-0 snapshot done (78/78, 7699 postings); 12-month backfill run 2026-09-07. Remaining: 3 unattended days, coverage report + feasibility decision. |
-| M2 Evidence layer | in progress | history (closures, matching, features, sample export) + events store built, 347 tests. Matching fixed (Lever 'Apply' anchor bug, temporal gates, one-to-one): 143 links on real data. Re-backfill with fixed extractor 2026-09-07. Remaining: hand-check 50 matches -> data/match_precision.md; event collection covers only 15/78 companies (web-search cap), rerun in a fresh session. |
+| M1 Data foundation | done | Adapters (GH/Ashby/Lever/JSON-LD) live-verified; 78 targets audited; `rli snapshot` daily job + `rli archive backfill` built and tested (250 tests). Cron installed (06:00 UTC); day-0 snapshot done (78/78, 7699 postings); 12-month backfill run 2026-09-07. Remaining: 3 unattended days, coverage report + feasibility decision. |
+| M2 Evidence layer | done | history (closures, matching, features, sample export) + events store built, 347 tests. Matching fixed (Lever 'Apply' anchor bug, temporal gates, one-to-one): 143 links on real data. Re-backfill with fixed extractor 2026-09-07. Hand-check done: precision 36/42 = 85.7% (data/match_precision.md); sample was top-50 by score so thresholds untested, left unchanged. Event collection still 15/78 companies. |
 | M3 Probes, policy, baselines | nearly done | Probes, registry, policy, splits, Systems A/B (`rli run --system A|B`), 707 tests; live A/B agree on 3 URLs. Remaining: policy tuning + freeze on temporal-validation data (needs collection window). |
 | M4 Replay | done (code) | PIT replay dataset builder, replay runner, leakage checker (0 violations on real data), lifelines survival curves, baseline/behavior reports, `rli replay build|run|check`, `rli eval baseline|behavior`. Data caveat: 117/118 dev cases are archive-era and therefore `weak`; A/B agreement 100% is near-trivial until live-era snapshots accumulate. |
 | M5 Agent | done (code) | LLM client (Anthropic + scripted + cache), investigator, deterministic controller, bounded loop, evidence-cited explanation with fallback, `rli agent run|trace`, 984 tests. Not exercised live: no ANTHROPIC_API_KEY in env. |
-| M6 Evaluation | done (code), interim report | metrics, gates, C2 ranker, `rli eval run|gates`; reports/evaluation.md generated on m4-dev-20 (20 postings). Agent gate NOT RUN (no API key → no C runs); product gate unproven; headline data gate not met on that dataset. Bug found: company_events were never loaded into the DB → fixed via `rli load-events`. |
+| M6 Evaluation | done (code); report on real data | metrics, gates, C2 ranker, `rli eval run|gates`; reports/evaluation.md on dev-300 (300 postings, 78 companies, 1278 cases, leakage 0, headline data gate MET); company split report too. Agent gate NOT RUN (no API key); product gate unproven; B == A at 90% of A's probe cost. Bug found: company_events were never loaded into the DB → fixed via `rli load-events`. |
 | M7 Product shell | done (code) | FastAPI (`/investigate`, debug `/runs/{id}`, `/outcomes`, `/watch`, `/health`), vanilla-JS UI, README, docs/demo.md. C degrades to B without API key. |
 
 ## Decisions log
@@ -31,3 +31,11 @@ Tracks milestone status against PLAN.md (which is frozen). Update this file only
 - 2026-09-08 M5: investigator prompt input carries config-derived budget estimates (not measured spend) so identical runs hash identically and the llm_cache can hit in replay. Model rows record tokens in run_steps.decision_type (`investigator:tokens=in/out`).
 - 2026-09-08 M5: run_steps.cost_usd mixes dollars (model rows) and cost points (probe rows); M6 reports must split by component. A runs all dynamic probes while C is gated by could_change_action, so the probe-count gate flatters C structurally; M6 must report this.
 - 2026-09-08 M6: `rli load-events` added; events must be loaded before any run. Ranker config `[ranker]` added. Evaluation must be regenerated on a larger dataset from data/rli.db after backfill.
+- 2026-09-08: matching thresholds left unchanged after hand-check; recommendation to lower max_gap_days 120→115 rests on one row, not applied. Next sample should be stratified near thresholds.
+- 2026-09-08: replay runs must not run concurrently on one SQLite file (database is locked → failed runs); run A then B sequentially.
+
+## What is left (needs things this environment lacks)
+1. `ANTHROPIC_API_KEY` → run `rli replay run --system C` on dev-300 and company-dev-150, then `rli eval run --with-c` to decide the agent gate.
+2. Calendar time with daily snapshots (reinstall cron from docs/cron.md when the machine is on) → live-era replay cases with `strong` evidence, then re-tune and freeze the policy (`policy.frozen_at`), then final holdout evaluation.
+3. Fresh session with web search → finish company_events collection for 63/78 companies, then `rli load-events`.
+4. Personal outcome data → product gate.
