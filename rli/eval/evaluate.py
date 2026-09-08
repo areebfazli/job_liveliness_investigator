@@ -634,10 +634,10 @@ def _limitations(
         "only probe that populates the team-shrink input, so the action policy's P4 "
         "branch is UNREACHABLE in every number in this report. No system is penalised "
         "or credited for it, and the high-cost tier is effectively empty.",
-        f"Company-event coverage is partial: {covered}/{total} companies in this database "
-        "carry any `company_events` row at all (the M6 collection reached 15/78 companies "
-        "at its fullest). `company_events` is a medium-cost probe and a "
-        "policy input, so for the uncovered majority the material-negative-event and "
+        f"Company-event coverage: {covered}/{total} companies in this database "
+        "carry any `company_events` row (all 78 targets were searched; the rest had no "
+        "dated event in the window). `company_events` is a medium-cost probe and a "
+        "policy input, so for uncovered companies the material-negative-event and "
         "hiring-freeze inputs are the UNKNOWN sentinel rather than a negative finding "
         "(spec.md §4: missing history never means flat hiring).",
         f"Sample sizes vs. spec.md §6 targets — evaluated dataset: "
