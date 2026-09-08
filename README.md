@@ -150,21 +150,14 @@ can populate `corroborating_hiring_signal`. The policy's repost/long-lived
 → `skip` branch (P4) is therefore never exercised by real evidence in any
 current report, and the agent's high-cost probe tier is effectively empty.
 
-**Company-events coverage is partial, and was recently found to be worse
-than intended.** The `company_events` collector reached only **15 of 78**
-target companies (the web-search cap encountered during a live collection
-session). Worse, PROGRESS.md's M6 log records a since-fixed bug: collected
-events were never loaded into `data/rli.db` at all, which is why
-`reports/evaluation.md` (generated 2026-09-08, after the fix landed as the
-new `rli load-events` command) still reports **0/78** companies carrying
-any `company_events` row — the fix exists but the evaluation dataset has
-not yet been rebuilt against a database that actually has events loaded.
-Run `rli load-events` before any run/eval that should see company-event
-evidence, and treat the current evaluation report's company-events figures
-as reflecting the pre-fix state. Even after loading, for the uncovered
-majority the `material_negative_event` and `freeze_or_pause` policy inputs
-read as the `Unknown` sentinel rather than a negative finding (never as "no
-news = flat hiring").
+**Company-events coverage is headline-only.** All **78 of 78** target companies
+have been searched (15 via web search on 2026-09-07, the remaining 63 via
+Google News RSS feeds on 2026-09-08 after the web-search budget ran out), giving
+308 dated events. Event dates are article publication dates and materiality is
+judged from headlines, so some layoffs are recorded without a confirmed
+percentage or headcount. Events live in `data/events/company_events.csv` and
+must be loaded with `rli load-events` before any run or evaluation; an earlier
+evaluation was generated before that step existed and saw no events at all.
 
 **System C (the LLM agent) has not been exercised live in this
 environment.** No `ANTHROPIC_API_KEY` was available during development or
