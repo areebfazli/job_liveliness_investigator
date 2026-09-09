@@ -40,3 +40,4 @@ Tracks milestone status against PLAN.md (which is frozen). Update this file only
 3. (done 2026-09-08) company_events collection covers 78/78 companies; source is Google News RSS headlines, so event dates are article dates and materiality for some layoffs is unconfirmed from headlines alone.
 4. Personal outcome data → product gate.
 - 2026-09-09: Anthropic client and dependency removed; `[llm]` config now takes base_url, api_key_env, model_id, and a per-model price table. LLM calls bypass the rli.net allowlist by design (localhost endpoints). Config timeout_s=60 is too low for CPU-only local models; raise it or use Gemini.
+- 2026-09-09: qwen3:8b rejected for local use: Ollama's OpenAI-compatible endpoint ignores think=false and /no_think, and CPU generation is ~2.4 tok/s. Default local model set to llama3.2:3b with timeout_s=600.
