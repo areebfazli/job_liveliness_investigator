@@ -6,9 +6,10 @@ test, seeded either through `rli.db.init_db`/`connect` or, for `trace`, with
 hand-written SQL against the real `run_steps`/`runs` schema) so this file has
 no dependency on any other test module or on `tests/conftest.py`.
 
-No test ever constructs a real `rli.llm.client.AnthropicClient` or makes a
-network call: `rli.agent.cli.AnthropicClient` is monkeypatched to a tiny
-local stand-in wherever `run` is invoked, and `rli.agent.cli.run_system_c` is
+No test ever constructs a real `rli.llm.client.OpenAICompatibleClient` or
+makes a network call: `rli.agent.cli.OpenAICompatibleClient` is monkeypatched
+to a tiny local stand-in wherever `run` is invoked, and
+`rli.agent.cli.run_system_c` is
 monkeypatched to a recording stub that returns a hand-built `RunResult`
 (mirroring the shape `rli.agent.loop.run_system_c` returns) instead of
 driving a live agent loop.
@@ -41,21 +42,26 @@ runner = CliRunner()
 # ---------------------------------------------------------------------------
 
 
-class _StubAnthropicClient:
-    """Stands in for `rli.llm.client.AnthropicClient` without touching the SDK.
+class _StubLLMClient:
+    """Stands in for `rli.llm.client.OpenAICompatibleClient`, without a socket.
 
-    Mirrors the real class's constructor contract (`cfg`, keyword-only
-    `model_id`/`client`) and its `model_id` resolution rule (`model_id` if
-    given, else `cfg.llm.model_id`), so a test that monkeypatches
-    `rli.agent.cli.AnthropicClient` with this class still exercises cli.py's
-    real argument-passing exactly as written, with no import of `anthropic`
-    and no network access.
+    Mirrors the factory the CLI actually calls — `from_config(cfg,
+    model_id=...)` — and the real class's `model_id` resolution rule
+    (`model_id` if given, else `cfg.llm.model_id`), so a test that
+    monkeypatches `rli.agent.cli.OpenAICompatibleClient` with this class
+    still exercises cli.py's real argument-passing exactly as written, with
+    no HTTP client constructed and no network access.
     """
 
-    def __init__(self, cfg: Config, *, model_id: str | None = None, client: Any = None) -> None:
+    def __init__(self, cfg: Config, *, model_id: str | None = None) -> None:
         self.cfg = cfg
         self.model_id = model_id if model_id is not None else cfg.llm.model_id
-        self.client = client
+
+    @classmethod
+    def from_config(
+        cls, cfg: Config, *, model_id: str | None = None, **_kwargs: Any
+    ) -> _StubLLMClient:
+        return cls(cfg, model_id=model_id)
 
 
 def _make_decision() -> Decision:
@@ -287,23 +293,25 @@ def test_trace_help_exits_zero_and_names_its_options() -> None:
 def test_run_command_reports_llm_error_cleanly_without_traceback(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """`run` surfaces an `LLMError` (e.g. no usable Anthropic credentials) as
-    a clean, human-readable failure: exit code 2, the pinned message, on
-    stderr, and never a Python traceback in the output.
+    """`run` surfaces an `LLMError` (e.g. an unreachable endpoint) as a clean,
+    human-readable failure: exit code 2, the pinned message, on stderr, and
+    never a Python traceback in the output.
 
-    `ANTHROPIC_API_KEY` is explicitly removed so this test is correct even on
-    a machine that happens to have one set. `rli.agent.cli.AnthropicClient`
-    is stubbed so no real Anthropic client is ever constructed, and
-    `rli.agent.cli.run_system_c` is stubbed to raise `LLMError` directly —
-    the exact exception `cli.py`'s `except LLMError` clause is written to
-    catch — so this test pins `cli.py`'s own error-handling code without
-    needing a live call or a network-dependent failure path.
+    The configured API-key env var is explicitly removed so this test is
+    correct even on a machine that happens to have one set.
+    `rli.agent.cli.OpenAICompatibleClient` is stubbed so no real client is
+    ever constructed, and `rli.agent.cli.run_system_c` is stubbed to raise
+    `LLMError` directly — the exact exception `cli.py`'s `except LLMError`
+    clause is written to catch — so this test pins `cli.py`'s own
+    error-handling code without needing a live call or a network-dependent
+    failure path.
     """
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.setattr(agent_cli, "AnthropicClient", _StubAnthropicClient)
+    cfg = load_config()
+    monkeypatch.delenv(cfg.llm.api_key_env, raising=False)
+    monkeypatch.setattr(agent_cli, "OpenAICompatibleClient", _StubLLMClient)
 
     def _boom(*args: Any, **kwargs: Any) -> RunResult:
-        raise LLMError("no usable Anthropic API credentials")
+        raise LLMError("LLM endpoint is not reachable")
 
     monkeypatch.setattr(agent_cli, "run_system_c", _boom)
 
@@ -314,8 +322,10 @@ def test_run_command_reports_llm_error_cleanly_without_traceback(
     )
 
     assert result.exit_code == 2
-    assert "LLM call failed: no usable Anthropic API credentials" in result.stderr
-    assert "ANTHROPIC_API_KEY" in result.stderr
+    assert "LLM call failed: LLM endpoint is not reachable" in result.stderr
+    # The remedy names the configured endpoint and the env var to export.
+    assert cfg.llm.base_url in result.stderr
+    assert cfg.llm.api_key_env in result.stderr
     assert "Traceback" not in result.output
     assert result.stdout == ""
 
@@ -343,7 +353,7 @@ def test_run_command_success_prints_only_decision_json_on_stdout(
       module's docstring / the final report for why that is worth pinning
       explicitly.
     """
-    monkeypatch.setattr(agent_cli, "AnthropicClient", _StubAnthropicClient)
+    monkeypatch.setattr(agent_cli, "OpenAICompatibleClient", _StubLLMClient)
 
     calls: list[dict[str, Any]] = []
     run_result = _make_run_result(run_id="run-cli-success-0001")
@@ -404,7 +414,7 @@ def test_run_command_without_overrides_forwards_none_to_run_system_c(
     the LLM client fall back to `cfg.llm.model_id`, confirming the override
     plumbing is genuinely optional rather than always active.
     """
-    monkeypatch.setattr(agent_cli, "AnthropicClient", _StubAnthropicClient)
+    monkeypatch.setattr(agent_cli, "OpenAICompatibleClient", _StubLLMClient)
 
     calls: list[dict[str, Any]] = []
     monkeypatch.setattr(
@@ -569,7 +579,7 @@ def test_run_command_warns_when_all_model_calls_failed(
     decision is genuine (from the deterministic fallback policy), just not
     agent-authored.
     """
-    monkeypatch.setattr(agent_cli, "AnthropicClient", _StubAnthropicClient)
+    monkeypatch.setattr(agent_cli, "OpenAICompatibleClient", _StubLLMClient)
 
     run_id = "run-cli-all-failed-0001"
     monkeypatch.setattr(
@@ -578,8 +588,8 @@ def test_run_command_warns_when_all_model_calls_failed(
         _run_system_c_seeding_model_steps(
             run_id,
             [
-                _model_step_row(0, error="no usable Anthropic API credentials"),
-                _model_step_row(1, error="no usable Anthropic API credentials"),
+                _model_step_row(0, error="LLM endpoint is not reachable"),
+                _model_step_row(1, error="LLM endpoint is not reachable"),
             ],
         ),
     )
@@ -597,7 +607,7 @@ def test_run_command_warns_when_all_model_calls_failed(
 
     # -- stderr carries a loud, specific warning --------------------------
     assert run_id in result.stderr
-    assert "no usable Anthropic API credentials" in result.stderr
+    assert "LLM endpoint is not reachable" in result.stderr
     assert "deterministic" in result.stderr.lower()
     assert "credentials" in result.stderr.lower()
     assert "rli agent trace --run-id" in result.stderr
@@ -610,7 +620,7 @@ def test_run_command_notes_partial_model_call_failure(
     prints a shorter stderr note conveying the fraction that failed,
     without stdout being touched.
     """
-    monkeypatch.setattr(agent_cli, "AnthropicClient", _StubAnthropicClient)
+    monkeypatch.setattr(agent_cli, "OpenAICompatibleClient", _StubLLMClient)
 
     run_id = "run-cli-partial-failed-0001"
     monkeypatch.setattr(
@@ -646,7 +656,7 @@ def test_run_command_no_warning_when_model_calls_all_succeeded(
     silent on stderr beyond the ordinary `run_id=...` line: no failure
     warning is printed.
     """
-    monkeypatch.setattr(agent_cli, "AnthropicClient", _StubAnthropicClient)
+    monkeypatch.setattr(agent_cli, "OpenAICompatibleClient", _StubLLMClient)
 
     run_id = "run-cli-all-succeeded-0001"
     monkeypatch.setattr(
@@ -681,7 +691,7 @@ def test_run_command_no_warning_when_zero_model_rows(
     e.g. unresolved identity or a hard stop before the first model call) is
     not itself a degraded run, so `run` prints no failure warning.
     """
-    monkeypatch.setattr(agent_cli, "AnthropicClient", _StubAnthropicClient)
+    monkeypatch.setattr(agent_cli, "OpenAICompatibleClient", _StubLLMClient)
 
     run_id = "run-cli-zero-model-rows-0001"
     monkeypatch.setattr(

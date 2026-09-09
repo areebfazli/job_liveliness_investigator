@@ -383,10 +383,12 @@ Other judgment calls
   probe against C in the one metric the agent gate turns on.
 * **`route_rule` stays `None`.** It names System B's fired routing rule
   (`rli.eval.runner.RunResult`); C has no routing tree.
-* **The module never imports `anthropic` and never needs an API key.** The
-  live client is built by `_default_llm_factory`, called only when no `llm`
-  and no `llm_factory` were supplied, and `rli.llm.client.AnthropicClient`
-  defers its own SDK import to that moment.
+* **The module needs no API key and no vendor SDK.** The live client is
+  built by `_default_llm_factory`, called only when no `llm` and no
+  `llm_factory` were supplied; it is
+  `rli.llm.client.OpenAICompatibleClient`, a plain httpx POST to the
+  `[llm].base_url` configured for this deployment (a local Ollama by
+  default, which needs no credential at all).
 """
 
 from __future__ import annotations
@@ -422,7 +424,7 @@ from rli.eval.runner import (
     open_system_runner,
     replay_run_shape,
 )
-from rli.llm.client import AnthropicClient, CachedClient, LLMClient, LLMError, Prompt
+from rli.llm.client import CachedClient, LLMClient, LLMError, OpenAICompatibleClient, Prompt
 from rli.llm.prompts import PROMPT_VERSION, build_investigator_prompt
 from rli.models.decision import Decision
 from rli.models.policy_inputs import UNKNOWN
@@ -529,16 +531,17 @@ def c_config_hash(cfg: Config, model_id: str) -> str:
 
 
 def _default_llm_factory(conn: sqlite3.Connection, cfg: Config) -> LLMClient:
-    """The live client: `CachedClient(AnthropicClient(cfg), conn)`.
+    """The live client: `CachedClient(OpenAICompatibleClient.from_config(cfg), conn)`.
 
     Built LAZILY — this function is only called when the caller supplied
-    neither `llm` nor `llm_factory`. Constructing `AnthropicClient` is what
-    reaches for the SDK and the API key, so importing this module, and every
-    test that injects its own client, stays free of both. A failure to build
-    the client propagates unchanged: an agent that silently degraded to "no
-    model" would report System C's cost while measuring nothing.
+    neither `llm` nor `llm_factory`. Constructing the client is what reads
+    the API key out of the environment and opens an httpx connection pool,
+    so importing this module, and every test that injects its own client,
+    stays free of both. A failure to build the client propagates unchanged:
+    an agent that silently degraded to "no model" would report System C's
+    cost while measuring nothing.
     """
-    return CachedClient(AnthropicClient(cfg), conn)
+    return CachedClient(OpenAICompatibleClient.from_config(cfg), conn)
 
 
 def _resolve_llm(
@@ -932,7 +935,8 @@ def run_system_c(
         cfg: loaded configuration.
         url: the job URL to investigate.
         llm: the structured-output client. `None` resolves via `llm_factory`,
-            then via the live `CachedClient(AnthropicClient(cfg), conn)`,
+            then via the live
+            `CachedClient(OpenAICompatibleClient.from_config(cfg), conn)`,
             constructed lazily so importing this module never needs an API
             key.
         now: decision clock override; must be timezone-aware. Defaults to the

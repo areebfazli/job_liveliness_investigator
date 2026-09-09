@@ -78,27 +78,33 @@ import json
 import re
 import sqlite3
 import time
-from collections.abc import Callable, Sequence
-from datetime import datetime
+from collections.abc import Callable, Mapping, Sequence
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any, Literal, Protocol
 
+import httpx
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
-from rli.config import Config
+from rli.config import Config, ModelPrice
 from rli.models.time import now_utc, to_utc_z
 
 __all__ = [
-    "AnthropicClient",
     "CachedClient",
     "CacheStatus",
     "LLMClient",
     "LLMError",
+    "LLMRequestError",
     "LLMResponse",
     "LLMSchemaError",
+    "LLMTransportError",
+    "OpenAICompatibleClient",
     "Prompt",
     "ScriptedClient",
     "UntrustedBlock",
+    "close_llm_client",
     "compute_cost_usd",
+    "endpoint_unavailable_reason",
     "neutralize_delimiters",
 ]
 
@@ -346,6 +352,51 @@ class LLMSchemaError(LLMError):
     """
 
 
+class LLMTransportError(LLMError):
+    """A RETRYABLE failure that survived every retry: 429, 5xx, or no answer.
+
+    Raised only after `max_retries` retries have been spent, so catching it
+    means "the endpoint is unwell right now", not "try again immediately".
+    `status_code` is the last HTTP status seen, or `None` for a connection
+    failure that never produced one.
+    """
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class LLMRequestError(LLMError):
+    """A NON-retryable HTTP failure: 4xx other than 429 (bad key, bad body, 404).
+
+    Never retried — the same request would fail identically — so this is
+    raised on the first response. `status_code` is load-bearing:
+    `OpenAICompatibleClient` reads it to recognize the one 400 that means
+    "this server does not support `response_format: json_schema`" and to
+    fall back to `json_object` (see the class docstring).
+    """
+
+    def __init__(self, message: str, *, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _price_cost_usd(
+    prices: Mapping[str, ModelPrice],
+    model_id: str,
+    input_tokens: int,
+    output_tokens: int,
+) -> float:
+    """Dollars for one call from an explicit price table; 0.0 when unpriced."""
+    price = prices.get(model_id)
+    if price is None:
+        return 0.0
+    return (
+        input_tokens / 1_000_000.0 * price.input_usd_per_mtok
+        + output_tokens / 1_000_000.0 * price.output_usd_per_mtok
+    )
+
+
 def compute_cost_usd(cfg: Config, model_id: str, input_tokens: int, output_tokens: int) -> float:
     """Dollar cost of one call from `[llm.prices]`; 0.0 for an unpriced model.
 
@@ -356,136 +407,595 @@ def compute_cost_usd(cfg: Config, model_id: str, input_tokens: int, output_token
     alternative trades a wrong number for no answer at all. The consequence
     is worth stating plainly: pointing `[llm].model_id` at a model missing
     from `[llm.prices]` makes that model look FREE to the budget ledger.
+    That is the normal, intended state for a local Ollama model (it IS
+    free), and the reason `config.toml` lists the local ids at 0.0 anyway is
+    so the ledger's zero is a recorded fact rather than a missing row.
     """
-    price = cfg.llm.price_for(model_id)
-    if price is None:
-        return 0.0
-    return (
-        input_tokens / 1_000_000.0 * price.input_usd_per_mtok
-        + output_tokens / 1_000_000.0 * price.output_usd_per_mtok
+    return _price_cost_usd(cfg.llm.prices, model_id, input_tokens, output_tokens)
+
+
+# Statuses worth a second attempt. 429 is rate limiting and 5xx is the
+# server admitting fault; everything else in 4xx describes a request that
+# will fail identically forever. This is deliberately broader than
+# `rli.net.client.RETRYABLE_STATUS_CODES` (which excludes 501/505): an
+# OpenAI-compatible LLM gateway in front of a loading model answers 501/503
+# interchangeably while it warms up, and a wrongly-retried 501 costs one
+# extra request, while a wrongly-abandoned one costs the whole run.
+_RETRYABLE_STATUS_FLOOR = 500
+_RETRY_ALWAYS = frozenset({429})
+
+# Backoff between retries: min(_MAX_BACKOFF_S, base * 2**attempt). No jitter,
+# unlike `rli.net` — that client fans out across many hosts from many probes
+# and needs de-correlated retries, whereas this one is a single serialized
+# conversation with one endpoint, where a deterministic (and therefore
+# testable) delay is strictly more useful.
+_BACKOFF_BASE_S = 0.5
+_MAX_BACKOFF_S = 8.0
+
+# A server can ask for an arbitrarily long `Retry-After`. We honour it, but
+# not past this: a 15-minute quota reset must fail the run so the operator
+# sees it, not silently freeze the agent inside one step's budget.
+_MAX_RETRY_AFTER_S = 60.0
+
+# Bytes of an error response body quoted in an exception message. Enough to
+# carry the provider's error JSON, short enough not to paste a whole HTML
+# error page into a `run_steps.error` column.
+_ERROR_BODY_CHARS = 500
+
+# `response_format.json_schema.name` must match this (OpenAI's rule, and the
+# strictest of the compatible servers); anything else is replaced with `_`.
+_SCHEMA_NAME_RE = re.compile(r"[^A-Za-z0-9_-]")
+
+# Timeout for the liveness probe in `endpoint_unavailable_reason`. Short on
+# purpose: it runs on a request path (`/investigate`) and its only job is to
+# distinguish "something is listening" from "nothing is".
+DEFAULT_PROBE_TIMEOUT_S = 1.5
+
+
+def _schema_name(schema: type[BaseModel]) -> str:
+    """A `response_format` name derived from the schema class name."""
+    return _SCHEMA_NAME_RE.sub("_", schema.__name__)[:64] or "output"
+
+
+def _message_content(payload: Mapping[str, Any]) -> str:
+    """Pull `choices[0].message.content` out of a chat-completions body.
+
+    Tolerates the two content shapes servers actually emit — a plain string,
+    and OpenAI's newer list of `{"type": "text", "text": ...}` parts — and
+    reports anything else as a schema failure rather than crashing on an
+    attribute that is not there. A `refusal` is named explicitly because it
+    is the one "successful" HTTP 200 that carries no answer at all.
+    """
+    choices = payload.get("choices")
+    if not isinstance(choices, Sequence) or isinstance(choices, (str, bytes)) or not choices:
+        raise LLMSchemaError("chat-completions response carried no `choices`")
+    message = choices[0].get("message") if isinstance(choices[0], Mapping) else None
+    if not isinstance(message, Mapping):
+        raise LLMSchemaError("chat-completions response carried no `choices[0].message`")
+
+    refusal = message.get("refusal")
+    if isinstance(refusal, str) and refusal.strip():
+        raise LLMSchemaError(f"model refused to answer: {refusal.strip()[:200]}")
+
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, Sequence) and not isinstance(content, (str, bytes)):
+        parts = [
+            part["text"]
+            for part in content
+            if isinstance(part, Mapping) and isinstance(part.get("text"), str)
+        ]
+        if parts:
+            return "".join(parts)
+    raise LLMSchemaError(
+        "chat-completions response carried no usable `choices[0].message.content` "
+        f"(got {type(content).__name__})"
     )
 
 
-def _text_from_content(content: Any) -> str:
-    """Join the text blocks of an Anthropic `response.content`, tolerantly.
+def _json_object_from_text(text: str) -> Any:
+    """Parse `text` as JSON, tolerating the wrappers small models add.
 
-    The parsed object is the contract; `raw_text` is for the trace, so this
-    never raises: an unexpected content shape degrades to an empty string
-    and the caller substitutes the parsed JSON.
+    Strictly, `response_format` obliges the server to return bare JSON. In
+    practice a local 4-8B model asked for `json_object` will sometimes fence
+    it in ```json ... ``` or prefix a sentence. Recovering from that is worth
+    a few lines: the alternative is a failed agent step (and a wasted local
+    inference) over punctuation the model added outside the object.
+
+    Only two recoveries are attempted, both of which preserve the "it must be
+    ONE JSON document" contract: strip a markdown fence, then take the span
+    from the first `{` to the last `}`. Anything still unparseable is an
+    `LLMSchemaError` — this never guesses at the content.
     """
-    if not isinstance(content, Sequence) or isinstance(content, (str, bytes)):
-        return ""
-    chunks: list[str] = []
-    for block in content:
-        text = getattr(block, "text", None)
-        if isinstance(text, str):
-            chunks.append(text)
-    return "".join(chunks)
+    candidates = [text.strip()]
+
+    fenced = re.match(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", text, re.DOTALL | re.IGNORECASE)
+    if fenced is not None:
+        candidates.append(fenced.group(1).strip())
+
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        candidates.append(text[start : end + 1])
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            return json.loads(candidate)
+        except ValueError:
+            continue
+    raise LLMSchemaError(
+        f"model output is not JSON (first {_ERROR_BODY_CHARS} chars): "
+        f"{text[:_ERROR_BODY_CHARS]!r}"
+    )
 
 
-class AnthropicClient:
-    """Live structured-output client over `client.messages.parse` (spec.md §7).
+def _retry_after_seconds(value: str | None) -> float | None:
+    """Seconds to wait per a `Retry-After` header, or None if unusable.
 
-    Two constructor knobs matter:
+    RFC 9110 allows both forms and providers use both: `Retry-After: 20`
+    (Ollama/OpenAI) and `Retry-After: Wed, 21 Oct 2026 07:28:00 GMT`
+    (Gemini's gateway). A malformed header is ignored rather than fatal —
+    it only costs us the default backoff — and the result is clamped into
+    `[0, _MAX_RETRY_AFTER_S]` so a hostile or buggy header cannot park the
+    agent for an hour.
+    """
+    if value is None:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    try:
+        return max(0.0, min(_MAX_RETRY_AFTER_S, float(raw)))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    delta = (when - datetime.now(UTC)).total_seconds()
+    return max(0.0, min(_MAX_RETRY_AFTER_S, delta))
 
-    * `model_id` overrides `[llm].model_id` for this client only (the CLI's
-      `--model` flag), and is what the cache is keyed on.
-    * `client` injects an already-built API client. This is what makes the
-      class unit-testable: a fake exposing `messages.parse(...)` -> object
-      with `.parsed_output`, `.usage.input_tokens`, `.usage.output_tokens`
-      and `.content` exercises every line below without a network or an API
-      key.
 
-    **The `anthropic` import is lazy, inside `__init__`, and only on the
-    path that actually builds a real client.** `rli.llm` must import (and
-    `tests/test_smoke.py` must pass) in an environment where the package is
-    not installed, and no test may require an API key. The corollary is that
-    the SDK's exception classes are not available at call time either, which
-    is why `complete_structured` wraps `Exception` from the API call rather
-    than enumerating `anthropic.APIError` / `APIConnectionError` / …: an SDK
-    error class we failed to enumerate must not escape as a raw exception
-    into the agent loop, which is written to handle `LLMError`.
-    `BaseException` (KeyboardInterrupt, SystemExit) still propagates.
+class OpenAICompatibleClient:
+    """Live structured-output client over `POST {base_url}/chat/completions`.
+
+    One transport, many providers: this speaks the OpenAI chat-completions
+    wire format and nothing else, so a local Ollama
+    (`http://localhost:11434/v1`, free, no key), Google Gemini's
+    compatibility layer
+    (`https://generativelanguage.googleapis.com/v1beta/openai/`), vLLM,
+    llama.cpp or OpenAI itself are all the same code path and differ only by
+    `[llm].base_url` / `[llm].model_id`. There is no per-vendor branch to
+    keep in sync, which is the whole point of choosing this API as the
+    target (spec.md §7 asks for "one structured-output-capable LLM API",
+    not for one vendor).
+
+    --------------------------------------------------------------------
+    JUDGMENT CALL: httpx directly, and NOT through `rli.net`
+    --------------------------------------------------------------------
+
+    `rli.net.NetClient` is the audited path for PROBE traffic: per-probe
+    domain allowlists, per-host rate limiting, an append-only tool cache,
+    https-only, no loopback targets. LLM calls have never gone through it,
+    and deliberately still do not:
+
+    * `rli.net.check_allowed` rejects non-https and non-publicly-routable
+      hosts, which would make the default local endpoint
+      (`http://localhost:11434/v1`) unreachable by construction. Loosening
+      that check would weaken the SSRF hardening that exists because the
+      `json_ld` probe runs with a `"*"` allowlist.
+    * The allowlist is a control on where UNTRUSTED, model-or-page-directed
+      traffic may go. The LLM endpoint is operator configuration, fixed
+      before the run starts, and is the one host the agent must talk to;
+      an allowlist entry for it would authorize exactly what config already
+      authorizes.
+    * `ToolCache` would be the wrong cache anyway — `CachedClient` and the
+      `llm_cache` table already provide replay-exact LLM caching keyed the
+      way spec.md §2 requires.
+
+    What replaces the allowlist here is `rli.config.Llm._check_base_url`
+    (http(s) + a real host, validated at config load) plus the fact that the
+    URL is never derived from remote input. The residual risk is stated
+    plainly: a `base_url` typo sends the prompt — including untrusted page
+    excerpts — to whatever host was typed. That is a config-review concern,
+    the same class as `[allowlists]` itself.
+
+    --------------------------------------------------------------------
+    Structured output, and the one-way fallback
+    --------------------------------------------------------------------
+
+    First choice is `response_format={"type": "json_schema", ...,
+    "strict": true}` with the Pydantic model's own JSON Schema, because it
+    makes the server responsible for shape. Servers that do not implement it
+    answer HTTP 400. On that 400 the client falls back ONCE to
+    `{"type": "json_object"}` with the schema described in the system
+    message, and LATCHES that decision for the rest of its lifetime
+    (`_json_object_mode`): re-probing `json_schema` on every subsequent call
+    would burn one wasted request per call for the entire run against a
+    server whose answer will not change.
+
+    The latch is per client INSTANCE, not global, so a process talking to two
+    endpoints does not let one server's limitation degrade the other. Note
+    the deliberate over-trigger: ANY 400 on the first json_schema attempt
+    flips the latch, because the error bodies are not standardized enough to
+    classify reliably. A 400 that was really about something else simply
+    fails again on the retry and raises — one extra request, no wrong answer.
+
+    Validation is unchanged in spirit from the client this replaced:
+    `choices[0].message.content` is parsed as JSON and validated into the
+    caller's Pydantic model, and anything that does not fit raises
+    `LLMSchemaError`.
     """
 
     def __init__(
         self,
+        base_url: str,
+        api_key: str,
+        model_id: str,
+        *,
+        timeout_s: float = 60.0,
+        max_tokens: int = 4096,
+        prices: Mapping[str, ModelPrice] | None = None,
+        max_retries: int = 2,
+        client: httpx.Client | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.model_id = model_id
+        self._api_key = api_key or ""
+        self._timeout_s = timeout_s
+        self._max_tokens = max_tokens
+        self._prices: Mapping[str, ModelPrice] = prices if prices is not None else {}
+        self._max_retries = max(0, max_retries)
+        self._sleep = sleep
+        self._owns_client = client is None
+        self._client = client if client is not None else httpx.Client(timeout=timeout_s)
+        # Latched by the first 400 on a json_schema request. See the class
+        # docstring for why it never resets.
+        self._json_object_mode = False
+
+    @classmethod
+    def from_config(
+        cls,
         cfg: Config,
         *,
         model_id: str | None = None,
-        client: Any | None = None,
-    ) -> None:
-        self._cfg = cfg
-        self.model_id = model_id if model_id is not None else cfg.llm.model_id
+        client: httpx.Client | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> OpenAICompatibleClient:
+        """Build from `[llm]`. `model_id` overrides `[llm].model_id` (CLI `--model`).
 
-        if client is not None:
-            self._client = client
-            return
-
-        try:
-            import anthropic
-        except ImportError as exc:  # pragma: no cover - depends on the environment
-            raise LLMError(
-                "the 'anthropic' package is required for live LLM calls; "
-                "install it (`uv add anthropic`) or inject a client with "
-                "AnthropicClient(cfg, client=...)"
-            ) from exc
-
-        # Transport retries and the per-request timeout are applied at client
-        # construction, not per call, so `complete_structured` can keep the
-        # exact `messages.parse` signature an injected fake has to satisfy.
-        self._client = anthropic.Anthropic(
-            timeout=cfg.llm.timeout_s,
+        The API key is read from the environment variable NAMED by
+        `[llm].api_key_env`, here and nowhere else; an unset variable yields
+        `""`, which means "send no Authorization header" — the local-Ollama
+        case, not an error.
+        """
+        return cls(
+            cfg.llm.base_url,
+            cfg.llm.api_key(),
+            model_id if model_id is not None else cfg.llm.model_id,
+            timeout_s=cfg.llm.timeout_s,
+            max_tokens=cfg.llm.max_tokens,
+            prices=cfg.llm.prices,
             max_retries=cfg.llm.max_retries,
+            client=client,
+            sleep=sleep,
         )
+
+    # -- request construction ------------------------------------------------
+
+    @property
+    def _url(self) -> str:
+        return f"{self.base_url}/chat/completions"
+
+    def _headers(self) -> dict[str, str]:
+        """`Authorization: Bearer …` only when a key was configured.
+
+        Sending `Bearer ` with an empty key is worse than sending nothing:
+        several OpenAI-compatible servers (Ollama included) accept an absent
+        header and reject a malformed one.
+        """
+        headers = {"Content-Type": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        return headers
+
+    def _scrub(self, text: str) -> str:
+        """Remove the API key from anything that may be shown to a human.
+
+        Every exception message, and every string this module would ever log,
+        goes through here. Providers do echo credentials back in error
+        bodies, and `run_steps.error` is persisted to the database and
+        printed by `rli agent trace`, so a leaked key would not merely be
+        transient.
+        """
+        if not self._api_key:
+            return text
+        return text.replace(self._api_key, "***")
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return (
+            f"OpenAICompatibleClient(base_url={self.base_url!r}, "
+            f"model_id={self.model_id!r}, api_key={'***' if self._api_key else ''!r})"
+        )
+
+    def _build_body(self, prompt: Prompt, schema: type[BaseModel]) -> dict[str, Any]:
+        """The request body, in whichever structured-output mode is latched.
+
+        `temperature=0` is a request for determinism, not a guarantee of it —
+        spec.md §2 says as much ("do not assume temperature 0 makes APIs
+        deterministic"), which is why `CachedClient` exists.
+
+        Note where the schema goes in fallback mode: into the SYSTEM message,
+        never the user message. Untrusted blocks live in the user message
+        (`Prompt.render_user`), so the two never share a region and the
+        schema text cannot be confused for case data.
+        """
+        json_schema = schema.model_json_schema()
+        system = prompt.system
+
+        if self._json_object_mode:
+            response_format: dict[str, Any] = {"type": "json_object"}
+            system = (
+                f"{prompt.system}\n\n"
+                "Respond with a single JSON object and nothing else: no prose, no "
+                "explanation, no markdown code fence. The object must validate "
+                "against this JSON Schema:\n"
+                f"{json.dumps(json_schema, sort_keys=True)}"
+            )
+        else:
+            response_format = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": _schema_name(schema),
+                    "schema": json_schema,
+                    "strict": True,
+                },
+            }
+
+        return {
+            "model": self.model_id,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt.render_user()},
+            ],
+            "max_tokens": self._max_tokens,
+            "temperature": 0,
+            "response_format": response_format,
+        }
+
+    # -- transport -----------------------------------------------------------
+
+    def _backoff_s(self, attempt: int) -> float:
+        return min(_MAX_BACKOFF_S, _BACKOFF_BASE_S * (2.0**attempt))
+
+    def _send(self, body: Mapping[str, Any]) -> Mapping[str, Any]:
+        """POST once, retrying only 429/5xx and connection failures.
+
+        Total attempts = `max_retries + 1` (spec.md §2: "no uncontrolled
+        retry loops" — the bound is a configured number, not a duration).
+        A non-retryable status raises immediately: retrying a 401 or a 404
+        cannot change the answer and only delays the operator's error.
+        """
+        attempt = 0
+        while True:
+            try:
+                response = self._client.post(self._url, json=body, headers=self._headers())
+            except httpx.HTTPError as exc:
+                if attempt >= self._max_retries:
+                    raise LLMTransportError(
+                        f"LLM request to {self._scrub(self._url)} failed after "
+                        f"{attempt + 1} attempt(s): {self._scrub(str(exc))}"
+                    ) from exc
+                self._sleep(self._backoff_s(attempt))
+                attempt += 1
+                continue
+            except Exception as exc:
+                # NOT retried, and NOT allowed to escape unwrapped. httpx
+                # raises a handful of things that are not `HTTPError` at all —
+                # `httpx.InvalidURL` for a host that cannot be IDNA-encoded is
+                # the reachable one, since `[llm].base_url` only has to parse
+                # to pass config validation. Retrying cannot fix any of them,
+                # but letting one out as a raw exception would break the
+                # guarantee the agent loop is built on: `_call_investigator`
+                # catches `LLMError`, and spec.md §4 requires the run to reach
+                # a valid `Decision` regardless of what the model layer did.
+                # `BaseException` (KeyboardInterrupt, SystemExit) still
+                # propagates.
+                raise LLMError(
+                    f"LLM request to {self._scrub(self._url)} could not be sent: "
+                    f"{type(exc).__name__}: {self._scrub(str(exc))}"
+                ) from exc
+
+            status = response.status_code
+            if status < 300:
+                return self._decode(response)
+
+            # Redirects are NOT followed (httpx's default, kept deliberately):
+            # this request carries an Authorization header, and following a
+            # 3xx would hand that credential to whatever host the redirect
+            # names. A 3xx therefore falls through to the non-retryable branch
+            # below and surfaces as an error naming the status, which is the
+            # right diagnosis for a mistyped `base_url`.
+            detail = self._scrub(response.text[:_ERROR_BODY_CHARS])
+            if status in _RETRY_ALWAYS or status >= _RETRYABLE_STATUS_FLOOR:
+                if attempt >= self._max_retries:
+                    raise LLMTransportError(
+                        f"LLM endpoint returned HTTP {status} after {attempt + 1} "
+                        f"attempt(s) for model {self.model_id!r}: {detail}",
+                        status_code=status,
+                    )
+                retry_after = _retry_after_seconds(response.headers.get("Retry-After"))
+                self._sleep(
+                    retry_after if retry_after is not None else self._backoff_s(attempt)
+                )
+                attempt += 1
+                continue
+
+            raise LLMRequestError(
+                f"LLM endpoint returned HTTP {status} for model {self.model_id!r}: {detail}",
+                status_code=status,
+            )
+
+    def _decode(self, response: httpx.Response) -> Mapping[str, Any]:
+        """A 2xx whose body is not a JSON object is a schema failure, not a 200."""
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise LLMSchemaError(
+                f"LLM endpoint returned a non-JSON body for model {self.model_id!r}: "
+                f"{self._scrub(response.text[:_ERROR_BODY_CHARS])!r}"
+            ) from exc
+        if not isinstance(payload, Mapping):
+            raise LLMSchemaError(
+                f"LLM endpoint returned {type(payload).__name__}, expected a JSON object"
+            )
+        return payload
+
+    # -- the one call --------------------------------------------------------
 
     def complete_structured(self, prompt: Prompt, schema: type[BaseModel]) -> LLMResponse:
         """One structured call. Returns a validated `schema` instance or raises."""
         started = time.perf_counter()
         try:
-            raw = self._client.messages.parse(
-                model=self.model_id,
-                max_tokens=self._cfg.llm.max_tokens,
-                system=[
-                    {
-                        "type": "text",
-                        "text": prompt.system,
-                        # The system prompt is static per template, so it is
-                        # the one part of the request worth caching across
-                        # the many cases a benchmark run investigates.
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
-                messages=[{"role": "user", "content": prompt.render_user()}],
-                output_format=schema,
-            )
-        except Exception as exc:  # see the class docstring for why this is broad
-            raise LLMError(
-                f"anthropic call failed for model {self.model_id!r} "
-                f"(template {prompt.template_id!r}): {exc}"
-            ) from exc
+            payload = self._send(self._build_body(prompt, schema))
+        except LLMRequestError as exc:
+            # The one recoverable 4xx: this server does not implement
+            # `response_format: json_schema`. Latch json_object mode and
+            # retry exactly once; a second failure propagates.
+            if exc.status_code != 400 or self._json_object_mode:
+                raise
+            self._json_object_mode = True
+            payload = self._send(self._build_body(prompt, schema))
         latency_ms = (time.perf_counter() - started) * 1000.0
 
-        parsed = _validate_parsed(getattr(raw, "parsed_output", None), schema)
+        raw_text = _message_content(payload)
+        parsed = _validate_parsed(_json_object_from_text(raw_text), schema)
 
-        usage = getattr(raw, "usage", None)
-        input_tokens = _int_or_zero(getattr(usage, "input_tokens", 0))
-        output_tokens = _int_or_zero(getattr(usage, "output_tokens", 0))
+        usage = payload.get("usage")
+        usage_map: Mapping[str, Any] = usage if isinstance(usage, Mapping) else {}
+        input_tokens = _int_or_zero(usage_map.get("prompt_tokens", 0))
+        output_tokens = _int_or_zero(usage_map.get("completion_tokens", 0))
 
-        raw_text = _text_from_content(getattr(raw, "content", None))
-        if not raw_text:
-            raw_text = parsed.model_dump_json()
+        reported = payload.get("model")
+        model_id = reported if isinstance(reported, str) and reported else self.model_id
 
         return LLMResponse(
             parsed=parsed,
             raw_text=raw_text,
-            model_id=self.model_id,
+            model_id=model_id,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            cost_usd=compute_cost_usd(self._cfg, self.model_id, input_tokens, output_tokens),
+            cost_usd=self._cost_usd(model_id, input_tokens, output_tokens),
             latency_ms=latency_ms,
             cache_status="n/a",
         )
+
+    def _cost_usd(self, reported_model_id: str, input_tokens: int, output_tokens: int) -> float:
+        """Price the call, preferring the REPORTED model id over the requested one.
+
+        The server is the authority on what actually served the request (a
+        gateway may resolve an alias), so its id is tried first. When that id
+        is absent from the table the CONFIGURED id is tried before giving up:
+        providers decorate their ids (`models/gemini-2.5-flash`,
+        `gemini-2.5-flash-001`), and silently pricing a paid model at zero
+        because of a suffix is the one failure this fallback prevents.
+        """
+        if reported_model_id in self._prices:
+            return _price_cost_usd(self._prices, reported_model_id, input_tokens, output_tokens)
+        return _price_cost_usd(self._prices, self.model_id, input_tokens, output_tokens)
+
+    def close(self) -> None:
+        """Close the underlying httpx client when this object created it."""
+        if self._owns_client:
+            self._client.close()
+
+
+def close_llm_client(client: object) -> None:
+    """Release the HTTP resources behind `client`, wrappers included.
+
+    `CachedClient` is a wrapper, not a client, so the thing holding a socket
+    is usually `client.inner`; this walks that chain and calls `close()` on
+    whatever exposes one (`ScriptedClient` and `CachedClient` expose none, and
+    are silently left alone). Callers that BUILD a live client — the CLI, the
+    API request handler — use this in a `finally` so the connection pool is
+    released when the run ends rather than whenever the object is collected.
+
+    Never raises: teardown must not turn a completed run into a failed one.
+    """
+    seen = 0
+    node: Any = client
+    while node is not None and seen < 8:  # bounded: a cycle must not hang
+        close = getattr(node, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # pragma: no cover - teardown is best-effort
+                pass
+        node = getattr(node, "inner", None)
+        seen += 1
+
+
+def endpoint_unavailable_reason(
+    cfg: Config,
+    *,
+    timeout_s: float = DEFAULT_PROBE_TIMEOUT_S,
+    client: httpx.Client | None = None,
+) -> str | None:
+    """Why the configured LLM endpoint cannot be used, or `None` if it can.
+
+    Two checks, cheapest first:
+
+    1. **Config only, no network.** A missing API key is fatal for a REMOTE
+       endpoint and irrelevant for a local one (`Llm.credentials_configured`),
+       so `http://localhost:11434/v1` with no key is fine and
+       `https://generativelanguage.googleapis.com/...` with no key is not.
+    2. **A bounded `GET {base_url}/models`.** No model is run, no tokens are
+       spent and no money changes hands — this only distinguishes "something
+       is listening and will talk to us" from "nothing is". Any HTTP status
+       other than 401/403 counts as reachable, including 404: several
+       compatible servers do not implement `/models`, and a 404 still proves
+       a server answered.
+
+    Never raises. Any exception from the probe — connection refused, DNS
+    failure, timeout, a test's mock transport refusing an unexpected call —
+    is reported as unreachable, because from the caller's point of view those
+    are one thing: System C cannot run right now.
+    """
+    if not cfg.llm.credentials_configured():
+        return (
+            f"no LLM API key: ${cfg.llm.api_key_env} is unset and "
+            f"[llm].base_url ({cfg.llm.base_url}) is not local"
+        )
+
+    headers = {}
+    api_key = cfg.llm.api_key()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    owned = client is None
+    probe = client if client is not None else httpx.Client(timeout=timeout_s)
+    try:
+        response = probe.get(cfg.llm.models_url, headers=headers, timeout=timeout_s)
+    except Exception as exc:  # see the docstring: unreachable is unreachable
+        detail = str(exc).replace(api_key, "***") if api_key else str(exc)
+        return f"LLM endpoint {cfg.llm.base_url} is not reachable: {detail[:200]}"
+    else:
+        if response.status_code in (401, 403):
+            return (
+                f"LLM endpoint {cfg.llm.base_url} rejected our credentials "
+                f"(HTTP {response.status_code}; check ${cfg.llm.api_key_env})"
+            )
+        return None
+    finally:
+        if owned:
+            probe.close()
 
 
 def _int_or_zero(value: Any) -> int:

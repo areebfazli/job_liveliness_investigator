@@ -31,6 +31,7 @@ from typer.testing import CliRunner
 from rli.cli import app
 from rli.config import Config
 from rli.db import connect, init_db
+from rli.eval import evaluate as evaluate_module
 from rli.eval.evaluate import (
     C_NOT_RUN_REASON,
     DEFAULT_REPORT_PATH,
@@ -346,9 +347,20 @@ def populated(conn: sqlite3.Connection) -> sqlite3.Connection:
 
 
 @pytest.fixture(autouse=True)
-def _no_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    """System C must be unrunnable, which is the real-world state (contract §HARD)."""
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+def _no_llm_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    """System C must be unrunnable, which is the real-world state (contract §HARD).
+
+    Substituted rather than left to the real probe: `[llm].base_url`
+    defaults to a local Ollama, so on a machine that happens to be running
+    one the real probe would report the endpoint as USABLE and this suite
+    would start driving a live model. What these tests are about is the
+    reporting of an unavailable C, so the availability answer is pinned.
+    """
+    monkeypatch.setattr(
+        evaluate_module,
+        "endpoint_unavailable_reason",
+        lambda _cfg: "LLM endpoint is not reachable",
+    )
 
 
 def _cli_db(tmp_path: Path, name: str = "cli.db") -> Path:
@@ -491,7 +503,7 @@ def test_allow_test_false_excludes_the_holdout_and_writes_no_marker(
     assert marker_count == 0
 
 
-def test_with_c_without_a_key_is_skipped_and_never_attempted(
+def test_with_c_without_a_usable_endpoint_is_skipped_and_never_attempted(
     populated: sqlite3.Connection, cfg: Config
 ) -> None:
     report = evaluate(
@@ -508,11 +520,11 @@ def test_with_c_without_a_key_is_skipped_and_never_attempted(
     )
 
 
-def test_c_status_does_not_blame_a_missing_key_when_one_exists(
+def test_c_status_does_not_blame_the_endpoint_when_it_is_usable(
     populated: sqlite3.Connection, cfg: Config, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`with_c=False` plus a key is 'not requested', not 'no API key'."""
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-not-a-real-key")
+    """`with_c=False` plus a usable endpoint is 'not requested', not 'not run'."""
+    monkeypatch.setattr(evaluate_module, "endpoint_unavailable_reason", lambda _cfg: None)
 
     report = evaluate(populated, cfg, dataset_id=DATASET, include_survival=False)
 

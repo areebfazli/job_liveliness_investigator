@@ -28,7 +28,12 @@ import typer
 from rli.agent.loop import parse_tokens, run_system_c
 from rli.config import load_config
 from rli.db import connect, init_db
-from rli.llm.client import AnthropicClient, CachedClient, LLMError
+from rli.llm.client import (
+    CachedClient,
+    LLMError,
+    OpenAICompatibleClient,
+    close_llm_client,
+)
 
 __all__ = ["app"]
 
@@ -87,11 +92,13 @@ def run_command(
     cfg = load_config()
     init_db(db)
     conn = connect(db)
+    llm: CachedClient | None = None
     try:
-        llm = CachedClient(AnthropicClient(cfg, model_id=model), conn)
+        llm = CachedClient(OpenAICompatibleClient.from_config(cfg, model_id=model), conn)
         try:
-            # A credentials failure does NOT take this path: `AnthropicClient`
-            # resolves credentials lazily, so construction never throws, and
+            # A credentials failure does NOT take this path:
+            # `OpenAICompatibleClient` never contacts the endpoint while it is
+            # being constructed, so construction never throws, and
             # `run_system_c`/`loop.py::_call_investigator` deliberately catch
             # `LLMError` internally (spec.md §4) so the run still reaches a
             # valid `Decision`. This `except` remains correct for a
@@ -102,8 +109,10 @@ def run_command(
         except LLMError as exc:
             typer.echo(
                 f"LLM call failed: {exc}\n"
-                "Set the ANTHROPIC_API_KEY environment variable (or otherwise "
-                "configure Anthropic API credentials) and try again.",
+                f"Check that [llm].base_url ({cfg.llm.base_url}) is serving "
+                f"model {model or cfg.llm.model_id!r} — e.g. `ollama serve` for a "
+                f"local endpoint — and, for a remote one, that ${cfg.llm.api_key_env} "
+                "is exported.",
                 err=True,
             )
             raise typer.Exit(code=2) from exc
@@ -111,6 +120,11 @@ def run_command(
         _warn_if_model_calls_failed(conn, result.run_id)
         typer.echo(result.decision.model_dump_json(indent=2))
     finally:
+        # This command BUILT the client, so it closes it: the connection pool
+        # is released when the command ends rather than whenever the object
+        # happens to be collected.
+        if llm is not None:
+            close_llm_client(llm)
         conn.close()
 
 
@@ -119,7 +133,7 @@ def _warn_if_model_calls_failed(conn: sqlite3.Connection, run_id: str) -> None:
 
     `_call_investigator` (loop.py) and `explain` (explanation.py) both catch
     `LLMError` so the run still reaches a valid `Decision` per spec.md §4 —
-    which means a run with e.g. no usable Anthropic credentials still exits
+    which means a run against an unreachable LLM endpoint still exits
     0 with an ordinary-looking Decision on stdout, printed from the
     deterministic `rli.policy.explain_stub` fallback rather than from the
     agent, with no other signal that the model never actually answered. This
@@ -151,8 +165,8 @@ def _warn_if_model_calls_failed(conn: sqlite3.Connection, run_id: str) -> None:
             f"{run_id} — the decision printed above came from the "
             "deterministic frozen policy with fallback reasons (rli.policy."
             "explain_stub), NOT from the agent. First error: "
-            f"{failures[0]!r}. This usually means missing or invalid "
-            "Anthropic API credentials. Run "
+            f"{failures[0]!r}. This usually means the configured LLM "
+            "endpoint is unreachable or rejected our credentials. Run "
             f"`rli agent trace --run-id {run_id}` for the full picture.",
             err=True,
         )

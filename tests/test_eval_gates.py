@@ -329,8 +329,8 @@ def test_zero_baseline_probe_use_passes_only_when_the_candidate_is_also_zero(
 def test_a_candidate_with_no_runs_is_not_run_not_failed(
     conn: sqlite3.Connection, cfg: Config
 ) -> None:
-    # The state on the real database today: no ANTHROPIC_API_KEY, so System C
-    # has no runs. "not measured" must never be reported as "failed".
+    # The state on the real database today: no reachable LLM endpoint, so
+    # System C has no runs. "not measured" must never be reported as "failed".
     candidate = _metrics("C", runs=0, medium_high_steps=0, overall=None, macro=None)
     baseline = _metrics("B", runs=10, medium_high_steps=30, overall=0.9, macro=0.9)
 

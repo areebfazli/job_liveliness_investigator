@@ -6,26 +6,30 @@
 boundary. See either module's docstring for the design and the judgment
 calls.
 
-Importing this package never imports `anthropic`: `AnthropicClient` defers
-that to `__init__`, and only when it has to build a real API client. The
-package therefore imports (and every non-live test runs) with the SDK
-absent and with no API key in the environment.
+There is exactly one live transport, `OpenAICompatibleClient`: a direct
+httpx POST to `{[llm].base_url}/chat/completions` with an OpenAI-shaped
+body. No vendor SDK is imported anywhere in this package, so it imports
+(and every non-live test runs) with no API key and no network available.
 """
 
 from __future__ import annotations
 
 from rli.llm.client import (
-    AnthropicClient,
     CachedClient,
     CacheStatus,
     LLMClient,
     LLMError,
+    LLMRequestError,
     LLMResponse,
     LLMSchemaError,
+    LLMTransportError,
+    OpenAICompatibleClient,
     Prompt,
     ScriptedClient,
     UntrustedBlock,
+    close_llm_client,
     compute_cost_usd,
+    endpoint_unavailable_reason,
 )
 from rli.llm.prompts import (
     PROMPT_VERSION,
@@ -38,18 +42,22 @@ from rli.llm.prompts import (
 __all__ = [
     "PROMPT_VERSION",
     "UNTRUSTED_TAG",
-    "AnthropicClient",
     "CacheStatus",
     "CachedClient",
     "LLMClient",
     "LLMError",
+    "LLMRequestError",
     "LLMResponse",
     "LLMSchemaError",
+    "LLMTransportError",
+    "OpenAICompatibleClient",
     "Prompt",
     "ScriptedClient",
     "UntrustedBlock",
     "build_explanation_prompt",
     "build_investigator_prompt",
+    "close_llm_client",
     "compute_cost_usd",
+    "endpoint_unavailable_reason",
     "sanitize_untrusted",
 ]

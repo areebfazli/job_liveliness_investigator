@@ -22,6 +22,7 @@ import respx
 from fastapi.testclient import TestClient
 from test_eval_helpers import add_capture, add_posting, job
 
+from rli.api import app as app_module
 from rli.api.app import create_app
 from rli.config import Config, load_config
 from rli.db import connect, init_db
@@ -149,10 +150,20 @@ def test_investigate_system_b_returns_spec_fields_and_writes_run(
 
 
 @respx.mock
-def test_investigate_default_system_without_api_key_falls_back_to_b(
-    client: TestClient, conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+def test_investigate_default_system_without_a_usable_llm_falls_back_to_b(
+    client: TestClient, conn: sqlite3.Connection, cfg: Config, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    """No reachable LLM endpoint degrades System C to System B, and says so.
+
+    The endpoint probe is stubbed rather than left to hit the network: the
+    default `[llm].base_url` is a local Ollama, so on a developer machine
+    that happens to be running one the un-stubbed probe would SUCCEED and
+    this test would try to drive a live model.
+    """
+    monkeypatch.delenv(cfg.llm.api_key_env, raising=False)
+    monkeypatch.setattr(
+        app_module, "endpoint_unavailable_reason", lambda _cfg: "LLM endpoint is not reachable"
+    )
 
     job_id = "7002"
     url = f"https://boards.greenhouse.io/acme/jobs/{job_id}"
@@ -166,7 +177,9 @@ def test_investigate_default_system_without_api_key_falls_back_to_b(
 
     assert data["system_used"] == "B"
     assert data["degraded"] is True
-    assert data["degraded_reason"]
+    assert data["degraded_reason"] == (
+        "LLM endpoint is not reachable; ran System B instead of System C"
+    )
 
     run_row = conn.execute("SELECT system FROM runs WHERE id = ?", (data["run_id"],)).fetchone()
     assert run_row["system"] == "B"
@@ -399,17 +412,37 @@ def test_watch_due_includes_due_and_excludes_not_due(
 # --------------------------------------------------------------------------- #
 
 
-def test_health_reflects_api_key_env(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
+def test_health_reports_the_configured_llm_without_probing_it(
+    client: TestClient, cfg: Config, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    """/health answers from config only — no socket, so it is always fast.
+
+    No respx mock is installed here on purpose: any HTTP call this route
+    made would raise, so a passing test is itself the proof that /health
+    does not probe the endpoint.
+    """
     resp = client.get("/health")
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok", "llm_key_configured": False}
+    payload = resp.json()
+    assert payload["status"] == "ok"
+    assert payload["llm_base_url"] == cfg.llm.base_url
+    assert payload["llm_model_id"] == cfg.llm.model_id
+    # The shipped default is a local endpoint, which needs no credential.
+    assert payload["llm_configured"] is True
 
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake")
-    resp = client.get("/health")
-    assert resp.json()["llm_key_configured"] is True
+    remote = "https://generativelanguage.googleapis.com/v1beta/openai"
+    monkeypatch.setattr(
+        app_module,
+        "load_config",
+        lambda: cfg.model_copy(
+            update={"llm": cfg.llm.model_copy(update={"base_url": remote})}
+        ),
+    )
+    monkeypatch.delenv(cfg.llm.api_key_env, raising=False)
+    assert client.get("/health").json()["llm_configured"] is False
+
+    monkeypatch.setenv(cfg.llm.api_key_env, "a-key")
+    assert client.get("/health").json()["llm_configured"] is True
 
 
 def test_root_serves_ui(client: TestClient) -> None:

@@ -71,8 +71,9 @@ NO_COLLECTION_STATUS = Path(__file__).with_name("_no_collection_status.csv")
 # `rli.llm.client.compute_cost_usd` prices a call from `[llm.prices]`, and an
 # id missing from that table costs 0.0 without raising. A scripted client must
 # therefore use a PRICED id, or every cost-cap assertion would pass vacuously
-# against a run that spent nothing.
-MODEL_ID = "claude-sonnet-5"
+# against a run that spent nothing — which rules out the default local model,
+# whose price is legitimately 0.0.
+MODEL_ID = "gemini-2.5-pro"
 
 # What `scripted_llm` answers with once its investigator script runs out; see
 # that function's docstring for why exhaustion is a STOP and not an error.
@@ -264,7 +265,7 @@ def scripted_llm(
     explanation: ExplanationOutput | Exception | None = None,
     cfg: Config | None = None,
     model_id: str = MODEL_ID,
-    input_tokens: int = 5_000,
+    input_tokens: int = 8_000,
     output_tokens: int = 1_000,
 ) -> ScriptedClient:
     """A `ScriptedClient` that dispatches on `prompt.template_id`, never on call order.

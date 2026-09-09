@@ -70,14 +70,15 @@ uv run rli replay check --dataset my-dataset --db ./data/rli.db
 uv run rli eval baseline --dataset my-dataset --out reports/baseline.md --db ./data/rli.db
 uv run rli eval behavior --out reports/behavior.md --db ./data/rli.db
 uv run rli eval run --dataset my-dataset --out reports/evaluation.md --db ./data/rli.db
-#   add --with-c to also score System C (needs ANTHROPIC_API_KEY; otherwise
-#   it is recorded as "not run: no API key" and the agent gate reads "not run")
+#   add --with-c to also score System C (needs a reachable LLM endpoint —
+#   see "LLM setup" below; otherwise C is recorded as "not run: no LLM
+#   endpoint configured" and the agent gate reads "not run")
 uv run rli eval gates --dataset my-dataset --db ./data/rli.db
 
 # 9. Investigate one URL directly (System A = full probes, System B = rules)
 uv run rli run --system B --url https://boards.greenhouse.io/<tenant>/jobs/<id> --db ./data/rli.db
 
-# 10. System C: the bounded LLM agent (needs ANTHROPIC_API_KEY for a live call)
+# 10. System C: the bounded LLM agent (needs an LLM endpoint — see "LLM setup")
 uv run rli agent run --url https://boards.greenhouse.io/<tenant>/jobs/<id> --db ./data/rli.db
 uv run rli agent trace --run-id <run-id-from-stderr> --db ./data/rli.db
 
@@ -94,13 +95,91 @@ Steps 4–7 need live network access; step 7's `replay build` is the only
 *replay* command that does (everything downstream of it replays from the
 cached record with tool calls forbidden — spec.md §6). Step 10 and an
 `/investigate` call with `system: "C"` (or omitted — "C" is the API
-default) need `ANTHROPIC_API_KEY`; without it, System C is untested live in
-this environment (see Limitations) and the API transparently falls back to
-System B, marking the response `degraded: true`.
+default) need a reachable LLM endpoint (next section); without one, System
+C is untested live in this environment (see Limitations) and the API
+transparently falls back to System B, marking the response
+`degraded: true`.
 
 `uv run rli --help` and `<command> --help` are the source of truth for every
 flag above — this recipe was verified against that output, not against a
 stale description.
+
+## LLM setup (System C)
+
+System C talks to exactly **one** kind of API: an OpenAI-compatible
+chat-completions endpoint (`POST {base_url}/chat/completions`). There is no
+vendor SDK and no per-provider code path (`OpenAICompatibleClient` in
+`rli/llm/client.py` is a direct httpx call), so anything that speaks that
+protocol works and switching providers is a two-line config change.
+
+Three ways to point it somewhere, in `config.toml`'s `[llm]` table:
+
+**1. A local model with Ollama (the shipped default — free, no API key, no
+data leaves the machine).**
+
+```bash
+ollama serve                 # in its own shell
+ollama pull qwen3:8b         # ~5 GB; qwen3:4b is the smaller alternative
+uv run rli agent run --url https://boards.greenhouse.io/<tenant>/jobs/<id> --db ./data/rli.db
+```
+
+```toml
+[llm]
+provider = "openai_compatible"
+base_url = "http://localhost:11434/v1"
+model_id = "qwen3:8b"
+```
+
+Pick a model that can hold a structured output format: both System C prompts
+demand a JSON object matching a schema. On a CPU-only machine expect tens of
+seconds per call, so raise `[llm].timeout_s` rather than lowering it.
+
+**2. Google Gemini's free tier (an API key, no local RAM).**
+
+```bash
+export GEMINI_API_KEY=...     # https://aistudio.google.com/apikey
+```
+
+```toml
+[llm]
+provider = "openai_compatible"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+model_id = "gemini-2.5-flash"
+api_key_env = "GEMINI_API_KEY"
+```
+
+**3. Any other OpenAI-compatible endpoint** — vLLM, llama.cpp's server, LM
+Studio, OpenAI, an internal gateway. Set `base_url`, `model_id`, and
+`api_key_env` to whichever environment variable holds the credential
+(default `LLM_API_KEY`). The key itself never appears in `config.toml`, in
+a log line, or in an error message — `OpenAICompatibleClient` scrubs it from
+every message it raises.
+
+Structured output is requested as `response_format: json_schema` with the
+Pydantic model's own schema. A server that answers HTTP 400 to that is
+retried once with `response_format: json_object` and the schema inlined in
+the system prompt, and the client remembers that for the rest of the run
+rather than re-probing on every call.
+
+**Cost accounting is fully config-driven.** `[llm.prices."<model id>"]` maps
+a model id to `input_usd_per_mtok` / `output_usd_per_mtok` (USD per 1,000,000
+tokens), and that table is the only source of the `cost_usd` figures in
+`run_steps`, in `runs.total_cost_usd`, and in the `[budgets]` ledger the
+controller enforces.
+Local models are listed at `0.0` (they are free); a model id absent from the
+table costs `0.0` and does not raise, so a paid model you add must also be
+priced or it will look free to the budget cap. Prices are never sent to the
+API and are not part of the LLM cache key, so re-pricing does not invalidate
+any cached model output.
+
+A live end-to-end check of whatever you configured:
+
+```bash
+RLI_LLM_LIVE=1 uv run pytest tests/test_llm_live.py -q
+```
+
+It skips (never fails) when `RLI_LLM_LIVE` is unset or the endpoint does not
+answer.
 
 ## Safety and reproducibility invariants, and how they're enforced
 
@@ -160,16 +239,18 @@ must be loaded with `rli load-events` before any run or evaluation; an earlier
 evaluation was generated before that step existed and saw no events at all.
 
 **System C (the LLM agent) has not been exercised live in this
-environment.** No `ANTHROPIC_API_KEY` was available during development or
-in the last evaluation run, so System C's investigator/controller loop has
-1,076 passing offline/mocked tests but zero recorded live model calls, and
+environment.** No LLM endpoint was reachable during development or in the
+last evaluation run, so System C's investigator/controller loop has 1,103
+passing offline/mocked tests but zero recorded live model calls, and
 `reports/evaluation.md`'s agent gate reads **NOT RUN** rather than pass or
 fail — System C produced zero scoped runs, so it has not failed, it has
-never been graded. The product API (`POST /investigate`) detects the
-missing key and transparently degrades to System B
-(`degraded: true, degraded_reason: "no ANTHROPIC_API_KEY configured; ran
-System B instead of System C"`), and also degrades if every System C model
-call in a run errors out.
+never been graded. (The reports in `reports/` predate the move to an
+OpenAI-compatible client and still name the old provider's key; they are
+generated artifacts and were not rewritten by hand.) The product API
+(`POST /investigate`) probes the configured endpoint and transparently
+degrades to System B (`degraded: true`, with the probe's reason in
+`degraded_reason`), and also degrades if every System C model call in a run
+errors out.
 
 **System A is not a neutral upper bound on probe use.** `rli.eval.system_a`
 runs every dynamic probe that survives history/licensing gates regardless
@@ -203,14 +284,14 @@ steps; no report anywhere quotes one combined "total cost" figure.
 
 | measure | A | B | C |
 |---|---|---|---|
-| runs | 1,185 | 1,185 | not run (no `ANTHROPIC_API_KEY`) |
+| runs | 1,185 | 1,185 | not run (no LLM endpoint was reachable) |
 | action distribution | apply_now 17 · quick_apply 1,053 · skip 115 | identical | n/a |
 | agreement with A (overall / macro) | — | 100% / 100% | n/a |
 | medium/high probes per run | 1.78 | 1.42 | n/a |
 | probe cost points per run | 7.52 | 6.77 | n/a |
 | leakage violations | 0 | 0 | n/a |
 
-The agent gate (C medium/high probe use ≤ 70% of B and agreement with A within 2 points of B's) cannot be evaluated until System C runs with an API key. Rules (B) currently reproduce A exactly at 90% of A's probe cost, so if C does not beat that, the spec says to remove the agent.
+The agent gate (C medium/high probe use ≤ 70% of B and agreement with A within 2 points of B's) cannot be evaluated until System C runs against a live LLM endpoint. Rules (B) currently reproduce A exactly at 90% of A's probe cost, so if C does not beat that, the spec says to remove the agent.
 
 Read the 100% agreement with the action distribution: almost every replay case is archive-era and therefore `weak` evidence, which routes to `quick_apply` by construction. This is not proof that B is as good as A on live-era postings.
 
@@ -229,8 +310,9 @@ document (see `docs/demo.md`).
 uvicorn.
 
 - `POST /investigate {url, system?: "A"|"B"|"C"}` — `system` defaults to
-  `"C"`; falls back to System B with `degraded: true` when
-  `ANTHROPIC_API_KEY` is unset or every System-C model call fails. Returns
+  `"C"`; falls back to System B with `degraded: true` when the configured
+  LLM endpoint is unreachable (or has no credential and is not local), or
+  when every System-C model call fails. Returns
   the spec §1 decision fields plus `run_id`, `system_used`, `degraded`,
   `degraded_reason`.
 - `GET /runs/{run_id}` — the internal `run_steps` trace, only when header
@@ -269,9 +351,9 @@ uv run pytest -q
 uv run ruff check .
 ```
 
-1,076 tests pass, 1 is skipped by design (`tests/test_llm_live.py`: a real
-`ANTHROPIC_API_KEY`-gated live-LLM test that costs money and is not run
-without one). `ruff check .` is clean. Per `PROGRESS.md`'s milestone table:
+1,103 tests pass, 1 is skipped by design (`tests/test_llm_live.py`: the
+live-LLM check, which runs only with `RLI_LLM_LIVE=1` and a reachable
+endpoint). `ruff check .` is clean. Per `PROGRESS.md`'s milestone table:
 M0–M5 done (M1–M3 "nearly done"/"in progress" with specific remaining items
 logged there), M6 "done (code), interim report", M7 "todo" as of the version
 read while writing this document — treat `PROGRESS.md` as the authoritative,

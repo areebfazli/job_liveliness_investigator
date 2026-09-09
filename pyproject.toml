@@ -15,7 +15,6 @@ dependencies = [
     "lifelines>=0.29",
     "scikit-learn>=1.5",
     "typer>=0.12",
-    "anthropic>=1.0",
     "uvicorn>=0.30",
 ]
 

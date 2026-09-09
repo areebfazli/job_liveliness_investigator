@@ -118,7 +118,7 @@ rather than discovering later:
    This is a conservative bias, not a neutral one: the learned model is
    trained to be skeptical by default.
 3. **System-count sparsity.** With three systems (A/B/C, and only A/B live
-   today with no `ANTHROPIC_API_KEY` for C — see the HARD RULES in the
+   today — no LLM endpoint was reachable for C; see the HARD RULES in the
    contract this module was built against), the "other system" in (a) is
    most often just B. A single comparison system is a thin base for a
    causal claim; this is exactly why `min_rows` exists and why the module

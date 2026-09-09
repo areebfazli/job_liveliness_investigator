@@ -21,7 +21,6 @@ waiting to happen under concurrent requests.
 
 from __future__ import annotations
 
-import os
 import sqlite3
 import traceback
 from collections.abc import AsyncIterator
@@ -40,6 +39,12 @@ from rli.db import connect, init_db
 from rli.eval.runner import RunResult
 from rli.eval.system_a import run_system_a
 from rli.eval.system_b import run_system_b
+from rli.llm.client import (
+    CachedClient,
+    OpenAICompatibleClient,
+    close_llm_client,
+    endpoint_unavailable_reason,
+)
 from rli.models.time import now_utc, parse_utc, to_utc_z
 from rli.net import DisallowedHostError, check_allowed
 
@@ -149,18 +154,37 @@ def create_app(
                 result = run_system_b(conn, cfg, body.url)
                 system_used = "B"
             else:
-                api_key = os.environ.get("ANTHROPIC_API_KEY")
-                if not api_key:
+                # Availability is decided per REQUEST, on the System C path
+                # only, and never at startup: a bounded (1.5s) `GET
+                # {base_url}/models` that runs no model and costs nothing.
+                # Doing it here rather than in the lifespan hook means the
+                # app still boots with the endpoint down, an operator who
+                # starts `ollama serve` afterwards is picked up on the next
+                # request with no restart, and nothing is cached that could
+                # go stale in either direction. The cost is one cheap probe
+                # per System C request, which is negligible next to the run
+                # it gates.
+                unavailable = endpoint_unavailable_reason(cfg)
+                if unavailable is not None:
                     result = run_system_b(conn, cfg, body.url)
                     system_used = "B"
                     degraded = True
-                    degraded_reason = (
-                        "no ANTHROPIC_API_KEY configured; ran System B instead of System C"
-                    )
+                    degraded_reason = f"{unavailable}; ran System B instead of System C"
                 else:
                     from rli.agent.loop import run_system_c
 
-                    result = run_system_c(conn, cfg, body.url)
+                    # Built here rather than left to `run_system_c`'s own
+                    # lazy factory so this request OWNS the client and can
+                    # close it: one httpx connection pool per /investigate
+                    # call would otherwise be released only by the garbage
+                    # collector.
+                    system_c_llm = CachedClient(
+                        OpenAICompatibleClient.from_config(cfg), conn
+                    )
+                    try:
+                        result = run_system_c(conn, cfg, body.url, system_c_llm)
+                    finally:
+                        close_llm_client(system_c_llm)
                     system_used = "C"
                     if _run_model_calls_all_failed(conn, result.run_id):
                         degraded = True
@@ -308,10 +332,20 @@ def create_app(
     # ------------------------------------------------------------------ #
     @app.get("/health")
     def health() -> JSONResponse:
+        cfg_llm = load_config().llm
+        # Deliberately does NOT probe the endpoint: /health is polled (by a
+        # container orchestrator, by the demo script, by a human refreshing)
+        # and must answer instantly, whereas the probe can spend up to
+        # `DEFAULT_PROBE_TIMEOUT_S` waiting on a socket. This reports what is
+        # CONFIGURED — a local base_url, or a key present in the environment
+        # variable `[llm].api_key_env` names. `/investigate` does the live
+        # probe, once, on the request that actually needs System C.
         return JSONResponse(
             {
                 "status": "ok",
-                "llm_key_configured": bool(os.environ.get("ANTHROPIC_API_KEY")),
+                "llm_configured": cfg_llm.credentials_configured(),
+                "llm_base_url": cfg_llm.base_url,
+                "llm_model_id": cfg_llm.model_id,
             }
         )
 

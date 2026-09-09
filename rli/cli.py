@@ -543,8 +543,9 @@ def eval_run_command(
     with_c: bool = typer.Option(
         False,
         "--with-c",
-        help="Also evaluate System C. Without an ANTHROPIC_API_KEY (or an injected "
-        "client) C is recorded as 'not run: no API key' and no live call is attempted.",
+        help="Also evaluate System C. Without a reachable LLM endpoint at the "
+        "configured llm.base_url (or an injected client) C is recorded as "
+        "'not run: no LLM endpoint configured' and no model call is attempted.",
     ),
     split_kind: str | None = typer.Option(
         None,

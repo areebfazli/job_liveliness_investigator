@@ -90,10 +90,10 @@ from rli.models.decision import Decision
 NOW = datetime(2026, 9, 7, tzinfo=UTC)
 
 # `scripted_llm`'s defaults, restated so the token/cost assertions below read
-# as arithmetic rather than as magic. At `[llm.prices."claude-sonnet-5"]`
-# (2 usd/Mtok in, 10 usd/Mtok out) one scripted call costs
-# 5000/1e6*2 + 1000/1e6*10 = 0.02 usd.
-INPUT_TOKENS = 5_000
+# as arithmetic rather than as magic. At `[llm.prices."gemini-2.5-pro"]`
+# (1.25 usd/Mtok in, 10 usd/Mtok out) one scripted call costs
+# 8000/1e6*1.25 + 1000/1e6*10 = 0.02 usd.
+INPUT_TOKENS = 8_000
 OUTPUT_TOKENS = 1_000
 CALL_USD = 0.02
 
@@ -502,7 +502,7 @@ def test_a_closed_posting_stops_before_the_first_model_call(
     "failure",
     [
         pytest.param(LLMSchemaError("model returned prose, not the schema"), id="schema"),
-        pytest.param(LLMError("anthropic call failed: connection reset"), id="transport"),
+        pytest.param(LLMError("LLM request failed: connection reset"), id="transport"),
     ],
 )
 @respx.mock

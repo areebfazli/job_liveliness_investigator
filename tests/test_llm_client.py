@@ -1,10 +1,12 @@
-"""`rli.llm.client`: cost accounting, the Anthropic adapter, and the replay cache.
+"""`rli.llm.client`: cost accounting, the OpenAI-compatible adapter, and the cache.
 
-Nothing here touches the network or needs an API key. `AnthropicClient` is
-exercised through an injected fake that mimics the SDK surface the adapter
-actually uses (`messages.parse(...)` -> `.parsed_output`, `.usage`,
-`.content`), and `test_anthropic_client_does_not_import_the_sdk_when_a_client_
-is_injected` pins the lazy-import guarantee that makes that possible.
+Nothing here touches the network or needs an API key. `OpenAICompatibleClient`
+speaks plain HTTP, so it is exercised through `respx` — the same mocking layer
+`tests/test_net.py` uses for probe traffic — against a fake endpoint at
+`http://llm.test/v1`. That is a strictly better test than an injected SDK
+double: it pins the actual bytes on the wire (the `response_format` block, the
+`Authorization` header, the retry behaviour on a 429), which is where every
+provider incompatibility will show up.
 
 `CachedClient` is exercised against a real SQLite database (the `conn`
 fixture's tmp_path file, never `data/rli.db`), because the behaviour under
@@ -14,25 +16,31 @@ test — a hit, a miss, an overwrite, a corrupt row — is behaviour of the
 
 from __future__ import annotations
 
+import json
 import sqlite3
-import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import httpx
 import pytest
+import respx
 from pydantic import BaseModel, ValidationError
 
-from rli.config import Config
+from rli.config import Config, ModelPrice
 from rli.llm.client import (
-    AnthropicClient,
     CachedClient,
     LLMError,
+    LLMRequestError,
     LLMResponse,
     LLMSchemaError,
+    LLMTransportError,
+    OpenAICompatibleClient,
     Prompt,
     ScriptedClient,
     UntrustedBlock,
+    close_llm_client,
     compute_cost_usd,
+    endpoint_unavailable_reason,
 )
 from rli.llm.prompts import build_investigator_prompt
 
@@ -54,65 +62,74 @@ def make_prompt(**structured: Any) -> Prompt:
 
 
 # ---------------------------------------------------------------------------
-# A fake mimicking the SDK surface `AnthropicClient` uses
+# A fake OpenAI-compatible endpoint
 # ---------------------------------------------------------------------------
 
+BASE_URL = "http://llm.test/v1"
+CHAT_URL = f"{BASE_URL}/chat/completions"
 
-class FakeUsage:
-    def __init__(self, input_tokens: int, output_tokens: int) -> None:
-        self.input_tokens = input_tokens
-        self.output_tokens = output_tokens
-
-
-class FakeTextBlock:
-    def __init__(self, text: str) -> None:
-        self.type = "text"
-        self.text = text
+# A price table that exists only in this file, so the assertions below are
+# about the arithmetic rather than about whatever `config.toml` charges today.
+TEST_PRICES = {
+    "test-model": ModelPrice(input_usd_per_mtok=3.0, output_usd_per_mtok=15.0),
+}
 
 
-class FakeParsed:
-    def __init__(self, parsed_output: Any, *, usage: Any, content: Any) -> None:
-        self.parsed_output = parsed_output
-        self.usage = usage
-        self.content = content
-
-
-class FakeMessages:
-    def __init__(self, result: Any, *, raises: BaseException | None = None) -> None:
-        self._result = result
-        self._raises = raises
-        self.kwargs: dict[str, Any] | None = None
-        self.call_count = 0
-
-    def parse(self, **kwargs: Any) -> Any:
-        self.call_count += 1
-        self.kwargs = kwargs
-        if self._raises is not None:
-            raise self._raises
-        return self._result
-
-
-class FakeAnthropic:
-    def __init__(self, result: Any = None, *, raises: BaseException | None = None) -> None:
-        self.messages = FakeMessages(result, raises=raises)
-
-
-def fake_ok(
-    parsed: Any = None,
+def chat_body(
+    content: str = '{"verdict":"live","score":7}',
     *,
-    input_tokens: int = 1000,
-    output_tokens: int = 500,
-    text: str = '{"verdict":"live","score":7}',
-) -> FakeAnthropic:
-    if parsed is None:
-        parsed = Answer(verdict="live", score=7)
-    return FakeAnthropic(
-        FakeParsed(
-            parsed,
-            usage=FakeUsage(input_tokens, output_tokens),
-            content=[FakeTextBlock(text)],
-        )
+    model: str = "test-model",
+    prompt_tokens: int = 1000,
+    completion_tokens: int = 500,
+    usage: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """One OpenAI-shaped chat-completions response body."""
+    body: dict[str, Any] = {
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+    }
+    body["usage"] = (
+        usage
+        if usage is not None
+        else {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
     )
+    return body
+
+
+def make_client(
+    *,
+    api_key: str = "",
+    model_id: str = "test-model",
+    max_retries: int = 2,
+    sleeps: list[float] | None = None,
+) -> OpenAICompatibleClient:
+    """A client pointed at the fake endpoint, whose retries never really sleep."""
+    return OpenAICompatibleClient(
+        BASE_URL,
+        api_key,
+        model_id,
+        timeout_s=1.0,
+        max_tokens=256,
+        prices=TEST_PRICES,
+        max_retries=max_retries,
+        sleep=(sleeps.append if sleeps is not None else (lambda _seconds: None)),
+    )
+
+
+def sent_body(route: respx.Route, index: int = 0) -> dict[str, Any]:
+    return json.loads(route.calls[index].request.content)
 
 
 # ---------------------------------------------------------------------------
@@ -121,21 +138,28 @@ def fake_ok(
 
 
 def test_cost_uses_the_config_price_table(cfg: Config) -> None:
-    price = cfg.llm.price_for("claude-sonnet-5")
+    price = cfg.llm.price_for("gemini-2.5-flash")
     assert price is not None and (price.input_usd_per_mtok, price.output_usd_per_mtok) == (
-        2.0,
-        10.0,
+        0.30,
+        2.50,
     )
-    # 1M in @ $2 + 0.5M out @ $10.
-    assert compute_cost_usd(cfg, "claude-sonnet-5", 1_000_000, 500_000) == pytest.approx(7.0)
-    assert compute_cost_usd(cfg, "claude-sonnet-5", 1000, 500) == pytest.approx(0.007)
+    # 1M in @ $0.30 + 0.5M out @ $2.50.
+    assert compute_cost_usd(cfg, "gemini-2.5-flash", 1_000_000, 500_000) == pytest.approx(1.55)
+    assert compute_cost_usd(cfg, "gemini-2.5-flash", 1000, 500) == pytest.approx(0.00155)
 
 
 def test_cost_differs_per_model(cfg: Config) -> None:
-    opus = compute_cost_usd(cfg, "claude-opus-5", 1_000_000, 0)
-    haiku = compute_cost_usd(cfg, "claude-haiku-4-5", 1_000_000, 0)
-    assert opus == pytest.approx(5.0)
-    assert haiku == pytest.approx(1.0)
+    pro = compute_cost_usd(cfg, "gemini-2.5-pro", 1_000_000, 0)
+    flash = compute_cost_usd(cfg, "gemini-2.5-flash", 1_000_000, 0)
+    assert pro == pytest.approx(1.25)
+    assert flash == pytest.approx(0.30)
+
+
+def test_a_local_model_is_priced_at_zero_explicitly(cfg: Config) -> None:
+    # Not the unpriced-model fallback: the row exists and says 0.0, so the
+    # ledger's zero for a local run is a recorded fact.
+    assert cfg.llm.price_for(cfg.llm.model_id) is not None
+    assert compute_cost_usd(cfg, cfg.llm.model_id, 10_000_000, 10_000_000) == 0.0
 
 
 def test_unknown_model_costs_zero_and_does_not_raise(cfg: Config) -> None:
@@ -146,151 +170,561 @@ def test_unknown_model_costs_zero_and_does_not_raise(cfg: Config) -> None:
 
 
 def test_zero_tokens_cost_zero(cfg: Config) -> None:
-    assert compute_cost_usd(cfg, "claude-sonnet-5", 0, 0) == 0.0
+    assert compute_cost_usd(cfg, "gemini-2.5-flash", 0, 0) == 0.0
 
 
 # ---------------------------------------------------------------------------
-# AnthropicClient (injected fake — no network, no API key)
+# OpenAICompatibleClient — the json_schema happy path
 # ---------------------------------------------------------------------------
 
 
-def test_anthropic_client_sends_the_expected_request(cfg: Config) -> None:
-    fake = fake_ok()
-    client = AnthropicClient(cfg, client=fake)
+@respx.mock
+def test_client_posts_an_openai_shaped_json_schema_request() -> None:
+    route = respx.post(CHAT_URL).mock(return_value=httpx.Response(200, json=chat_body()))
     prompt = make_prompt(posting_id="p1")
 
-    client.complete_structured(prompt, Answer)
+    make_client().complete_structured(prompt, Answer)
 
-    kwargs = fake.messages.kwargs
-    assert kwargs is not None
-    assert kwargs["model"] == cfg.llm.model_id
-    assert kwargs["max_tokens"] == cfg.llm.max_tokens
-    assert kwargs["output_format"] is Answer
-    assert kwargs["system"] == [
-        {
-            "type": "text",
-            "text": prompt.system,
-            "cache_control": {"type": "ephemeral"},
-        }
+    assert route.called
+    body = sent_body(route)
+    assert body["model"] == "test-model"
+    assert body["max_tokens"] == 256
+    assert body["messages"] == [
+        {"role": "system", "content": prompt.system},
+        {"role": "user", "content": prompt.render_user()},
     ]
-    assert kwargs["messages"] == [{"role": "user", "content": prompt.render_user()}]
+    assert body["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "Answer",
+            "schema": Answer.model_json_schema(),
+            "strict": True,
+        },
+    }
     # The untrusted excerpt travels inside the user message's block, never in
     # the system prompt.
-    assert "excerpt" not in kwargs["system"][0]["text"]
-    assert "excerpt" in kwargs["messages"][0]["content"]
+    assert "excerpt" not in body["messages"][0]["content"]
+    assert "excerpt" in body["messages"][1]["content"]
 
 
-def test_anthropic_client_returns_a_priced_validated_response(cfg: Config) -> None:
-    client = AnthropicClient(cfg, client=fake_ok(input_tokens=1000, output_tokens=500))
+@respx.mock
+def test_client_returns_a_priced_validated_response() -> None:
+    respx.post(CHAT_URL).mock(return_value=httpx.Response(200, json=chat_body()))
 
-    response = client.complete_structured(make_prompt(), Answer)
+    response = make_client().complete_structured(make_prompt(), Answer)
 
     assert isinstance(response, LLMResponse)
     assert isinstance(response.parsed, Answer)
     assert response.parsed.verdict == "live"
-    assert response.model_id == cfg.llm.model_id
+    assert response.model_id == "test-model"
     assert (response.input_tokens, response.output_tokens) == (1000, 500)
-    assert response.cost_usd == pytest.approx(0.007)
+    # 1000/1e6*$3 + 500/1e6*$15.
+    assert response.cost_usd == pytest.approx(0.0105)
     assert response.cache_status == "n/a"
     assert response.latency_ms >= 0.0
     assert response.raw_text == '{"verdict":"live","score":7}'
 
 
-def test_anthropic_client_model_id_override_is_used_for_call_and_price(cfg: Config) -> None:
-    fake = fake_ok(input_tokens=1_000_000, output_tokens=0)
-    client = AnthropicClient(cfg, model_id="claude-opus-5", client=fake)
-
-    response = client.complete_structured(make_prompt(), Answer)
-
-    assert client.model_id == "claude-opus-5"
-    assert fake.messages.kwargs is not None
-    assert fake.messages.kwargs["model"] == "claude-opus-5"
-    assert response.model_id == "claude-opus-5"
-    assert response.cost_usd == pytest.approx(5.0)
-
-
-def test_anthropic_client_unpriced_model_still_answers(cfg: Config) -> None:
-    client = AnthropicClient(cfg, model_id="some-future-model", client=fake_ok())
-    response = client.complete_structured(make_prompt(), Answer)
-    assert response.cost_usd == 0.0
-
-
-def test_anthropic_client_falls_back_to_parsed_json_for_raw_text(cfg: Config) -> None:
-    fake = FakeAnthropic(
-        FakeParsed(Answer(verdict="live", score=1), usage=FakeUsage(1, 1), content=None)
+@respx.mock
+def test_model_id_comes_from_the_response_body() -> None:
+    respx.post(CHAT_URL).mock(
+        return_value=httpx.Response(200, json=chat_body(model="test-model-0925"))
     )
-    response = AnthropicClient(cfg, client=fake).complete_structured(make_prompt(), Answer)
-    assert response.raw_text == Answer(verdict="live", score=1).model_dump_json()
+    response = make_client().complete_structured(make_prompt(), Answer)
+    assert response.model_id == "test-model-0925"
+    # The reported id is unpriced, so the CONFIGURED id's price is used
+    # rather than silently charging zero for a decorated alias.
+    assert response.cost_usd == pytest.approx(0.0105)
 
 
-def test_anthropic_client_tolerates_missing_usage(cfg: Config) -> None:
-    fake = FakeAnthropic(FakeParsed(Answer(verdict="live"), usage=None, content=[]))
-    response = AnthropicClient(cfg, client=fake).complete_structured(make_prompt(), Answer)
+@respx.mock
+def test_an_unpriced_model_costs_zero_and_still_answers() -> None:
+    respx.post(CHAT_URL).mock(
+        return_value=httpx.Response(200, json=chat_body(model="llama3.2:3b"))
+    )
+    response = make_client(model_id="llama3.2:3b").complete_structured(make_prompt(), Answer)
+    assert response.cost_usd == 0.0
+    assert response.parsed.verdict == "live"  # type: ignore[attr-defined]
+
+
+@respx.mock
+def test_missing_usage_reports_zero_tokens() -> None:
+    respx.post(CHAT_URL).mock(return_value=httpx.Response(200, json=chat_body(usage={})))
+    response = make_client().complete_structured(make_prompt(), Answer)
     assert (response.input_tokens, response.output_tokens, response.cost_usd) == (0, 0, 0.0)
 
 
-def test_anthropic_client_coerces_a_dict_parsed_output(cfg: Config) -> None:
-    fake = fake_ok({"verdict": "closed", "score": 2})
-    response = AnthropicClient(cfg, client=fake).complete_structured(make_prompt(), Answer)
-    assert isinstance(response.parsed, Answer)
-    assert response.parsed.verdict == "closed"
+@respx.mock
+def test_content_delivered_as_parts_is_joined() -> None:
+    body = chat_body()
+    body["choices"][0]["message"]["content"] = [
+        {"type": "text", "text": '{"verdict":"clo'},
+        {"type": "text", "text": 'sed","score":2}'},
+    ]
+    respx.post(CHAT_URL).mock(return_value=httpx.Response(200, json=body))
+
+    response = make_client().complete_structured(make_prompt(), Answer)
+    assert response.parsed.verdict == "closed"  # type: ignore[attr-defined]
 
 
-def test_anthropic_client_wraps_transport_failures(cfg: Config) -> None:
-    fake = FakeAnthropic(None, raises=RuntimeError("connection reset"))
+@respx.mock
+def test_a_fenced_json_object_is_still_parsed() -> None:
+    # Small local models fence their output even when told not to; recovering
+    # is cheaper than throwing away a completed inference.
+    respx.post(CHAT_URL).mock(
+        return_value=httpx.Response(
+            200, json=chat_body(content='```json\n{"verdict":"live","score":1}\n```')
+        )
+    )
+    response = make_client().complete_structured(make_prompt(), Answer)
+    assert response.parsed.score == 1  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Authorization header
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_authorization_header_is_sent_when_a_key_is_configured() -> None:
+    route = respx.post(CHAT_URL).mock(return_value=httpx.Response(200, json=chat_body()))
+    make_client(api_key="secret-key-123").complete_structured(make_prompt(), Answer)
+    assert route.calls[0].request.headers["Authorization"] == "Bearer secret-key-123"
+
+
+@respx.mock
+def test_no_authorization_header_without_a_key() -> None:
+    # The local-Ollama case: several compatible servers reject a malformed
+    # `Bearer ` header while accepting an absent one.
+    route = respx.post(CHAT_URL).mock(return_value=httpx.Response(200, json=chat_body()))
+    make_client().complete_structured(make_prompt(), Answer)
+    assert "authorization" not in route.calls[0].request.headers
+
+
+@respx.mock
+def test_the_api_key_never_appears_in_an_error_message() -> None:
+    respx.post(CHAT_URL).mock(
+        return_value=httpx.Response(401, text="invalid api key: secret-key-123")
+    )
     with pytest.raises(LLMError) as excinfo:
-        AnthropicClient(cfg, client=fake).complete_structured(make_prompt(), Answer)
-    assert "connection reset" in str(excinfo.value)
-    assert not isinstance(excinfo.value, LLMSchemaError)
+        make_client(api_key="secret-key-123").complete_structured(make_prompt(), Answer)
+    assert "secret-key-123" not in str(excinfo.value)
+    assert "***" in str(excinfo.value)
 
 
-def test_anthropic_client_does_not_swallow_keyboard_interrupt(cfg: Config) -> None:
-    fake = FakeAnthropic(None, raises=KeyboardInterrupt())
-    with pytest.raises(KeyboardInterrupt):
-        AnthropicClient(cfg, client=fake).complete_structured(make_prompt(), Answer)
+def test_repr_does_not_carry_the_api_key() -> None:
+    assert "secret-key-123" not in repr(make_client(api_key="secret-key-123"))
 
 
-def test_anthropic_client_raises_schema_error_on_missing_output(cfg: Config) -> None:
-    fake = FakeAnthropic(FakeParsed(None, usage=FakeUsage(1, 1), content=[]))
-    with pytest.raises(LLMSchemaError):
-        AnthropicClient(cfg, client=fake).complete_structured(make_prompt(), Answer)
+# ---------------------------------------------------------------------------
+# json_object fallback (and its latch)
+# ---------------------------------------------------------------------------
 
 
-def test_anthropic_client_raises_schema_error_on_wrong_shape(cfg: Config) -> None:
-    fake = fake_ok({"nope": 1})
+@respx.mock
+def test_a_400_on_json_schema_falls_back_to_json_object_once() -> None:
+    route = respx.post(CHAT_URL).mock(
+        side_effect=[
+            httpx.Response(400, json={"error": {"message": "response_format not supported"}}),
+            httpx.Response(200, json=chat_body()),
+        ]
+    )
+
+    response = make_client().complete_structured(make_prompt(), Answer)
+
+    assert response.parsed.verdict == "live"  # type: ignore[attr-defined]
+    assert route.call_count == 2
+    first, second = sent_body(route, 0), sent_body(route, 1)
+    assert first["response_format"]["type"] == "json_schema"
+    assert second["response_format"] == {"type": "json_object"}
+    # The schema has to reach the model somehow: it moves into the SYSTEM
+    # message, never the user message where untrusted text lives.
+    assert "verdict" in second["messages"][0]["content"]
+    assert second["messages"][1]["content"] == first["messages"][1]["content"]
+
+
+@respx.mock
+def test_the_json_object_fallback_sticks_for_the_rest_of_the_client_life() -> None:
+    route = respx.post(CHAT_URL).mock(
+        side_effect=[
+            httpx.Response(400, json={"error": "unsupported"}),
+            httpx.Response(200, json=chat_body()),
+            httpx.Response(200, json=chat_body()),
+            httpx.Response(200, json=chat_body()),
+        ]
+    )
+    client = make_client()
+
+    client.complete_structured(make_prompt(posting_id="p1"), Answer)
+    client.complete_structured(make_prompt(posting_id="p2"), Answer)
+    client.complete_structured(make_prompt(posting_id="p3"), Answer)
+
+    # 2 for the first call (probe + fallback), then exactly 1 each: the
+    # client never re-probes json_schema.
+    assert route.call_count == 4
+    assert [sent_body(route, i)["response_format"]["type"] for i in range(4)] == [
+        "json_schema",
+        "json_object",
+        "json_object",
+        "json_object",
+    ]
+
+
+@respx.mock
+def test_a_second_400_in_json_object_mode_raises() -> None:
+    route = respx.post(CHAT_URL).mock(
+        return_value=httpx.Response(400, text="genuinely bad request")
+    )
+    with pytest.raises(LLMRequestError) as excinfo:
+        make_client().complete_structured(make_prompt(), Answer)
+    assert excinfo.value.status_code == 400
+    # One probe + one fallback attempt, and no retry loop beyond that.
+    assert route.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Retries: 429, 5xx, Retry-After, transport
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_a_429_is_retried_and_honours_retry_after_seconds() -> None:
+    sleeps: list[float] = []
+    route = respx.post(CHAT_URL).mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "7"}, text="slow down"),
+            httpx.Response(200, json=chat_body()),
+        ]
+    )
+
+    response = make_client(sleeps=sleeps).complete_structured(make_prompt(), Answer)
+
+    assert response.parsed.verdict == "live"  # type: ignore[attr-defined]
+    assert route.call_count == 2
+    # The header wins over the 0.5s exponential backoff that would otherwise
+    # apply to the first retry.
+    assert sleeps == [7.0]
+
+
+@respx.mock
+def test_retry_after_accepts_an_http_date() -> None:
+    sleeps: list[float] = []
+    when = datetime.now(UTC) + timedelta(seconds=10)
+    respx.post(CHAT_URL).mock(
+        side_effect=[
+            httpx.Response(
+                503,
+                headers={"Retry-After": when.strftime("%a, %d %b %Y %H:%M:%S GMT")},
+            ),
+            httpx.Response(200, json=chat_body()),
+        ]
+    )
+
+    make_client(sleeps=sleeps).complete_structured(make_prompt(), Answer)
+
+    assert len(sleeps) == 1
+    assert 5.0 <= sleeps[0] <= 11.0
+
+
+@respx.mock
+def test_an_absurd_retry_after_is_clamped() -> None:
+    sleeps: list[float] = []
+    respx.post(CHAT_URL).mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "86400"}),
+            httpx.Response(200, json=chat_body()),
+        ]
+    )
+    make_client(sleeps=sleeps).complete_structured(make_prompt(), Answer)
+    # A quota that resets tomorrow must fail the run, not freeze the agent.
+    assert sleeps == [60.0]
+
+
+@respx.mock
+def test_a_malformed_retry_after_falls_back_to_exponential_backoff() -> None:
+    sleeps: list[float] = []
+    respx.post(CHAT_URL).mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "soon"}),
+            httpx.Response(200, json=chat_body()),
+        ]
+    )
+    make_client(sleeps=sleeps).complete_structured(make_prompt(), Answer)
+    assert sleeps == [0.5]
+
+
+@respx.mock
+def test_5xx_retries_are_bounded_and_then_raise_the_retryable_error() -> None:
+    sleeps: list[float] = []
+    route = respx.post(CHAT_URL).mock(return_value=httpx.Response(503, text="overloaded"))
+
+    with pytest.raises(LLMTransportError) as excinfo:
+        make_client(max_retries=2, sleeps=sleeps).complete_structured(make_prompt(), Answer)
+
+    assert excinfo.value.status_code == 503
+    assert isinstance(excinfo.value, LLMError)
+    # max_retries=2 means three attempts total, and exponential backoff
+    # between them.
+    assert route.call_count == 3
+    assert sleeps == [0.5, 1.0]
+    assert "overloaded" in str(excinfo.value)
+
+
+@respx.mock
+def test_max_retries_zero_attempts_once() -> None:
+    route = respx.post(CHAT_URL).mock(return_value=httpx.Response(500))
+    with pytest.raises(LLMTransportError):
+        make_client(max_retries=0).complete_structured(make_prompt(), Answer)
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_a_connection_failure_is_retried_then_wrapped() -> None:
+    sleeps: list[float] = []
+    route = respx.post(CHAT_URL).mock(side_effect=httpx.ConnectError("connection refused"))
+
+    with pytest.raises(LLMTransportError) as excinfo:
+        make_client(max_retries=1, sleeps=sleeps).complete_structured(make_prompt(), Answer)
+
+    assert route.call_count == 2
+    assert sleeps == [0.5]
+    assert "connection refused" in str(excinfo.value)
+
+
+@respx.mock
+def test_a_connection_failure_that_recovers_is_not_an_error() -> None:
+    respx.post(CHAT_URL).mock(
+        side_effect=[httpx.ConnectError("boom"), httpx.Response(200, json=chat_body())]
+    )
+    assert make_client().complete_structured(make_prompt(), Answer).parsed.verdict == "live"  # type: ignore[attr-defined]
+
+
+@respx.mock
+@pytest.mark.parametrize("status", [401, 403, 404, 422])
+def test_non_retryable_statuses_are_not_retried(status: int) -> None:
+    route = respx.post(CHAT_URL).mock(return_value=httpx.Response(status, text="nope"))
+
+    with pytest.raises(LLMRequestError) as excinfo:
+        make_client().complete_structured(make_prompt(), Answer)
+
+    assert excinfo.value.status_code == status
+    assert not isinstance(excinfo.value, LLMTransportError)
+    assert route.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Schema failures
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_non_json_model_output_raises_a_schema_error() -> None:
+    respx.post(CHAT_URL).mock(
+        return_value=httpx.Response(200, json=chat_body(content="I cannot answer that."))
+    )
     with pytest.raises(LLMSchemaError) as excinfo:
-        AnthropicClient(cfg, client=fake).complete_structured(make_prompt(), Answer)
+        make_client().complete_structured(make_prompt(), Answer)
     # LLMSchemaError is an LLMError, so the agent loop's single handler works.
     assert isinstance(excinfo.value, LLMError)
 
 
-def test_anthropic_client_schema_error_on_a_different_model_class(cfg: Config) -> None:
-    fake = fake_ok(Alt(other="x"))
+@respx.mock
+def test_a_non_json_http_body_raises_a_schema_error() -> None:
+    respx.post(CHAT_URL).mock(return_value=httpx.Response(200, text="<html>hello</html>"))
     with pytest.raises(LLMSchemaError):
-        AnthropicClient(cfg, client=fake).complete_structured(make_prompt(), Answer)
+        make_client().complete_structured(make_prompt(), Answer)
 
 
-def test_anthropic_client_does_not_import_the_sdk_when_a_client_is_injected(
-    cfg: Config, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # `None` in sys.modules makes `import anthropic` raise ImportError, which
-    # simulates the package being absent. Constructing with an injected
-    # client must still work: that is what keeps `rli.llm` importable (and
-    # every non-live test runnable) without the dependency installed.
-    monkeypatch.setitem(sys.modules, "anthropic", None)
-
-    client = AnthropicClient(cfg, client=fake_ok())
-    assert client.complete_structured(make_prompt(), Answer).parsed.verdict == "live"
+@respx.mock
+def test_json_that_does_not_fit_the_schema_raises_a_schema_error() -> None:
+    respx.post(CHAT_URL).mock(
+        return_value=httpx.Response(200, json=chat_body(content='{"nope": 1}'))
+    )
+    with pytest.raises(LLMSchemaError):
+        make_client().complete_structured(make_prompt(), Answer)
 
 
-def test_anthropic_client_reports_a_missing_sdk_as_an_llm_error(
-    cfg: Config, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setitem(sys.modules, "anthropic", None)
+@respx.mock
+def test_a_response_without_choices_raises_a_schema_error() -> None:
+    respx.post(CHAT_URL).mock(return_value=httpx.Response(200, json={"model": "test-model"}))
+    with pytest.raises(LLMSchemaError):
+        make_client().complete_structured(make_prompt(), Answer)
 
+
+@respx.mock
+def test_a_refusal_raises_a_schema_error() -> None:
+    body = chat_body()
+    body["choices"][0]["message"] = {"role": "assistant", "content": None, "refusal": "no"}
+    respx.post(CHAT_URL).mock(return_value=httpx.Response(200, json=body))
+    with pytest.raises(LLMSchemaError, match="refused"):
+        make_client().complete_structured(make_prompt(), Answer)
+
+
+@respx.mock
+def test_output_matching_a_different_schema_raises() -> None:
+    respx.post(CHAT_URL).mock(
+        return_value=httpx.Response(200, json=chat_body(content='{"other":"x"}'))
+    )
+    with pytest.raises(LLMSchemaError):
+        make_client().complete_structured(make_prompt(), Answer)
+
+
+# ---------------------------------------------------------------------------
+# Nothing escapes as a non-LLMError
+# ---------------------------------------------------------------------------
+
+
+def test_a_non_http_error_from_httpx_is_still_an_llm_error() -> None:
+    """`httpx.InvalidURL` is NOT an `httpx.HTTPError`, and must not escape.
+
+    `[llm].base_url` only has to PARSE to pass config validation, so a host
+    that httpx cannot IDNA-encode reaches the transport and raises something
+    outside the `HTTPError` tree. The agent loop catches `LLMError` and
+    spec.md §4 requires the run to reach a valid `Decision` regardless of
+    what the model layer did, so an unwrapped exception here would break that
+    guarantee rather than merely producing a worse message.
+    """
+    client = OpenAICompatibleClient("http://\u2603.com/v1", "", "test-model", max_retries=0)
     with pytest.raises(LLMError) as excinfo:
-        AnthropicClient(cfg)
-    assert "anthropic" in str(excinfo.value)
+        client.complete_structured(make_prompt(), Answer)
+    assert "could not be sent" in str(excinfo.value)
+
+
+def test_a_keyboard_interrupt_is_not_swallowed() -> None:
+    """The broad transport catch is `Exception`, so Ctrl-C still stops the run.
+
+    Injected rather than mocked through respx, which refuses to raise a
+    non-`Exception` side effect at all.
+    """
+
+    class Interrupting:
+        def post(self, *_args: Any, **_kwargs: Any) -> httpx.Response:
+            raise KeyboardInterrupt
+
+    client = OpenAICompatibleClient(
+        BASE_URL, "", "test-model", client=Interrupting()  # type: ignore[arg-type]
+    )
+    with pytest.raises(KeyboardInterrupt):
+        client.complete_structured(make_prompt(), Answer)
+
+
+# ---------------------------------------------------------------------------
+# close_llm_client
+# ---------------------------------------------------------------------------
+
+
+def test_close_llm_client_closes_through_a_wrapper(conn: sqlite3.Connection) -> None:
+    inner = make_client()
+    close_llm_client(CachedClient(inner, conn))
+    assert inner._client.is_closed
+
+
+def test_close_llm_client_tolerates_a_client_with_nothing_to_close() -> None:
+    # `ScriptedClient` holds no resources and exposes no `close`; teardown
+    # must not care.
+    close_llm_client(ScriptedClient([]))
+
+
+def test_close_llm_client_does_not_close_an_injected_client() -> None:
+    # The caller that passed the httpx client in still owns it.
+    injected = httpx.Client()
+    close_llm_client(make_client_with(injected))
+    assert not injected.is_closed
+    injected.close()
+
+
+def make_client_with(client: httpx.Client) -> OpenAICompatibleClient:
+    return OpenAICompatibleClient(BASE_URL, "", "test-model", client=client)
+
+
+# ---------------------------------------------------------------------------
+# from_config
+# ---------------------------------------------------------------------------
+
+
+def test_from_config_reads_the_endpoint_model_and_key_env(
+    cfg: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(cfg.llm.api_key_env, "from-the-environment")
+    client = OpenAICompatibleClient.from_config(cfg)
+
+    assert client.base_url == cfg.llm.base_url
+    assert client.model_id == cfg.llm.model_id
+    assert client._headers()["Authorization"] == "Bearer from-the-environment"
+    client.close()
+
+
+def test_from_config_sends_no_auth_header_when_the_env_var_is_unset(
+    cfg: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(cfg.llm.api_key_env, raising=False)
+    client = OpenAICompatibleClient.from_config(cfg)
+    assert "Authorization" not in client._headers()
+    client.close()
+
+
+def test_from_config_model_id_override_is_used_for_the_call_and_the_price(
+    cfg: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(cfg.llm.api_key_env, raising=False)
+    client = OpenAICompatibleClient.from_config(cfg, model_id="gemini-2.5-pro")
+    try:
+        assert client.model_id == "gemini-2.5-pro"
+        assert client._cost_usd("gemini-2.5-pro", 1_000_000, 0) == pytest.approx(1.25)
+    finally:
+        client.close()
+
+
+# ---------------------------------------------------------------------------
+# endpoint_unavailable_reason
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_a_reachable_endpoint_has_no_unavailable_reason(cfg: Config) -> None:
+    respx.get(f"{cfg.llm.base_url}/models").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+    assert endpoint_unavailable_reason(cfg) is None
+
+
+@respx.mock
+def test_an_unreachable_endpoint_reports_why(cfg: Config) -> None:
+    respx.get(f"{cfg.llm.base_url}/models").mock(side_effect=httpx.ConnectError("refused"))
+    reason = endpoint_unavailable_reason(cfg)
+    assert reason is not None and "not reachable" in reason
+
+
+@respx.mock
+def test_a_404_on_models_still_counts_as_reachable(cfg: Config) -> None:
+    # Not every compatible server implements /models; a 404 still proves a
+    # server answered.
+    respx.get(f"{cfg.llm.base_url}/models").mock(return_value=httpx.Response(404))
+    assert endpoint_unavailable_reason(cfg) is None
+
+
+@respx.mock
+def test_rejected_credentials_are_reported(cfg: Config) -> None:
+    respx.get(f"{cfg.llm.base_url}/models").mock(return_value=httpx.Response(401))
+    reason = endpoint_unavailable_reason(cfg)
+    assert reason is not None and "credentials" in reason
+
+
+def test_a_remote_endpoint_without_a_key_is_unavailable_without_any_request(
+    cfg: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No respx mock is installed: reaching the network at all would raise,
+    # so this also proves the config check short-circuits the probe.
+    remote = cfg.model_copy(
+        update={
+            "llm": cfg.llm.model_copy(
+                update={"base_url": "https://generativelanguage.googleapis.com/v1beta/openai"}
+            )
+        }
+    )
+    monkeypatch.delenv(remote.llm.api_key_env, raising=False)
+    reason = endpoint_unavailable_reason(remote)
+    assert reason is not None and remote.llm.api_key_env in reason
 
 
 # ---------------------------------------------------------------------------
@@ -342,12 +776,14 @@ def test_scripted_client_rejects_a_mismatched_schema() -> None:
 def test_scripted_client_prices_against_config_when_given_one(cfg: Config) -> None:
     client = ScriptedClient(
         [Answer(verdict="a")],
-        model_id="claude-sonnet-5",
+        model_id="gemini-2.5-flash",
         input_tokens=1000,
         output_tokens=500,
         cfg=cfg,
     )
-    assert client.complete_structured(make_prompt(), Answer).cost_usd == pytest.approx(0.007)
+    assert client.complete_structured(make_prompt(), Answer).cost_usd == pytest.approx(
+        0.00155
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -543,23 +979,24 @@ def test_an_inner_failure_writes_nothing(conn: sqlite3.Connection) -> None:
 
 
 def test_model_id_delegates_to_the_inner_client(conn: sqlite3.Connection) -> None:
-    inner = ScriptedClient([], model_id="claude-opus-5")
-    assert CachedClient(inner, conn).model_id == "claude-opus-5"
+    inner = ScriptedClient([], model_id="gemini-2.5-pro")
+    assert CachedClient(inner, conn).model_id == "gemini-2.5-pro"
 
 
-def test_cached_client_wraps_the_anthropic_adapter(
-    cfg: Config, conn: sqlite3.Connection
-) -> None:
-    # The wiring the CLI uses: CachedClient(AnthropicClient(...), conn).
-    fake = fake_ok(input_tokens=1000, output_tokens=500)
-    cached = CachedClient(AnthropicClient(cfg, client=fake), conn)
+@respx.mock
+def test_cached_client_wraps_the_live_adapter(conn: sqlite3.Connection) -> None:
+    # The wiring the CLI uses: CachedClient(OpenAICompatibleClient(...), conn).
+    route = respx.post(CHAT_URL).mock(return_value=httpx.Response(200, json=chat_body()))
+    inner = make_client()
+    cached = CachedClient(inner, conn)
     prompt = make_prompt(posting_id="p1")
 
     first = cached.complete_structured(prompt, Answer)
     second = cached.complete_structured(prompt, Answer)
 
     assert (first.cache_status, second.cache_status) == ("miss", "hit")
-    assert fake.messages.call_count == 1
-    assert first.cost_usd == pytest.approx(0.007)
+    # The hit never reached the endpoint — that is what makes replay exact.
+    assert route.call_count == 1
+    assert first.cost_usd == pytest.approx(0.0105)
     assert second.cost_usd == 0.0
-    assert cache_rows(conn)[0][0] == cfg.llm.model_id
+    assert cache_rows(conn)[0][0] == inner.model_id

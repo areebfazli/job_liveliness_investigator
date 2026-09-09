@@ -84,13 +84,17 @@ Judgment calls
   first so the case pairing stays unambiguous (see `rli.replay.run`'s
   docstring on why a kept duplicate degenerates to "greatest uuid wins").
 
-* **"System C was not run" is a first-class state, not a gap.** There is no
-  `ANTHROPIC_API_KEY` in this environment, and this module will not attempt a
-  live model call to discover that. When `with_c` is requested without an
-  explicit `llm` / `llm_factory` and without a key in the environment, C's
-  status is `"skipped: not run: no API key"`, the agent gate's status is
+* **"System C was not run" is a first-class state, not a gap.** This module
+  will never attempt a MODEL call to discover whether System C is usable.
+  When `with_c` is requested without an explicit `llm` / `llm_factory`, the
+  configured endpoint (`[llm].base_url`) is checked by
+  `rli.llm.client.endpoint_unavailable_reason` — a config check plus a
+  bounded, free `GET {base_url}/models` that runs no model and spends no
+  tokens. If it is not usable, C's status is
+  `"skipped: not run: no LLM endpoint configured"`, the agent gate's status is
   `"not_run"` (not `"fail"` — an ungraded candidate has not failed), and the
-  literal phrase `not run: no API key` is printed next to every place a C
+  literal phrase `not run: no LLM endpoint configured` is printed next to
+  every place a C
   number would otherwise appear. Tests drive C through
   `rli.llm.client.ScriptedClient` via `llm=` / `llm_factory=`, which is the
   only supported way to exercise the path.
@@ -163,7 +167,6 @@ Judgment calls
 
 from __future__ import annotations
 
-import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -186,6 +189,12 @@ from rli.eval.metrics import (
     split_map_for_dataset,
 )
 from rli.eval.ranker import RankerConfig, RankerResult, evaluate_ranker
+
+# `endpoint_unavailable_reason` is imported at module scope, not lazily like
+# `rli.agent.loop` below: `rli.llm.client` pulls only httpx and the config
+# models (never the agent/investigator stack), and a module-level name is
+# what lets a test substitute the probe.
+from rli.llm.client import endpoint_unavailable_reason
 from rli.models.time import now_utc, to_utc_z
 from rli.policy.action import policy_version
 
@@ -231,7 +240,7 @@ HOLDOUT_TEST_NOTE = (
 
 #: The exact phrase that must appear next to every System C figure when no
 #: model client is available. Callers grep for it; do not reword it.
-C_NOT_RUN_REASON = "not run: no API key"
+C_NOT_RUN_REASON = "not run: no LLM endpoint configured"
 
 _SYSTEM_ORDER = ("A", "B", "C", "C2")
 
@@ -542,14 +551,24 @@ def _note_holdout_runs(conn: sqlite3.Connection, run_ids: list[str]) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _c_runner(llm: object | None, llm_factory: object | None) -> tuple[object | None, str]:
-    """`(runner, reason)` for System C — never touching the network to decide.
+def _c_runner(
+    cfg: Config, llm: object | None, llm_factory: object | None
+) -> tuple[object | None, str]:
+    """`(runner, reason)` for System C — never making a MODEL call to decide.
 
-    A live model call to "check" whether a key works would be exactly the
-    thing this function exists to avoid. Availability is decided from what
-    the caller passed and from `os.environ`, and nothing else.
+    A live completion to "check" whether the endpoint works would be exactly
+    the thing this function exists to avoid: it costs money on a paid
+    endpoint and minutes on a local one. What it does instead is ask
+    `rli.llm.client.endpoint_unavailable_reason`, which is config plus a
+    bounded `GET {base_url}/models` — no model runs, no tokens are spent.
+
+    That probe is a deliberate change from the key-only check this replaced.
+    With a local endpoint as the default, "is there an API key" no longer
+    answers the question at all: a local Ollama needs none, and the only
+    thing that distinguishes "C can run" from "C cannot" is whether anything
+    is actually listening.
     """
-    if llm is None and llm_factory is None and not os.environ.get("ANTHROPIC_API_KEY"):
+    if llm is None and llm_factory is None and endpoint_unavailable_reason(cfg) is not None:
         return None, C_NOT_RUN_REASON
     # Imported here, not at module scope: `rli.agent.loop` pulls the whole
     # investigator/controller stack, which an A/B-only evaluation never needs.
@@ -664,9 +683,10 @@ def _limitations(
     c_status = systems_run.get("C", "")
     if C_NOT_RUN_REASON in c_status or not c_status:
         items.append(
-            f"System C was {C_NOT_RUN_REASON} — there is no ANTHROPIC_API_KEY in this "
-            "environment and no `llm`/`llm_factory` was supplied, so no live model call "
-            "was attempted. The spec.md §6 agent gate is therefore `not_run`, not "
+            f"System C was {C_NOT_RUN_REASON} — the endpoint configured in "
+            "`[llm].base_url` did not answer a liveness probe and no `llm`/`llm_factory` "
+            "was supplied, so no model call was attempted. The spec.md §6 agent gate is "
+            "therefore `not_run`, not "  
             "`fail`: an ungraded candidate has not failed. Every System C figure "
             f"elsewhere in this report reads `{C_NOT_RUN_REASON}`."
         )
@@ -764,9 +784,10 @@ def evaluate(
         split_kind / cutoff / validation_cutoff: override the split
             assignment. Default to the dataset row's own `split_kind` and
             `created_at`, reproducing the assignment the build used.
-        with_c: also evaluate System C. Requires `llm` or `llm_factory` or an
-            `ANTHROPIC_API_KEY`; otherwise C is recorded as
-            `"skipped: not run: no API key"` and no call is attempted.
+        with_c: also evaluate System C. Requires `llm` or `llm_factory`, or
+            a reachable endpoint at `[llm].base_url`; otherwise C is recorded
+            as `"skipped: not run: no LLM endpoint configured"` and no model
+            call is attempted.
         rerun: force `run_replay(..., replace=True)` for every system.
         include_survival: include the corpus-wide posting-behaviour summary.
             `False` skips the lifelines import entirely.
@@ -801,7 +822,7 @@ def evaluate(
             collection_status_csv=collection_status_csv,
         )
 
-    c_runner, c_reason = _c_runner(llm, llm_factory)
+    c_runner, c_reason = _c_runner(cfg, llm, llm_factory)
     if not with_c:
         # Even when C was not asked for, say whether it COULD have run: a
         # reader looking at an empty C column needs the reason, and "no API

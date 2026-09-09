@@ -19,10 +19,14 @@ Two invariants shape this module:
 
 from __future__ import annotations
 
+import ipaddress
 import os
+import re
 import tomllib
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -377,8 +381,32 @@ class ModelPrice(BaseModel):
     output_usd_per_mtok: float = Field(ge=0.0)
 
 
+#: Environment-variable names are matched against this before they are read.
+#: A name that cannot be exported by a shell (`FOO BAR`, `FOO=BAR`, ``) is a
+#: config typo, and reading it would silently yield "" — i.e. "no API key" —
+#: which is exactly the failure this validation exists to make loud.
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+#: Hostnames that mean "this machine" without a DNS lookup. Loopback IP
+#: literals are recognized separately via `ipaddress`, and `0.0.0.0` is
+#: included because it is how a locally bound server is often addressed.
+_LOCAL_HOSTNAMES = frozenset({"localhost", "0.0.0.0", "::", "[::]"})
+
+
 class Llm(BaseModel):
-    """`[llm]` — model selection, request knobs, and the cost price table (spec.md §2).
+    """`[llm]` — ONE OpenAI-compatible chat-completions endpoint (spec.md §2/§7).
+
+    spec.md §7 asks for "one structured-output-capable LLM API"; this table
+    names it as a `base_url` plus a `model_id` rather than as a vendor. Any
+    server that speaks `POST {base_url}/chat/completions` with an
+    OpenAI-shaped body fits — Ollama (`http://localhost:11434/v1`, free, no
+    key), Google Gemini's OpenAI compatibility layer
+    (`https://generativelanguage.googleapis.com/v1beta/openai/`), vLLM,
+    llama.cpp, LM Studio, OpenAI itself. `provider` is a `Literal` with one
+    member on purpose: it is a forward-compatibility marker that fails loudly
+    if someone writes a vendor name here expecting a bespoke code path (there
+    is none — every provider is reached through the same OpenAI-compatible
+    transport), rather than a switch.
 
     Every field carries a default, and the whole table defaults on `Config`,
     so a configuration that predates this table (notably the inline-TOML
@@ -388,17 +416,41 @@ class Llm(BaseModel):
     `model_id` is deliberately part of the LLM cache key
     (`rli.llm.client.CachedClient` keys on `(model_id, prompt_hash,
     structured_input_hash)`, spec.md §2), so pointing this at a different
-    model does NOT silently reuse the previous model's answers.
+    model does NOT silently reuse the previous model's answers. Note the
+    corollary now that the endpoint is configurable: `base_url` is NOT in the
+    key, so two endpoints serving the same `model_id` share cache rows. That
+    is the right default (the same model is the same model) but it means
+    swapping `base_url` between two genuinely different models under one id
+    requires clearing `llm_cache`.
 
-    `max_retries` is the retry count handed to the Anthropic SDK client, i.e.
-    transport-level retries of a single call. It is unrelated to
+    `api_key_env` names the environment variable holding the credential; the
+    key itself never enters the config file or any log line. It is entirely
+    normal for that variable to be unset — a local Ollama needs no key —
+    which is why "is System C available?" is `credentials_configured()` plus
+    a live probe (`rli.llm.client.endpoint_unavailable_reason`), not "is
+    there a key".
+
+    `max_retries` is the retry count applied by `OpenAICompatibleClient` to
+    ONE call, i.e. transport-level retries. It is unrelated to
     `[agent].max_probe_retries`, which is the agent loop's retry of a failed
     PROBE.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    model_id: str = "claude-sonnet-5"
+    # One valid value. See the class docstring for why this exists at all.
+    provider: Literal["openai_compatible"] = "openai_compatible"
+
+    # Base of the OpenAI-compatible API, WITHOUT the `/chat/completions`
+    # suffix. Validated to be http(s) with a host; a trailing slash is
+    # stripped so the derived URLs never contain `//`.
+    base_url: str = "http://localhost:11434/v1"
+
+    # Name of the env var holding the API key (not the key itself). Unset or
+    # empty is legal — that is the local-Ollama case.
+    api_key_env: str = "LLM_API_KEY"
+
+    model_id: str = "qwen3:8b"
     max_tokens: int = Field(4096, gt=0)
     timeout_s: float = Field(60.0, gt=0.0)
     max_retries: int = Field(2, ge=0)
@@ -406,21 +458,100 @@ class Llm(BaseModel):
     # Cost accounting only — never sent to the API (see `ModelPrice`).
     prices: dict[str, ModelPrice] = Field(
         default_factory=lambda: {
-            "claude-sonnet-5": ModelPrice(input_usd_per_mtok=2.0, output_usd_per_mtok=10.0),
-            "claude-opus-5": ModelPrice(input_usd_per_mtok=5.0, output_usd_per_mtok=25.0),
-            "claude-haiku-4-5": ModelPrice(input_usd_per_mtok=1.0, output_usd_per_mtok=5.0),
+            # Local models cost nothing; listed explicitly so the ledger's
+            # 0.0 is a recorded fact rather than an unpriced-model fallback.
+            "qwen3:8b": ModelPrice(input_usd_per_mtok=0.0, output_usd_per_mtok=0.0),
+            "qwen3:4b": ModelPrice(input_usd_per_mtok=0.0, output_usd_per_mtok=0.0),
+            "llama3.2:3b": ModelPrice(input_usd_per_mtok=0.0, output_usd_per_mtok=0.0),
+            # Paid-tier list prices; the free tier bills 0.0 but is rate
+            # limited, so over-reporting cost is the safe direction here.
+            "gemini-2.5-flash": ModelPrice(input_usd_per_mtok=0.30, output_usd_per_mtok=2.50),
+            "gemini-2.5-pro": ModelPrice(input_usd_per_mtok=1.25, output_usd_per_mtok=10.00),
         }
     )
+
+    @field_validator("base_url")
+    @classmethod
+    def _check_base_url(cls, value: str) -> str:
+        """http(s) with a host, trailing slash stripped.
+
+        This is a URL-shape check, NOT an allowlist check: LLM calls do not
+        go through `rli.net` (see `rli.llm.client.OpenAICompatibleClient`),
+        so nothing downstream would otherwise notice `base_url = "ollama"`
+        until a request failed with an unhelpful httpx error.
+        """
+        url = value.strip().rstrip("/")
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError(
+                f"llm.base_url must be an http(s) URL with a host, got {value!r} "
+                '(e.g. "http://localhost:11434/v1")'
+            )
+        return url
+
+    @field_validator("api_key_env")
+    @classmethod
+    def _check_api_key_env(cls, value: str) -> str:
+        if not _ENV_NAME_RE.match(value):
+            raise ValueError(
+                f"llm.api_key_env must be a valid environment-variable NAME (not the key "
+                f"itself), got {value!r}"
+            )
+        return value
+
+    @property
+    def chat_completions_url(self) -> str:
+        """The one endpoint `rli.llm.client` POSTs to."""
+        return f"{self.base_url}/chat/completions"
+
+    @property
+    def models_url(self) -> str:
+        """Endpoint used for the cheap liveness probe; never a model call."""
+        return f"{self.base_url}/models"
+
+    def api_key(self) -> str:
+        """The credential from `api_key_env`, or `""` when unset/blank.
+
+        Read at call time, never cached on the frozen model: a process that
+        exports the variable after `load_config()` (a test, a shell that
+        sourced an env file late) must still see it.
+        """
+        return os.environ.get(self.api_key_env, "").strip()
+
+    def is_local_endpoint(self) -> bool:
+        """True when `base_url` points at this machine (loopback / `localhost`).
+
+        Used to decide whether a MISSING api key is a problem: a local
+        Ollama legitimately has none, while a remote endpoint without a
+        credential cannot possibly answer.
+        """
+        host = (urlparse(self.base_url).hostname or "").lower()
+        if host in _LOCAL_HOSTNAMES:
+            return True
+        try:
+            return ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            return host.endswith(".localhost")
+
+    def credentials_configured(self) -> bool:
+        """True when the endpoint could plausibly answer, without touching it.
+
+        "Local endpoint" OR "a key is present". This is the no-network half
+        of the availability question; `rli.llm.client.
+        endpoint_unavailable_reason` adds the bounded reachability probe.
+        """
+        return self.is_local_endpoint() or bool(self.api_key())
 
     def price_for(self, model_id: str) -> ModelPrice | None:
         """Price row for `model_id`, or None when the id is not in the table.
 
         Returning None rather than raising is deliberate: an unpriced model
         must cost `0.0` and keep the run going (see
-        `rli.llm.client.AnthropicClient`). A run that dies because someone
+        `rli.llm.client.compute_cost_usd`). A run that dies because someone
         pointed `[llm].model_id` at a model whose price we have not recorded
         would trade a wrong number for no answer at all, and the price table
-        is accounting, not a safety control.
+        is accounting, not a safety control. It is also the common case now:
+        every local Ollama tag someone tries is free and unpriced.
         """
         return self.prices.get(model_id)
 

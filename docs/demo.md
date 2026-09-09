@@ -199,13 +199,14 @@ expected shape for conflicting evidence per spec.md §5's policy table
 
 **Note on hypotheses:** run this same case through System C
 (`uv run rli agent run --url ... --db ...` or `POST /investigate` with
-`system: "C"`) and, with a real `ANTHROPIC_API_KEY` configured, the
-investigator may populate `hypotheses` with plausible interpretations of
-the conflict (e.g. "the career page may show a different posting date than
-the ATS record"). **Without `ANTHROPIC_API_KEY`, `hypotheses` will always
-be empty** — this is an honest, current limitation of this environment
-(see the main README's Limitations section), not a bug in the ambiguous
-case itself.
+`system: "C"`) and, with a reachable LLM endpoint configured (a local
+Ollama or any other OpenAI-compatible server — see the README's "LLM
+setup"), the investigator may populate `hypotheses` with plausible
+interpretations of the conflict (e.g. "the career page may show a different
+posting date than the ATS record"). **With no LLM endpoint reachable,
+`hypotheses` will always be empty** — this is an honest, current limitation
+of this environment (see the main README's Limitations section), not a bug
+in the ambiguous case itself.
 
 ### API form
 
@@ -318,17 +319,19 @@ uv run rli run --system B --url "https://boards.greenhouse.io/affirm/jobs/1" --d
 # stderr: run_id=... system=B probes=(none) route=R0_terminal
 ```
 
-### 3b. System C requested (or defaulted) with no `ANTHROPIC_API_KEY`
+### 3b. System C requested (or defaulted) with no reachable LLM endpoint
 
 ```bash
-env -u ANTHROPIC_API_KEY curl -s -X POST http://127.0.0.1:8000/investigate \
+# With nothing serving [llm].base_url (no `ollama serve`, no API key for a
+# remote endpoint), System C is unavailable and the API says so.
+curl -s -X POST http://127.0.0.1:8000/investigate \
   -H 'Content-Type: application/json' \
   -d '{"url": "https://boards.greenhouse.io/affirm/jobs/7850544003"}'
 ```
 
 (`system` is omitted, so it defaults to `"C"`.) Actual result:
 **`STATUS:200`**, deterministic and offline-reproducible (no live network
-flakiness — this path never reaches Anthropic):
+flakiness — this path never reaches a model):
 
 ```json
 {
@@ -338,14 +341,18 @@ flakiness — this path never reaches Anthropic):
   "...": "... full spec.md §1 decision fields ...",
   "system_used": "B",
   "degraded": true,
-  "degraded_reason": "no ANTHROPIC_API_KEY configured; ran System B instead of System C"
+  "degraded_reason": "LLM endpoint http://localhost:11434/v1 is not reachable: ...; ran System B instead of System C"
 }
 ```
 
 `system_used: "B"` and `degraded: true` confirm the fallback actually
 happened rather than silently returning a System-C-shaped but empty
-response. `GET /health` reports the same fact ahead of time:
-`{"status": "ok", "llm_key_configured": false}`.
+response. The exact `degraded_reason` text is whatever the endpoint probe
+reported — an unreachable endpoint, or a missing API key for a non-local
+`base_url`. `GET /health` reports the CONFIGURED endpoint ahead of time
+without probing it (so it always answers instantly):
+`{"status": "ok", "llm_configured": true, "llm_base_url":
+"http://localhost:11434/v1", "llm_model_id": "qwen3:8b"}`.
 
 ### 3c. A disallowed URL
 

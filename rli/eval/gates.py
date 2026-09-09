@@ -60,7 +60,8 @@ Judgment calls
   `passed=None` and every sub-check `None` — not `False`, because nothing was
   measured and "System C failed the gate" is a materially different claim
   from "System C was never run". This is the state on the real database
-  today: there is no `ANTHROPIC_API_KEY`, so System C has no runs. But once
+  today: no LLM endpoint was reachable during development, so System C has
+  no runs. But once
   the candidate HAS runs and some comparison input is missing (the baseline
   never ran, or produced no paired cases so its agreement is undefined), the
   affected sub-check is `False` with an explanatory note: at that point a
@@ -374,8 +375,8 @@ def agent_gate(
         notes.append(
             f"system {candidate} has no runs in scope for dataset {dataset_id!r} on splits "
             f"{tuple(allowed_splits)!r}, so the gate was not evaluated. On the current "
-            "database this is expected for System C: there is no ANTHROPIC_API_KEY, so C was "
-            "never run. `passed` is None (unknown), NOT False (failed)."
+            "database this is expected for System C: no LLM endpoint was configured or "
+            "reachable, so C was never run. `passed` is None (unknown), NOT False (failed)."
         )
         return base.model_copy(update={"status": "not_run", "passed": None, "notes": tuple(notes)})
 

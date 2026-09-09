@@ -310,23 +310,57 @@ enabled = false
 # spec.md §2: "one structured-output-capable LLM API" (spec.md §7), with LLM
 # outputs cached by `(model_id, prompt_hash, structured_input_hash)` for exact
 # benchmark replay. `model_id` below is part of that cache key, so changing it
-# does NOT silently reuse the previous model's answers.
+# does NOT silently reuse the previous model's answers. `base_url` is NOT in
+# that key: two endpoints serving the same model id share cache rows, so
+# pointing base_url at a genuinely different model under a reused id means
+# clearing `llm_cache` first.
+#
+# The client (rli.llm.client.OpenAICompatibleClient) speaks ONE protocol:
+# POST {base_url}/chat/completions with an OpenAI-shaped body. Anything that
+# implements it works — Ollama, Google Gemini's OpenAI compatibility layer,
+# vLLM, llama.cpp, LM Studio, OpenAI itself.
 [llm]
-# Anthropic model id used by System C's investigator and explanation calls.
-model_id = "claude-sonnet-5"
+# Only valid value. Present so that a config naming a provider whose code
+# path no longer exists fails loudly at load time instead of being ignored.
+provider = "openai_compatible"
+
+# Default: a local Ollama. Free, no API key, nothing leaves the machine.
+#   ollama serve && ollama pull qwen3:8b
+base_url = "http://localhost:11434/v1"
+
+# Name of the environment variable holding the API key — NOT the key. Leaving
+# the variable unset is normal and supported (local Ollama needs no key).
+api_key_env = "LLM_API_KEY"
+
+# Model used by System C's investigator and explanation calls. Both prompts
+# demand a JSON object matching a schema, so pick a model that can actually
+# hold a structured format. `qwen3:4b` is the smaller alternative if RAM is
+# tight; `llama3.2:3b` is smaller still but noticeably weaker at schema
+# adherence (it leans on the json_object fallback).
+model_id = "qwen3:8b"
+
+# ---------------------------------------------------------------------------
+# Google Gemini free tier instead of a local model: uncomment and export the
+# key named by api_key_env.
+#
+#   base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+#   model_id = "gemini-2.5-flash"
+#   api_key_env = "GEMINI_API_KEY"
+# ---------------------------------------------------------------------------
 
 # Per-call output cap. Both System C prompts return a small structured object,
 # so this is a guard against a runaway generation, not a target length.
 max_tokens = 4096
 
-# Per-request timeout (seconds) handed to the Anthropic SDK client. Kept well
-# under [budgets].max_latency_s so a single hung call cannot silently consume
-# the whole run's latency budget.
+# Per-request timeout (seconds). Kept well under [budgets].max_latency_s so a
+# single hung call cannot silently consume the whole run's latency budget.
+# A CPU-only local model is slow: raise this rather than lowering it.
 timeout_s = 60.0
 
-# Transport-level retries of ONE API call, applied by the SDK
-# (spec.md §2: "no uncontrolled retry loops"). This is unrelated to
-# [agent].max_probe_retries, which retries a failed PROBE.
+# Transport-level retries of ONE API call, applied by the client
+# (spec.md §2: "no uncontrolled retry loops"). Only 429 and 5xx are retried,
+# and a `Retry-After` header wins over the exponential backoff. This is
+# unrelated to [agent].max_probe_retries, which retries a failed PROBE.
 max_retries = 2
 
 # Price table used ONLY for cost accounting — these numbers are never sent to
@@ -335,18 +369,29 @@ max_retries = 2
 # price per MILLION tokens. A model id absent from this table costs 0.0 and
 # does not raise (rli.config.Llm.price_for): an unpriced model must produce a
 # wrong number rather than no answer, since this table is accounting, not a
-# safety control.
-[llm.prices."claude-sonnet-5"]
-input_usd_per_mtok = 2.0
-output_usd_per_mtok = 10.0
+# safety control. Local models are listed at 0.0 explicitly so the ledger's
+# zero is a recorded fact rather than a missing-row fallback.
+[llm.prices."qwen3:8b"]
+input_usd_per_mtok = 0.0
+output_usd_per_mtok = 0.0
 
-[llm.prices."claude-opus-5"]
-input_usd_per_mtok = 5.0
-output_usd_per_mtok = 25.0
+[llm.prices."qwen3:4b"]
+input_usd_per_mtok = 0.0
+output_usd_per_mtok = 0.0
 
-[llm.prices."claude-haiku-4-5"]
-input_usd_per_mtok = 1.0
-output_usd_per_mtok = 5.0
+[llm.prices."llama3.2:3b"]
+input_usd_per_mtok = 0.0
+output_usd_per_mtok = 0.0
+
+# Paid-tier list prices. Gemini's free tier bills nothing but is rate
+# limited; over-reporting cost is the safe direction for a budget ledger.
+[llm.prices."gemini-2.5-flash"]
+input_usd_per_mtok = 0.30
+output_usd_per_mtok = 2.50
+
+[llm.prices."gemini-2.5-pro"]
+input_usd_per_mtok = 1.25
+output_usd_per_mtok = 10.00
 
 # System C (LLM investigator + deterministic controller, spec.md §4/§6;
 # PLAN.md M5). spec.md §2: "Never rely on the LLM alone for budgets,
