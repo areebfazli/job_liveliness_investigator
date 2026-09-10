@@ -258,6 +258,33 @@ otherwise                                          → quick_apply
 
 Policy inputs are: `posting_state`, `publish_recency` (from resolver), `evidence_quality`, `material_negative_event` and `freeze_or_pause` (from `company_events`), `declared_expiry` (from resolver), `repost_pattern` (from `repost_history` + `requirements_drift`), `corroborating_hiring_signal` (from `team_signal`). Terms such as `recent`, `long-lived`, and `material negative event` are configuration with documented frozen thresholds. This policy is a user-effort heuristic, not a claim about employer intent.
 
+#### Amendment 2026-09-10 (policy tuning, before freeze)
+
+Replay on real data showed the original table left the agent with no reachable question: `apply_now` needed a first publish within 14 days, `skip` needed a licensed hiring signal that does not exist, and `long-lived` was measured from our own first snapshot. The table above is kept verbatim as **before**; the version below is **after** and is what the code implements from this date.
+
+| Rule | Before | After |
+|---|---|---|
+| `recent` | first publish ≤ 14 days ago | latest of first publish **or** an ATS `updated_at` that coincides with an observed content-hash change, ≤ 30 days ago |
+| `long-lived` | days since our own `first_observed` ≥ 180 | days since the earliest of ATS first publish / earliest archive capture / own `first_observed` ≥ 180 |
+| `corroborating_hiring_signal` source | licensed enrichment only | `team_signal` probe derived from own + archive board snapshots: new roles on the same team in the last 30 days, or closures on the same team in the last 60 days; unknown when team history < `min_history_days` |
+| `wait` (new row) | — | open + material negative event inside the window + posting not refreshed since that event → `wait`, `recheck_after_days` = default |
+
+```text
+closed                                             → skip
+open + unresolved posting state                    → wait
+open + explicit freeze/pause or declared expiry
+     + unresolved current status                   → wait
+open + material negative event after last refresh  → wait      (new)
+repeated unchanged repost + long-lived history
+     + corroborating hiring signal = false         → skip
+open + recent (see table) + strong evidence
+     + no material negative event                  → apply_now
+open + mixed/weak evidence                         → quick_apply
+otherwise                                          → quick_apply
+```
+
+`team_signal` remains the only source for `corroborating_hiring_signal` and keeps its medium/high cost tier so the controller must still justify running it. Its data source is now first-party board history rather than a licensed feed; §4's table row is read accordingly. All new thresholds live in `config.toml` and are frozen with the rest of the policy.
+
 ### Outcome data
 
 **Posting behavior:** closure/repost timing from snapshots. Open postings are right-censored; archive-derived closures are interval-censored (`last_seen_open`, `first_seen_absent`). Use a library with interval-censored fitters (lifelines) for evaluation, or, if using scikit-survival, use interval midpoints with interval width recorded as a covariate and say so in the report. Do not use posting survival probability as the v1 action engine.
