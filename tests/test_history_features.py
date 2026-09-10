@@ -414,9 +414,7 @@ def test_age_days_takes_the_earliest_of_all_three_origins_when_several_are_prese
     add_posting(conn, job_id="old1", title=TITLE, first_observed=at(80))
     _posting_snapshot(conn, OLD_POSTING, at(30), source="archive", status="open")
 
-    features = posting_features(
-        conn, cfg, OLD_POSTING, now=at(200), first_published=at(50)
-    )
+    features = posting_features(conn, cfg, OLD_POSTING, now=at(200), first_published=at(50))
 
     # Earliest of {50, 30, 80} is 30 — neither of the other two origins.
     assert features.age_days == pytest.approx(170.0)
@@ -427,9 +425,7 @@ def test_long_lived_boundary_exactly_at_the_threshold_is_true(
 ) -> None:
     add_posting(conn, job_id="old1", title=TITLE, first_observed=at(0))
 
-    features = posting_features(
-        conn, cfg, OLD_POSTING, now=at(cfg.thresholds.long_lived_days)
-    )
+    features = posting_features(conn, cfg, OLD_POSTING, now=at(cfg.thresholds.long_lived_days))
 
     assert features.age_days == pytest.approx(float(cfg.thresholds.long_lived_days))
     assert features.long_lived is True  # >= is inclusive
@@ -440,9 +436,7 @@ def test_long_lived_boundary_one_day_under_the_threshold_is_false(
 ) -> None:
     add_posting(conn, job_id="old1", title=TITLE, first_observed=at(0))
 
-    features = posting_features(
-        conn, cfg, OLD_POSTING, now=at(cfg.thresholds.long_lived_days - 1)
-    )
+    features = posting_features(conn, cfg, OLD_POSTING, now=at(cfg.thresholds.long_lived_days - 1))
 
     assert features.age_days == pytest.approx(float(cfg.thresholds.long_lived_days - 1))
     assert features.long_lived is False

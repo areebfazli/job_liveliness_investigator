@@ -938,7 +938,9 @@ def decide_and_finish(
         # `rli.policy.action`'s "two keyword inputs" section.
         last_refreshed_at=last_publish_or_refresh(evidence),
     )
-    reasons = reasons_from_inputs(inputs, evidence, now=probes.now)
+    # `cfg=` so the explanation windows the company-event claims with the
+    # very thresholds `decide` just used; see `reasons_from_inputs`.
+    reasons = reasons_from_inputs(inputs, evidence, now=probes.now, cfg=probes.cfg)
 
     decision = Decision(
         posting_state=outcome.posting_state,

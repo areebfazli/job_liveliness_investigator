@@ -78,6 +78,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from rli.models.decision import ReasonItem
 from rli.models.evidence import EvidenceItem
@@ -93,6 +94,10 @@ from rli.policy.inputs import (
     material_event_claims,
     newest_refresh_claim,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from rli.config import Config
+    from rli.policy.action import PolicyThresholds
 
 __all__ = ["reasons_from_inputs"]
 
@@ -129,6 +134,7 @@ def reasons_from_inputs(
     evidence: Sequence[EvidenceItem],
     *,
     now: datetime | None = None,
+    cfg: Config | PolicyThresholds | None = None,
 ) -> list[ReasonItem]:
     """Build the spec.md §1 `reason` array deterministically from evidence.
 
@@ -136,6 +142,18 @@ def reasons_from_inputs(
     Reasons whose supporting evidence is absent are dropped, so the result can
     legitimately be empty (an investigation that produced no evidence has
     nothing to say, and must not invent something).
+
+    `cfg` supplies `negative_event_window_days` to the company-event citation
+    helpers, and exists so THIS function windows the event claims exactly the
+    way the `PolicyInputs` it was handed were windowed. Left `None` it
+    resolves to the loaded project config, which is what a production caller
+    would have passed anyway; a caller that decided with non-default
+    thresholds should pass the same ones here, or a claim inside the policy's
+    window but outside this one would drop out of the citation. The
+    consequence of getting it wrong is bounded — the reason falls back to
+    citing every `company_events` item rather than disappearing — but "the
+    explanation used a different window than the decision" is not a thing
+    worth leaving to luck.
     """
     when = ensure_aware(now, "now") if now is not None else now_utc()
     reasons: list[ReasonItem] = []
@@ -206,7 +224,7 @@ def reasons_from_inputs(
     event_evidence = _by_probe(evidence, _EVENTS_PROBE)
     if event_evidence:
         if inputs.material_negative_event is True:
-            cited = material_event_claims(evidence, when) or event_evidence
+            cited = material_event_claims(evidence, when, cfg=cfg) or event_evidence
             reasons.append(_material_event_reason(inputs, evidence, cited))
         if inputs.freeze_or_pause is True:
             reasons.append(
@@ -215,7 +233,9 @@ def reasons_from_inputs(
                         "A dated hiring freeze or pause was recorded for this company "
                         "inside the policy's lookback window."
                     ),
-                    evidence_ids=_ids(freeze_event_claims(evidence, when) or event_evidence),
+                    evidence_ids=_ids(
+                        freeze_event_claims(evidence, when, cfg=cfg) or event_evidence
+                    ),
                 )
             )
 

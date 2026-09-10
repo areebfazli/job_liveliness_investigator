@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from rli.events.policy_signals import CLAIM_EVENTS_SEARCHED, format_event_claim_value
 from rli.models.decision import Decision
 from rli.models.evidence import EvidenceItem
 from rli.models.policy_inputs import UNKNOWN, PolicyInputs
@@ -306,3 +307,81 @@ def test_reasons_drop_in_to_the_spec_output_shape():
     payload = decision.model_dump()
     cited = {eid for reason in payload["reason"] for eid in reason["evidence_ids"]}
     assert cited <= {item["id"] for item in payload["evidence"]}
+
+
+# ---------------------------------------------------------------------------
+# Company-event reasons cite the qualifying claims, not "everything the probe
+# produced" (spec.md §9)
+# ---------------------------------------------------------------------------
+
+
+def _event_ev(
+    eid: str, claim_type: str, event_at: datetime, *, materiality: str = "material"
+) -> EvidenceItem:
+    """A `company_events` claim shaped exactly as that probe emits it."""
+    return ev(
+        eid,
+        claim_type,
+        probe="company_events",
+        value=format_event_claim_value(materiality, f"headline for {claim_type}"),
+        source_quality="news",
+        source_event_at=event_at,
+    )
+
+
+def test_company_event_reasons_cite_only_the_qualifying_claims():
+    """A layoff reason must not be supported by a funding headline.
+
+    `company_events` emits a claim per dated event of ANY type, plus the
+    `company_events_searched` collection-status claim. Citing the whole probe
+    output would attach a funding round and a bookkeeping stamp to the
+    sentence "a dated layoff or shutdown was recorded", which resolves to
+    real ids and still says nothing that supports the claim — the exact shape
+    of unsupported citation spec.md §9 forbids (and which
+    `rli.eval.metrics`' citation-support figure counts).
+    """
+    event_at = NOW - timedelta(days=10)
+    evidence = [
+        ev(
+            "e0",
+            CLAIM_EVENTS_SEARCHED,
+            probe="company_events",
+            source_quality="enrichment",
+            source_event_at=NOW - timedelta(days=1),
+        ),
+        _event_ev("e1", "funding", event_at, materiality="minor"),
+        _event_ev("e2", "layoff", event_at),
+        _event_ev("e3", "hiring_freeze", event_at),
+    ]
+    inputs = PolicyInputs(
+        material_negative_event=True,
+        freeze_or_pause=True,
+        last_material_event_at=event_at,
+    )
+
+    reasons = reasons_from_inputs(inputs, evidence, now=NOW)
+    assert_every_reason_is_cited(reasons, evidence)
+
+    material = next(r for r in reasons if _MATERIAL_EVENT_FRAGMENT in r.text)
+    assert set(material.evidence_ids) == {"e2"}
+
+    freeze = next(r for r in reasons if "hiring freeze or pause" in r.text)
+    assert freeze.evidence_ids == ["e3"]
+
+
+def test_company_event_reason_falls_back_to_the_whole_probe_output():
+    """Defensive fallback: an undatable claim cannot be selected precisely.
+
+    A `company_events` claim with no `source_event_at` cannot be windowed, so
+    `material_event_claims` drops it and the precise set comes back empty
+    while the boolean is still `True` (here, because the caller asserted it).
+    The reason must still be emitted and cited — silently dropping the
+    explanation of a `wait` is worse than a coarser citation.
+    """
+    evidence = [ev("e1", "layoff", probe="company_events", source_quality="news")]
+    inputs = PolicyInputs(material_negative_event=True)
+
+    reasons = reasons_from_inputs(inputs, evidence, now=NOW)
+
+    material = next(r for r in reasons if _MATERIAL_EVENT_FRAGMENT in r.text)
+    assert material.evidence_ids == ["e1"]
