@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 from rli.agent.explanation import (
     MAX_HYPOTHESES,
     STEP_CITATION_INVALID,
+    STEP_CITATION_UNSUPPORTED,
     STEP_EXPLANATION_FALLBACK,
     ExplanationOutput,
     ReasonDraft,
@@ -37,11 +38,13 @@ from rli.models.policy_inputs import PolicyInputs
 NOW = datetime(2026, 9, 7, 12, 0, tzinfo=UTC)
 
 
-def _evidence(eid: str, *, raw_excerpt: str | None = None) -> EvidenceItem:
+def _evidence(
+    eid: str, *, raw_excerpt: str | None = None, claim_type: str = "posting_state"
+) -> EvidenceItem:
     return EvidenceItem(
         id=eid,
         probe="resolve_posting",
-        claim_type="posting_state",
+        claim_type=claim_type,
         value="open",
         source_url="https://boards-api.greenhouse.io/v1/boards/acme/jobs/1",
         raw_excerpt=raw_excerpt,
@@ -212,6 +215,154 @@ def test_reason_with_only_fabricated_citations_is_dropped_while_others_survive(
     # A usable reason remained, so no fallback path fires.
     assert not any(r["decision_type"].startswith(STEP_EXPLANATION_FALLBACK) for r in rows)
     assert any(r["decision_type"] == f"{STEP_CITATION_INVALID}:2" for r in rows)
+
+
+# ---------------------------------------------------------------------------
+# 3b. Citation SUPPORT guard: an existing id is not necessarily a relevant one
+# ---------------------------------------------------------------------------
+
+
+def test_reason_citing_unrelated_but_existing_evidence_is_dropped_as_unsupported(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    """A reason whose TEXT is about a company layoff, but whose only citation is an
+    existing-but-unrelated `posting_state` id, has a citation that resolves and no
+    support for what it says — spec.md §9 does not consider that publishable."""
+    evidence = [_evidence("e1", claim_type="posting_state")]
+    decision = _decision(evidence)
+    output = ExplanationOutput(
+        reason=[ReasonDraft(text="The company announced a layoff recently.", evidence_ids=["e1"])]
+    )
+    client = ScriptedClient([output])
+    run = _open_run(conn, cfg)
+
+    result = explain(
+        llm=client,
+        run=run,
+        cfg=cfg,
+        now=NOW,
+        decision=decision,
+        inputs=PolicyInputs(),
+        quality=None,
+        fallback_reasons=[ReasonItem(text="fallback", evidence_ids=["e1"])],
+    )
+
+    # The reason had a valid (existing) citation, but it is unrelated to the
+    # claim: it must not survive.
+    assert result.reason != [
+        ReasonItem(text="The company announced a layoff recently.", evidence_ids=["e1"])
+    ]
+
+    rows = _run_steps(conn, run.id)
+    unsupported_rows = [r for r in rows if r["decision_type"].startswith(STEP_CITATION_UNSUPPORTED)]
+    assert len(unsupported_rows) == 1
+    assert unsupported_rows[0]["decision_type"] == f"{STEP_CITATION_UNSUPPORTED}:1"
+    assert "company_event" in unsupported_rows[0]["error"]
+
+
+def test_reason_citing_matching_claim_type_survives_support_guard(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    """The same layoff-shaped reason, citing an actual `layoff` evidence item, must
+    survive: the citation is both real and on-topic."""
+    evidence = [_evidence("e1", claim_type="layoff")]
+    decision = _decision(evidence)
+    output = ExplanationOutput(
+        reason=[ReasonDraft(text="The company announced a layoff recently.", evidence_ids=["e1"])]
+    )
+    client = ScriptedClient([output])
+    run = _open_run(conn, cfg)
+
+    result = explain(
+        llm=client,
+        run=run,
+        cfg=cfg,
+        now=NOW,
+        decision=decision,
+        inputs=PolicyInputs(),
+        quality=None,
+        fallback_reasons=[],
+    )
+
+    assert result.reason == [
+        ReasonItem(text="The company announced a layoff recently.", evidence_ids=["e1"])
+    ]
+    rows = _run_steps(conn, run.id)
+    assert not any(r["decision_type"].startswith(STEP_CITATION_UNSUPPORTED) for r in rows)
+
+
+def test_reason_with_unclassifiable_text_survives_regardless_of_citation(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    """A reason whose text matches NO `FAMILY_KEYWORDS` keyword at all is kept no
+    matter what it cites: the classifier is deliberately crude, and a lexicon gap
+    must never cost a real reason (module docstring's judgment call)."""
+    evidence = [_evidence("e1", claim_type="posting_state")]
+    decision = _decision(evidence)
+    text = "This role seems like a great fit for the candidate's skill set."
+    output = ExplanationOutput(reason=[ReasonDraft(text=text, evidence_ids=["e1"])])
+    client = ScriptedClient([output])
+    run = _open_run(conn, cfg)
+
+    result = explain(
+        llm=client,
+        run=run,
+        cfg=cfg,
+        now=NOW,
+        decision=decision,
+        inputs=PolicyInputs(),
+        quality=None,
+        fallback_reasons=[],
+    )
+
+    assert result.reason == [ReasonItem(text=text, evidence_ids=["e1"])]
+    rows = _run_steps(conn, run.id)
+    assert not any(r["decision_type"].startswith(STEP_CITATION_UNSUPPORTED) for r in rows)
+
+
+def test_all_reasons_dropped_by_mix_of_invalid_and_unsupported_falls_back(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    """When every reason is dropped — one for a fabricated id, one for an
+    existing-but-unsupported id — the deterministic fallback still fires, under the
+    `all_citations_unsupported` label (not `all_citations_invalid`, since a support
+    drop, not just an invalid-id drop, contributed to the wipeout)."""
+    evidence = [_evidence("e1", claim_type="posting_state")]
+    decision = _decision(evidence)
+    fallback = [ReasonItem(text="Deterministic fallback.", evidence_ids=["e1"])]
+    output = ExplanationOutput(
+        reason=[
+            ReasonDraft(text="Entirely made up.", evidence_ids=["e9"]),
+            ReasonDraft(text="The company had a layoff.", evidence_ids=["e1"]),
+        ],
+        hypotheses=["Possibly evergreen."],
+    )
+    client = ScriptedClient([output])
+    run = _open_run(conn, cfg)
+
+    result = explain(
+        llm=client,
+        run=run,
+        cfg=cfg,
+        now=NOW,
+        decision=decision,
+        inputs=PolicyInputs(),
+        quality=None,
+        fallback_reasons=fallback,
+    )
+
+    assert result.reason == fallback
+    assert result.reason
+    # Hypotheses still survive a full citation wipeout.
+    assert result.hypotheses == ["Possibly evergreen."]
+
+    rows = _run_steps(conn, run.id)
+    fallback_rows = [r for r in rows if r["decision_type"].startswith(STEP_EXPLANATION_FALLBACK)]
+    assert len(fallback_rows) == 1
+    assert (
+        fallback_rows[0]["decision_type"]
+        == f"{STEP_EXPLANATION_FALLBACK}:all_citations_unsupported"
+    )
 
 
 # ---------------------------------------------------------------------------

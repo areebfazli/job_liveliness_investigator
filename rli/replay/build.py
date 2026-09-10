@@ -524,8 +524,16 @@ def _recording_runner(
     now: datetime,
     *,
     use_tool_cache: bool,
+    collection_status_csv: str | Path | None = None,
 ) -> Iterator[_RecordingProbeRunner]:
-    with open_probe_runner(conn, cfg, run, now, use_tool_cache=use_tool_cache) as base:
+    with open_probe_runner(
+        conn,
+        cfg,
+        run,
+        now,
+        use_tool_cache=use_tool_cache,
+        collection_status_csv=collection_status_csv,
+    ) as base:
         yield _RecordingProbeRunner(
             run=base.run, ctx=base.ctx, cfg=base.cfg, now=base.now, pool=base.pool
         )
@@ -624,6 +632,7 @@ def case_state_at(
                 store=probe_store,
                 posting_id=posting_id,
                 archive_claims=archive_claims,
+                collection_status_csv=collection_status_csv,
             ) as probes:
                 case = build_case_state(
                     conn,
@@ -631,7 +640,6 @@ def case_state_at(
                     url=url,
                     now=replay_at,
                     probes=probes,
-                    collection_status_csv=collection_status_csv,
                 )
                 run.set_posting_id(case.posting_id)
                 case_file = case.case_file()
@@ -796,14 +804,20 @@ def _observe_live(
         config_hash=f"cfg:{config_hash(cfg)}|replay_build:{dataset_id}",
         started_at=now,
     ) as run:
-        with _recording_runner(conn, cfg, run, now, use_tool_cache=use_tool_cache) as probes:
+        with _recording_runner(
+            conn,
+            cfg,
+            run,
+            now,
+            use_tool_cache=use_tool_cache,
+            collection_status_csv=collection_status_csv,
+        ) as probes:
             case = build_case_state(
                 conn,
                 cfg,
                 url=plan.canonical_url,
                 now=now,
                 probes=probes,
-                collection_status_csv=collection_status_csv,
             )
             run.set_posting_id(case.posting_id)
             case_file = case.case_file()
@@ -830,6 +844,8 @@ def _company_events_at(
     cfg: Config,
     case: CaseState,
     replay_at: datetime,
+    *,
+    collection_status_csv: str | Path | None = None,
 ) -> _Observation | None:
     """Run `company_events` with `as_of=T`, under the args replay will build.
 
@@ -838,6 +854,13 @@ def _company_events_at(
     replay. Arguments are produced by `rli.probes.registry.build_args` with a
     context whose clock is `T` — the same call the replayed controller makes
     — rather than constructed here, so the two can never diverge.
+
+    `collection_status_csv` goes on the CONTEXT, so the stored record
+    reflects the collection state the build pinned rather than whatever the
+    working checkout holds. It reaches the probe without touching `args`,
+    which is exactly what the `args_hash` above requires: the hash must
+    identify the QUESTION (`company_id`, `as_of`) and stay identical on the
+    machine that later replays this record.
     """
     case_file = case.case_file()
     if case_file is None:
@@ -850,6 +873,7 @@ def _company_events_at(
         # exists to satisfy the dataclass and must never be reached.
         net_client_factory=_no_network,
         now=lambda: replay_at,
+        collection_status_csv=collection_status_csv,
     )
     args = build_args(CompanyEventsProbe, case_file, ctx)
     result = CompanyEventsProbe().run(args, ctx)  # type: ignore[arg-type]
@@ -1015,7 +1039,9 @@ def build_dataset(
                 )
                 probe_records += 1
 
-            events = _company_events_at(conn, cfg, case, replay_at)
+            events = _company_events_at(
+                conn, cfg, case, replay_at, collection_status_csv=collection_status_csv
+            )
             if events is not None:
                 store.save(
                     conn,

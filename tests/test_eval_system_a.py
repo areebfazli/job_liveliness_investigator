@@ -10,10 +10,19 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import httpx
 import respx
-from test_eval_helpers import COMPANY, add_capture, add_posting, job
+from test_eval_helpers import (
+    COMPANY,
+    add_capture,
+    add_company_event,
+    add_posting,
+    decision_branch,
+    job,
+    write_status_csv,
+)
 
 from rli.config import Config
 from rli.eval.system_a import ALL_DYNAMIC_INPUTS, run_system_a
@@ -228,3 +237,79 @@ def test_system_a_runs_zero_dynamic_probes_for_unresolved_identity(
     assert result.probes_run == ()
     assert isinstance(result.decision, Decision)
     assert result.decision.posting_state == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# spec.md §5 Amendment 2026-09-10: P3c, end to end and evidence-cited
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_system_a_waits_on_a_material_layoff_after_the_last_refresh(
+    conn: sqlite3.Connection, cfg: Config, tmp_path: Path
+) -> None:
+    """A material layoff dated after the posting last moved -> `wait` on P3c.
+
+    The point of running this through the WHOLE system rather than through
+    `decide` is the last assertion: the `wait` must be explained by the
+    layoff claims the `company_events` probe actually produced. Before the
+    events pipeline was moved onto claims, this exact case decided `wait`
+    from a pre-populated policy input with no layoff evidence anywhere in the
+    run — the decision was right and completely unsupportable, which
+    spec.md §9 forbids.
+
+    The collection-status file is pinned on the run (and therefore on every
+    probe's `ProbeContext`) so the scenario does not depend on whether
+    `acme.com` happens to appear in the real `data/events/collection_status.csv`.
+    """
+    add_posting(
+        conn,
+        job_id="6002",
+        first_observed=NOW - timedelta(days=520),
+        last_seen_open=NOW,
+    )
+    for offset in (520, 300, 120, 40, 2):
+        add_capture(conn, NOW - timedelta(days=offset), [job("6002")], company_id=COMPANY)
+    add_company_event(
+        conn,
+        event_date=(NOW - timedelta(days=18)).date(),
+        available_at=NOW - timedelta(days=18),
+    )
+    status_csv = write_status_csv(tmp_path / "collection_status.csv", NOW - timedelta(days=1))
+
+    url = "https://boards.greenhouse.io/acme/jobs/6002"
+    gh_job = dict(GH_JOB_OPEN, id=6002, absolute_url=url)
+    gh_job["first_published"] = (NOW - timedelta(days=520)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    respx.get("https://boards-api.greenhouse.io/v1/boards/acme/jobs/6002").mock(
+        return_value=httpx.Response(200, json=gh_job)
+    )
+    respx.get(url).mock(return_value=httpx.Response(200, text=NO_JSONLD_PAGE))
+    respx.get("https://boards-api.greenhouse.io/v1/boards/acme/jobs").mock(
+        return_value=httpx.Response(200, json={"jobs": [gh_job]})
+    )
+
+    result = run_system_a(
+        conn,
+        cfg,
+        url,
+        now=NOW,
+        sleep=lambda _s: None,
+        use_tool_cache=False,
+        collection_status_csv=status_csv,
+    )
+
+    assert "company_events" in result.probes_run
+    assert result.decision.recommended_action == "wait"
+    assert decision_branch(conn, result.run_id) == "P3c_material_event_unrefreshed"
+
+    layoff_ids = {
+        row["id"]
+        for row in conn.execute(
+            "SELECT id FROM evidence WHERE run_id = ? AND probe = 'company_events' "
+            "AND claim_type = 'layoff'",
+            (result.run_id,),
+        ).fetchall()
+    }
+    assert layoff_ids, "the probe must have produced the layoff claim the policy read"
+    cited = {eid for reason in result.decision.reason for eid in reason.evidence_ids}
+    assert layoff_ids <= cited

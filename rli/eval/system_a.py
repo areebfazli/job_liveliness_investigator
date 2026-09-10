@@ -24,11 +24,21 @@ with ONE of its three gates deliberately neutralized:
   `populates & unpopulated` is non-empty (spec.md §4). A passes the union of
   every dynamic probe's `populates` instead of the case's actual unpopulated
   set, which makes that intersection vacuously true for all four probes. A
-  is the full-probe reference: it must run `company_events` even when the
-  event store has already answered both of its inputs, and `team_signal`
-  even when nothing is left for it to change, because otherwise "the
-  full-probe reference action" would silently depend on how much the case
-  state happened to know already.
+  is the full-probe reference: it must run `team_signal` even when nothing
+  is left for it to change, and `company_events` even when the case state
+  already holds an answer, because otherwise "the full-probe reference
+  action" would silently depend on how much the case state happened to know
+  already.
+
+  Note this gate no longer changes anything for `company_events`
+  specifically. It used to: `rli.eval.case` pre-populated that probe's three
+  policy inputs from the local event store, so the real unpopulated set
+  would have excluded it on most of the corpus. That pre-population is gone
+  (see `rli.eval.case`'s judgment call), and those inputs now stay UNKNOWN
+  until the probe itself runs. The neutralized gate is kept regardless — the
+  reference system's probe set must not depend on how much any OTHER layer
+  happens to have worked out first, which is a statement about A, not about
+  one probe.
 * **the history gate is NOT neutralized.** spec.md §4: "history probes are
   ineligible without usable history", and "missing history never means flat
   hiring". `repost_history` and `requirements_drift` on a company with two
@@ -141,11 +151,14 @@ def run_system_a(
         sleep: injected into the retry backoff and the per-host rate limiter.
         use_tool_cache: `False` disconnects `tool_cache` entirely, so a
             mocked fetch can never be answered from a stored row.
-        collection_status_csv: override for the pre-collected company-event
-            status file (`rli.eval.case._event_signals`). `None` reads the
-            project default, which is a file in the working checkout — pass
-            an explicit path to keep a test or a replay from depending on
-            whatever that file happens to contain.
+        collection_status_csv: pins the pre-collected company-event
+            collection-status file for this run's `ProbeContext`, i.e. for the
+            `company_events` probe (`rli.eval.runner.open_system_runner`).
+            `None` reads the project default, which is a file in the working
+            checkout — pass an explicit path to keep a test or a replay from
+            depending on whatever that file happens to contain. Under
+            `replay=`, the hook's own pinned value wins; see
+            `open_system_runner`.
         replay: `None` for a live run. A `rli.eval.runner.ReplayHook` puts
             this run in replay mode (spec.md §6): the run is recorded with
             `mode='replay'` and `replay_at=T`, its `config_hash` carries the
@@ -177,6 +190,7 @@ def run_system_a(
             replay=replay,
             sleep=sleep,
             use_tool_cache=use_tool_cache,
+            collection_status_csv=collection_status_csv,
         ) as probes:
             case = build_case_state(
                 conn,
@@ -184,7 +198,6 @@ def run_system_a(
                 url=url,
                 now=moment,
                 probes=probes,
-                collection_status_csv=collection_status_csv,
             )
             run.set_posting_id(case.posting_id)
 

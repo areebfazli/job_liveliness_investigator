@@ -46,11 +46,29 @@ Judgment calls:
   refresh/event reason misfiled as a requirements-drift reason would be
   counted as an unsupported citation. The classifier is documented as crude
   and this module works around it rather than widening it.
-* **Some inputs are cited by probe, not by claim type.** `repost_pattern`,
-  the company-event signals and `corroborating_hiring_signal` come from
-  probes whose claim vocabulary is owned by `rli.probes`; citing "any
-  evidence this probe produced" keeps this module correct as those probes
-  evolve, at the cost of a slightly coarser citation.
+* **Some inputs are cited by probe, not by claim type.** `repost_pattern`
+  and `corroborating_hiring_signal` come from probes whose claim vocabulary
+  is owned by `rli.probes`; citing "any evidence this probe produced" keeps
+  this module correct as those probes evolve, at the cost of a slightly
+  coarser citation.
+* **The company-event reasons are the exception, and cite PRECISELY.** They
+  used to be in the bullet above, citing every `company_events` item. That
+  is no longer honest: the probe emits a claim per dated event of ANY type
+  (funding, expansion, acquisition) plus a `company_events_searched`
+  collection-status claim, so "a dated layoff or shutdown was recorded"
+  could end up citing a funding headline and nothing else. So the
+  material-event reason cites `rli.policy.inputs.material_event_claims` and
+  the freeze reason cites `freeze_event_claims` — in both cases exactly the
+  windowed claims that made the boolean True, selected by the very rule that
+  set it (those helpers are defined against `signals_from_facts`, so they
+  cannot drift from it).
+
+  This matters beyond tidiness: the explanation layer carries a guard that
+  drops a reason whose TEXT names a claim type absent from its cited ids, so
+  a layoff reason citing only funding ids would be silently deleted, and the
+  `wait` it explains would arrive unexplained. Each precise set falls back to
+  the old broad `_by_probe` set when it comes back empty — defensive only, as
+  it cannot be empty while the corresponding boolean is True.
 * **`now` defaults to the current clock** so a caller can omit it, but replay
   and tests must pass it explicitly — an implicit clock in a replayed
   explanation is exactly the kind of leak spec.md §6 counts.
@@ -70,7 +88,9 @@ from rli.policy.inputs import (
     CLAIM_DECLARED_EXPIRY,
     CLAIM_POSTING_STATE,
     best_publish_claim,
+    freeze_event_claims,
     last_publish_or_refresh,
+    material_event_claims,
     newest_refresh_claim,
 )
 
@@ -180,11 +200,14 @@ def reasons_from_inputs(
             )
 
     # 5. Company events. Only stated when TRUE: "we checked and found nothing"
-    #    is not a user-facing reason, and UNKNOWN certainly is not.
+    #    is not a user-facing reason, and UNKNOWN certainly is not. Each
+    #    reason cites the precise claims that set its boolean, not every
+    #    `company_events` item — see the module docstring.
     event_evidence = _by_probe(evidence, _EVENTS_PROBE)
     if event_evidence:
         if inputs.material_negative_event is True:
-            reasons.append(_material_event_reason(inputs, evidence, event_evidence))
+            cited = material_event_claims(evidence, when) or event_evidence
+            reasons.append(_material_event_reason(inputs, evidence, cited))
         if inputs.freeze_or_pause is True:
             reasons.append(
                 ReasonItem(
@@ -192,7 +215,7 @@ def reasons_from_inputs(
                         "A dated hiring freeze or pause was recorded for this company "
                         "inside the policy's lookback window."
                     ),
-                    evidence_ids=_ids(event_evidence),
+                    evidence_ids=_ids(freeze_event_claims(evidence, when) or event_evidence),
                 )
             )
 
@@ -243,6 +266,12 @@ def _material_event_reason(
     event_evidence: Sequence[EvidenceItem],
 ) -> ReasonItem:
     """The one reason emitted when `material_negative_event is True`.
+
+    `event_evidence` is the caller's already-narrowed citation set — the
+    layoff/shutdown claims that actually set the boolean
+    (`rli.policy.inputs.material_event_claims`), or the whole
+    `company_events` set as a defensive fallback. It is passed in rather than
+    re-selected here so both wordings below cite the same thing.
 
     Two wordings, one reason (module docstring). The specific wording states
     the observation behind the policy's P3c `wait` branch — a dated event,

@@ -18,6 +18,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import ClassVar, Literal
 
 from pydantic import BaseModel
@@ -82,12 +83,28 @@ class ProbeContext:
       from inside the `resolve_posting` probe.
     * `now` — injectable clock, so `available_at`/`fetched_at` are
       deterministic in tests and consistent across one probe run.
+    * `collection_status_csv` — the pinned location of a piece of
+      PRE-COLLECTED CORPUS REFERENCE DATA (`company_events`' collection-status
+      file). It is in the same category as `conn`: a handle on the corpus
+      this run is reasoning against, chosen by whoever opened the run, and
+      identical for every probe in it. `None` means "wherever the probe's own
+      default points", which is the repo's `data/events/collection_status.csv`.
+
+      It is deliberately NOT part of any probe's `args`, and therefore not
+      part of `args_hash`. `rli.eval.runner.ProbeRunner.execute` hashes
+      `args.model_dump()` into `args_hash`, and `rli.replay.build` stores the
+      `company_events` dataset record under that hash while `rli.replay.run`
+      looks it up: a machine-local filesystem path inside the args would make
+      every stored record machine-specific and every lookup miss on another
+      checkout. The path pins WHICH corpus is read; it is not part of the
+      QUESTION being asked, which is what `args_hash` identifies.
     """
 
     conn: sqlite3.Connection
     config: Config
     net_client_factory: Callable[[str], NetClient]
     now: Callable[[], datetime] = field(default=now_utc)
+    collection_status_csv: str | Path | None = None
 
     def net_client(self, probe_name: str) -> NetClient:
         return self.net_client_factory(probe_name)

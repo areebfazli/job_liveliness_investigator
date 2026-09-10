@@ -45,6 +45,32 @@ emits publish or refresh evidence — which is why `publish_recency` cannot
 move during the agent loop and why `could_change_action` holds
 `last_refreshed_at` fixed rather than enumerating it.
 
+Emitted by `rli.probes.company_events`, and answering THREE policy inputs at
+once (`material_negative_event`, `freeze_or_pause`,
+`last_material_event_at`):
+
+* one claim per dated event, whose `claim_type` is the raw event type
+  (`layoff`, `hiring_freeze`, ... — the full set is
+  `rli.events.policy_signals.EVENT_CLAIM_TYPES`), whose `source_event_at` is
+  the event's calendar date at midnight UTC, and whose `value` carries the
+  stored materiality as a prefix (`"material: Acme lays off 200"`);
+* one `company_events_searched` claim
+  (`rli.events.policy_signals.CLAIM_EVENTS_SEARCHED`) whose value is the
+  moment that company's events were searched. This is what makes the `False`
+  answer — "we checked, and nothing qualifying is in the window" — an
+  evidence-backed statement rather than an inference from silence.
+
+**No `company_events` evidence at all therefore means UNKNOWN, never False.**
+That is the whole point: `False` is a report on a search that happened, so
+it requires the search claim; an empty evidence list is "we have not looked",
+which is an unresolved question for the controller (spec.md §4), not a
+clean bill of health. These three inputs are derived here, from the claims,
+and NOT handed in pre-computed by whoever holds the events store — a
+pre-populated input made `company_events` ineligible under spec.md §4's
+`populates & unpopulated` rule, so the probe never ran, so a `wait` could be
+returned citing no layoff evidence at all (see `rli.eval.case`'s docstring
+for the full account of that bug).
+
 --------------------------------------------------------------------------
 Judgment calls (documented because they are not forced by spec.md)
 --------------------------------------------------------------------------
@@ -98,7 +124,15 @@ from datetime import datetime, timedelta
 from itertools import product
 from typing import TYPE_CHECKING, Any, NamedTuple
 
-from rli.events.policy_signals import EventSignals
+from rli.events.policy_signals import (
+    CLAIM_EVENTS_SEARCHED,
+    COMPANY_EVENTS_PROBE,
+    EVENT_CLAIM_TYPES,
+    EventFact,
+    EventSignals,
+    parse_event_claim_value,
+    signals_from_facts,
+)
 from rli.models.decision import EvidenceQuality, RecommendedAction
 from rli.models.evidence import EvidenceItem
 from rli.models.policy_inputs import (
@@ -127,7 +161,9 @@ __all__ = [
     "best_publish_claim",
     "could_change_action",
     "derive_policy_inputs",
+    "freeze_event_claims",
     "last_publish_or_refresh",
+    "material_event_claims",
     "newest_refresh_claim",
     "unpopulated",
 ]
@@ -301,6 +337,163 @@ def _team_signal(evidence: Sequence[EvidenceItem]) -> bool | Unknown:
 
 
 # ---------------------------------------------------------------------------
+# The `company_events` claims adapter
+# ---------------------------------------------------------------------------
+
+#: Materiality assumed for a `layoff`/`shutdown` claim whose `value` prefix
+#: could not be parsed (an evidence row written by an older probe version, a
+#: hand-written fixture, anything not produced by
+#: `rli.events.policy_signals.format_event_claim_value`).
+#:
+#: FAIL-SAFE, and deliberately so. Guessing `"minor"` would silently drop a
+#: `wait` on a real layoff — exactly the failure this whole claims path was
+#: introduced to prevent — while guessing `"material"` can only over-warn,
+#: and an over-warning is visible in the reasons and arguable by the reader.
+#: `rli.events.store.classify_materiality` makes the same call for the same
+#: reason when a layoff headline carries no extractable magnitude, and
+#: `rli.events.policy_signals`' module docstring documents this end of it.
+_FAIL_SAFE_MATERIALITY = "material"
+
+
+def _events_searched(evidence: Iterable[EvidenceItem]) -> bool:
+    """Did `company_events` report an actual search (spec.md §4's "checked")?
+
+    The presence of its `company_events_searched` claim, and nothing else.
+    Note it is NOT enough for the probe merely to have run: in replay the
+    point-in-time gate drops this claim when the search post-dates `T`, which
+    is precisely how "searched, but not yet at this instant" collapses back
+    to UNKNOWN without a second copy of that comparison living here.
+    """
+    return any(
+        item.probe == COMPANY_EVENTS_PROBE and item.claim_type == CLAIM_EVENTS_SEARCHED
+        for item in evidence
+    )
+
+
+def _event_claim_facts(evidence: Iterable[EvidenceItem]) -> list[tuple[EvidenceItem, EventFact]]:
+    """Every `company_events` per-event claim, paired with its `EventFact`.
+
+    The pair — not just the fact — because the explanation layer has to cite
+    the very claims that made a boolean True, and re-selecting them from a
+    second predicate is how the two would drift apart.
+
+    Three filters, each load-bearing:
+
+    * `probe == company_events` — another probe emitting a claim that happens
+      to be named `funding` must not feed the company-event rule;
+    * `claim_type in EVENT_CLAIM_TYPES` — excludes the
+      `company_events_searched` collection claim (read separately, by
+      `_events_searched`) and anything else the probe grows later;
+    * `source_event_at is not None` — an event we cannot place on the
+      calendar cannot be windowed, so it cannot answer "inside the lookback
+      window?" either way. Dropping it is the same discipline
+      `best_publish_claim` applies to an undated publish claim.
+    """
+    pairs: list[tuple[EvidenceItem, EventFact]] = []
+    for item in evidence:
+        if item.probe != COMPANY_EVENTS_PROBE:
+            continue
+        if item.claim_type not in EVENT_CLAIM_TYPES:
+            continue
+        if item.source_event_at is None:
+            continue
+        materiality, _headline = parse_event_claim_value(item.value)
+        pairs.append(
+            (
+                item,
+                EventFact(
+                    event_type=item.claim_type,
+                    event_date=item.source_event_at.date(),
+                    materiality=materiality or _FAIL_SAFE_MATERIALITY,
+                ),
+            )
+        )
+    return pairs
+
+
+def _event_signals(
+    evidence: Sequence[EvidenceItem], now: datetime, window_days: int
+) -> EventSignals:
+    """The three event inputs, read from `company_events` claims alone."""
+    return signals_from_facts(
+        [fact for _item, fact in _event_claim_facts(evidence)],
+        now,
+        window_days=window_days,
+        searched=_events_searched(evidence),
+    )
+
+
+def _claims_that_flip(
+    evidence: Sequence[EvidenceItem], now: datetime, window_days: int, index: int
+) -> list[EvidenceItem]:
+    """The claims that would, ALONE, set signal `index` of the triple True.
+
+    `index` is `0` for `material_negative_event` and `1` for
+    `freeze_or_pause`.
+
+    The selection is made by asking `signals_from_facts` about each claim on
+    its own rather than by restating its predicates here. That is the point:
+    the window, the event-type sets and the materiality rule then have
+    exactly ONE definition in the codebase, and `material_event_claims` /
+    `freeze_event_claims` cannot drift from the booleans they are supposed to
+    explain even if that rule changes. `searched=True` is passed because the
+    question asked here is "does this fact qualify?", not "have we searched?"
+    — the caller has already established the latter by getting a `True` out
+    of `_event_signals`.
+
+    The cost is one pure call per company-event claim, on a list that holds
+    the dated events of a single company; this runs once per explanation, not
+    inside any loop.
+    """
+    return [
+        item
+        for item, fact in _event_claim_facts(evidence)
+        if signals_from_facts([fact], now, window_days=window_days, searched=True)[index] is True
+    ]
+
+
+def _window_days(cfg: Config | PolicyThresholds | None) -> int:
+    from rli.policy.action import PolicyThresholds as _PolicyThresholds
+
+    return _PolicyThresholds.coerce(cfg).negative_event_window_days
+
+
+def material_event_claims(
+    evidence: Sequence[EvidenceItem],
+    now: datetime,
+    *,
+    cfg: Config | PolicyThresholds | None = None,
+) -> list[EvidenceItem]:
+    """The windowed `company_events` claims that make `material_negative_event` True.
+
+    Public because `rli.policy.explain_stub` must cite exactly these — the
+    layoff/shutdown claims the policy actually read — and not "every claim
+    the `company_events` probe produced", which now also includes the
+    `company_events_searched` collection claim and any unrelated funding or
+    expansion item. A reason whose text says "a dated layoff or shutdown"
+    while citing a funding headline is an unsupported citation under
+    spec.md §9 even though every id in it resolves.
+
+    Empty when the input is False or UNKNOWN, and never empty when it is
+    True — the same call decides both (see `_claims_that_flip`).
+    """
+    return _claims_that_flip(evidence, ensure_aware(now, "now"), _window_days(cfg), 0)
+
+
+def freeze_event_claims(
+    evidence: Sequence[EvidenceItem],
+    now: datetime,
+    *,
+    cfg: Config | PolicyThresholds | None = None,
+) -> list[EvidenceItem]:
+    """The windowed `company_events` claims that make `freeze_or_pause` True.
+
+    The sibling of `material_event_claims`, public for the same reason.
+    """
+    return _claims_that_flip(evidence, ensure_aware(now, "now"), _window_days(cfg), 1)
+
+
+# ---------------------------------------------------------------------------
 # derive_policy_inputs
 # ---------------------------------------------------------------------------
 
@@ -308,7 +501,6 @@ def _team_signal(evidence: Sequence[EvidenceItem]) -> bool | Unknown:
 def derive_policy_inputs(
     evidence: Sequence[EvidenceItem],
     features: PostingHistoryFeatures | None,
-    event_signals: EventSignals | None,
     now: datetime,
     *,
     cfg: Config | PolicyThresholds | None = None,
@@ -317,18 +509,18 @@ def derive_policy_inputs(
 ) -> PolicyInputs:
     """Build `PolicyInputs` from the case file's evidence and derived features.
 
+    A pure function of `(evidence, features, now)` plus the two narrow
+    keyword fallbacks below. In particular there is NO `event_signals`
+    parameter: `material_negative_event`, `freeze_or_pause` and
+    `last_material_event_at` are read out of `company_events`' claims like
+    every other evidence-backed input, so calling this twice with the same
+    evidence cannot produce two different answers depending on who called it.
+
     Arguments:
         evidence: every `EvidenceItem` gathered so far for this posting.
         features: `rli.history.features.posting_features` output, or `None`
             when no history exists (leaves `repost_pattern` UNKNOWN — spec.md
             §4: "missing history never means flat hiring").
-        event_signals: the `EventSignals` triple
-            `(material_negative_event, freeze_or_pause,
-            last_material_event_at)` returned by
-            `rli.events.policy_signals.derive_policy_signals`, or `None` when
-            `company_events` has not run (all three UNKNOWN). The three are
-            taken as a unit precisely because they are three readings of one
-            windowed event list; see that module.
         now: the decision clock. Must be timezone-aware.
         cfg: `Config` or `PolicyThresholds`; supplies `recent_publish_days`.
             Defaults to the loaded project config.
@@ -344,8 +536,12 @@ def derive_policy_inputs(
     thresholds = _PolicyThresholds.coerce(cfg)
 
     posting_state = _posting_state(evidence)
-    material_negative_event, freeze_or_pause, last_material_event_at = (
-        event_signals if event_signals is not None else (UNKNOWN, UNKNOWN, UNKNOWN)
+    # The three event inputs come from `company_events`' CLAIMS — never from
+    # a pre-computed triple handed in by whoever holds the events store. See
+    # the evidence-claim contract above, and `rli.eval.case`'s docstring for
+    # what the pre-computed version cost.
+    material_negative_event, freeze_or_pause, last_material_event_at = _event_signals(
+        evidence, now, thresholds.negative_event_window_days
     )
 
     from_evidence = _team_signal(evidence)

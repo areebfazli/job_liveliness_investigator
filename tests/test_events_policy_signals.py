@@ -134,3 +134,106 @@ def test_shutdown_in_window_sets_material_negative_event(conn: sqlite3.Connectio
     status = {"acme.com": _status(events_found=1)}
     result = derive_policy_signals(conn, "acme.com", AS_OF, status, window_days=WINDOW_DAYS)
     assert result == (True, False, EVENT_MIDNIGHT)
+
+
+# ---------------------------------------------------------------------------
+# The third element: last_material_event_at (spec.md §5, Amendment 2026-09-10)
+# ---------------------------------------------------------------------------
+
+
+def test_last_material_event_at_is_the_max_event_date_when_several_qualify(
+    conn: sqlite3.Connection,
+) -> None:
+    """Several qualifying material events: the MAX `event_date`, not the min or the count.
+
+    The policy asks "has this posting been refreshed SINCE the bad news", so
+    the most recent qualifying event is the one that matters — an older
+    layoff must not win over a newer one just because it was inserted first
+    or has a smaller id.
+    """
+    _insert_company(conn)
+    upsert_event(
+        conn,
+        _event(
+            event_type="layoff",
+            materiality="material",
+            event_date=date(2026, 6, 1),
+            available_at=datetime(2026, 6, 1, 12, 0, tzinfo=UTC),
+            source_url="https://news.example.com/layoff-june",
+            headline="Acme cuts 5% of staff",
+        ),
+    )
+    upsert_event(
+        conn,
+        _event(
+            event_type="shutdown",
+            materiality="material",
+            event_date=date(2026, 8, 1),  # the later, MAX-qualifying date
+            available_at=datetime(2026, 8, 1, 12, 0, tzinfo=UTC),
+            source_url="https://news.example.com/shutdown-august",
+            headline="Acme shuts down a division",
+        ),
+    )
+    # A non-qualifying event with a LATER date than either material one, to
+    # prove the max is taken only over the events that made the boolean True.
+    upsert_event(
+        conn,
+        _event(
+            event_type="hiring_freeze",
+            materiality="material",
+            event_date=date(2026, 9, 1),
+            available_at=datetime(2026, 9, 1, 12, 0, tzinfo=UTC),
+            source_url="https://news.example.com/freeze-september",
+            headline="Acme announces a hiring freeze",
+        ),
+    )
+    status = {"acme.com": _status(events_found=3)}
+
+    result = derive_policy_signals(conn, "acme.com", AS_OF, status, window_days=WINDOW_DAYS)
+
+    assert result == (True, True, datetime(2026, 8, 1, tzinfo=UTC))
+
+
+def test_material_negative_event_true_iff_last_material_event_at_is_a_datetime(
+    conn: sqlite3.Connection,
+) -> None:
+    """The documented pairing invariant, checked across every reachable shape.
+
+    `rli.events.policy_signals.EventSignals`: `material_negative_event is
+    True` if and only if the third element is a `datetime` — `False` pairs
+    with `None` ("checked, nothing found") and `UNKNOWN` pairs with `UNKNOWN`
+    ("not yet investigated"). The impossible pairs (`True`/`None`,
+    `True`/`UNKNOWN`, `False` or `UNKNOWN` paired with a real date) must never
+    occur.
+    """
+    _insert_company(conn)
+    upsert_event(conn, _event(event_type="layoff", materiality="material"))
+    scenarios: list[tuple[dict, bool | object]] = [
+        ({}, UNKNOWN),  # not searched at all
+        ({"acme.com": _status(events_found=1)}, True),  # searched, material event
+    ]
+    for status, expected_material in scenarios:
+        material, _freeze, event_at = derive_policy_signals(
+            conn, "acme.com", AS_OF, status, window_days=WINDOW_DAYS
+        )
+        assert material == expected_material
+        assert (material is True) == isinstance(event_at, datetime)
+
+    # Searched, but the only event present does not qualify (outside window).
+    conn.execute("DELETE FROM company_events")
+    upsert_event(
+        conn,
+        _event(
+            event_type="layoff",
+            materiality="material",
+            event_date=date(2000, 1, 1),
+            available_at=datetime(2000, 1, 1, tzinfo=UTC),
+            source_url="https://news.example.com/ancient-layoff",
+        ),
+    )
+    material, _freeze, event_at = derive_policy_signals(
+        conn, "acme.com", AS_OF, {"acme.com": _status(events_found=1)}, window_days=WINDOW_DAYS
+    )
+    assert material is False
+    assert (material is True) == isinstance(event_at, datetime)
+    assert event_at is None

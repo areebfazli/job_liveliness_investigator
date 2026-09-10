@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime
 
 import pytest
 from test_history_helpers import (
@@ -20,10 +21,34 @@ from rli.history.closures import apply_to_postings
 from rli.history.features import company_features, coverage_window, posting_features
 from rli.history.matching import link_reposts
 from rli.models.policy_inputs import UNKNOWN, Unknown
+from rli.models.time import to_utc_z
 
 TITLE = "Senior Backend Engineer"
 OLD_POSTING = "greenhouse:acme:old1"
 TWIN_POSTING = "greenhouse:acme:twin1"
+
+
+def _posting_snapshot(
+    conn: sqlite3.Connection,
+    posting_id: str,
+    captured_at: datetime,
+    *,
+    source: str = "archive",
+    status: str = "open",
+) -> None:
+    """Raw-SQL `posting_snapshots` row — the per-posting capture table.
+
+    No helper for this table exists in `test_history_helpers` (only the
+    board-capture route, via `add_capture`, is covered there); mirrors
+    `tests/test_probes_requirements_drift.py`'s `_archive_snapshot`, which
+    inserts into the same table the same way.
+    """
+    conn.execute(
+        "INSERT INTO posting_snapshots (posting_id, captured_at, source, status) "
+        "VALUES (?, ?, ?, ?)",
+        (posting_id, to_utc_z(captured_at), source, status),
+    )
+    conn.commit()
 
 
 def _long_history(
@@ -322,6 +347,104 @@ def test_long_lived_is_false_when_the_earliest_origin_is_inside_the_threshold(
 
     assert features.history_days == float(span)
     assert features.age_days == 10.0
+    assert features.long_lived is False
+
+
+def test_long_lived_from_an_archive_posting_snapshot_predating_first_observed(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    """The `posting_snapshots` archive route: an early archive capture wins over `first_observed`.
+
+    `first_observed` (our own first sighting) is day 100; an archived open
+    capture from day 10 predates it, so `age_days` must run from day 10, not
+    day 100 — the whole point of the amendment's origin set.
+    """
+    add_posting(conn, job_id="old1", title=TITLE, first_observed=at(100))
+    _posting_snapshot(conn, OLD_POSTING, at(10), source="archive", status="open")
+
+    features = posting_features(conn, cfg, OLD_POSTING, now=at(200))
+
+    assert features.age_days == pytest.approx(190.0)  # 200 - 10, not 200 - 100
+    assert features.long_lived is True  # 190 >= long_lived_days (180)
+
+
+def test_long_lived_from_an_archive_board_snapshot_predating_first_observed(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    """The `board_snapshot_jobs` archive route, joined on `(company_id, ats_job_id)`.
+
+    Same shape as the `posting_snapshots` archive test, but through a
+    company-wide board capture instead of a per-posting one — `add_posting`
+    stores `job_id` as `ats_job_id`, which is what the join key requires.
+    """
+    add_posting(conn, job_id="old1", title=TITLE, first_observed=at(100))
+    add_capture(conn, at(10), [job("old1", title=TITLE)], source="archive")
+
+    features = posting_features(conn, cfg, OLD_POSTING, now=at(200))
+
+    assert features.age_days == pytest.approx(190.0)
+    assert features.long_lived is True
+
+
+def test_own_capture_does_not_count_as_an_archive_origin(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    """An `'own'` capture must NOT widen `age_days` the way an `'archive'` one does.
+
+    Both archive queries in `posting_features` filter `source = 'archive'`
+    explicitly; this pins that an early `'own' posting_snapshots` row (own
+    captures cannot predate `first_observed`, which is derived from exactly
+    those captures — module docstring) is correctly excluded rather than
+    silently treated as an archive origin.
+    """
+    add_posting(conn, job_id="old1", title=TITLE, first_observed=at(100))
+    _posting_snapshot(conn, OLD_POSTING, at(10), source="own", status="open")
+
+    features = posting_features(conn, cfg, OLD_POSTING, now=at(200))
+
+    # If the 'own' row were wrongly counted, age_days would be 190, not 100.
+    assert features.age_days == pytest.approx(100.0)
+    assert features.long_lived is False  # 100 < long_lived_days (180)
+
+
+def test_age_days_takes_the_earliest_of_all_three_origins_when_several_are_present(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    """publish date, archive capture, and `first_observed` all present: the EARLIEST wins."""
+    add_posting(conn, job_id="old1", title=TITLE, first_observed=at(80))
+    _posting_snapshot(conn, OLD_POSTING, at(30), source="archive", status="open")
+
+    features = posting_features(
+        conn, cfg, OLD_POSTING, now=at(200), first_published=at(50)
+    )
+
+    # Earliest of {50, 30, 80} is 30 — neither of the other two origins.
+    assert features.age_days == pytest.approx(170.0)
+
+
+def test_long_lived_boundary_exactly_at_the_threshold_is_true(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    add_posting(conn, job_id="old1", title=TITLE, first_observed=at(0))
+
+    features = posting_features(
+        conn, cfg, OLD_POSTING, now=at(cfg.thresholds.long_lived_days)
+    )
+
+    assert features.age_days == pytest.approx(float(cfg.thresholds.long_lived_days))
+    assert features.long_lived is True  # >= is inclusive
+
+
+def test_long_lived_boundary_one_day_under_the_threshold_is_false(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    add_posting(conn, job_id="old1", title=TITLE, first_observed=at(0))
+
+    features = posting_features(
+        conn, cfg, OLD_POSTING, now=at(cfg.thresholds.long_lived_days - 1)
+    )
+
+    assert features.age_days == pytest.approx(float(cfg.thresholds.long_lived_days - 1))
     assert features.long_lived is False
 
 

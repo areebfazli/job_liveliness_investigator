@@ -13,6 +13,12 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from rli.events.policy_signals import (
+    CLAIM_EVENTS_SEARCHED,
+    COLLECTION_STATUS_SOURCE_URL,
+    COMPANY_EVENTS_PROBE,
+    format_event_claim_value,
+)
 from rli.history.features import PostingHistoryFeatures
 from rli.models.evidence import EvidenceItem
 from rli.models.policy_inputs import UNKNOWN, PolicyInputs
@@ -25,7 +31,9 @@ from rli.policy.inputs import (
     CLAIM_TEAM_SIGNAL,
     could_change_action,
     derive_policy_inputs,
+    freeze_event_claims,
     last_publish_or_refresh,
+    material_event_claims,
     newest_refresh_claim,
     unpopulated,
 )
@@ -97,8 +105,48 @@ def features(**overrides) -> PostingHistoryFeatures:
     return PostingHistoryFeatures(**{**base, **overrides})
 
 
-def derive(evidence, *, feats=None, signals=None, **kwargs) -> PolicyInputs:
-    return derive_policy_inputs(evidence, feats, signals, NOW, cfg=THRESHOLDS, **kwargs)
+def searched_ev(searched_at: datetime = NOW, eid: str = "e-searched") -> EvidenceItem:
+    """`company_events`' collection-status claim.
+
+    Its presence is what makes a `False` event signal an evidence-backed
+    "checked, none found" instead of an inference from silence; its absence
+    is what keeps the three inputs UNKNOWN.
+    """
+    return ev(
+        eid,
+        CLAIM_EVENTS_SEARCHED,
+        probe=COMPANY_EVENTS_PROBE,
+        value=searched_at.isoformat(),
+        source_quality="enrichment",
+        source_event_at=searched_at,
+        available_at=searched_at,
+        source_url=COLLECTION_STATUS_SOURCE_URL,
+    )
+
+
+def event_ev(
+    event_type: str,
+    event_at: datetime,
+    *,
+    eid: str = "e-event",
+    materiality: str = "material",
+    headline: str = "something happened",
+    value: str | None = None,
+) -> EvidenceItem:
+    """One dated `company_events` claim, shaped exactly as the probe emits it."""
+    return ev(
+        eid,
+        event_type,
+        probe=COMPANY_EVENTS_PROBE,
+        value=value if value is not None else format_event_claim_value(materiality, headline),
+        source_quality="news",
+        source_event_at=event_at,
+        source_url="https://news.example/acme-layoff",
+    )
+
+
+def derive(evidence, *, feats=None, **kwargs) -> PolicyInputs:
+    return derive_policy_inputs(evidence, feats, NOW, cfg=THRESHOLDS, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -325,17 +373,18 @@ def test_declared_expiry_unknown_without_any_resolver_evidence():
 # ---------------------------------------------------------------------------
 
 
-def test_event_signals_are_passed_through():
-    inputs = derive([], signals=(True, False, EVENT_AT))
+def test_event_signals_come_from_company_events_claims():
+    """The three event inputs are read out of the probe's CLAIMS (spec.md §5/§9)."""
+    inputs = derive([searched_ev(), event_ev("layoff", EVENT_AT)])
     assert inputs.material_negative_event is True
     assert inputs.freeze_or_pause is False
     assert inputs.last_material_event_at == EVENT_AT
 
 
-def test_missing_event_signals_are_unknown_not_false():
-    """`event_signals=None` (company_events has not run) leaves all THREE
-    members of the triple UNKNOWN, not just the first two."""
-    inputs = derive([], signals=None)
+def test_no_company_events_evidence_is_unknown_not_false():
+    """No `company_events` evidence at all (the probe has not run) leaves all
+    THREE members of the triple UNKNOWN, not just the first two."""
+    inputs = derive([])
     assert inputs.material_negative_event is UNKNOWN
     assert inputs.freeze_or_pause is UNKNOWN
     assert inputs.last_material_event_at is UNKNOWN
@@ -346,11 +395,103 @@ def test_missing_event_signals_are_unknown_not_false():
     } <= unpopulated(inputs)
 
 
-def test_unknown_event_signals_survive_the_round_trip():
-    inputs = derive([], signals=(UNKNOWN, True, UNKNOWN))
+def test_searched_claim_alone_is_a_known_negative():
+    """ "We looked and found nothing" is `False`/`None`, and it is evidence-backed."""
+    inputs = derive([searched_ev()])
+    assert inputs.material_negative_event is False
+    assert inputs.freeze_or_pause is False
+    assert inputs.last_material_event_at is None
+    assert not {
+        "material_negative_event",
+        "freeze_or_pause",
+        "last_material_event_at",
+    } & unpopulated(inputs)
+
+
+def test_event_claims_without_the_searched_claim_stay_unknown():
+    """A dated event with no collection-status claim cannot be reported as a
+    known negative for the OTHER signals: the search claim is what says the
+    company was checked at all. (In replay the point-in-time gate can drop
+    the searched claim while events remain visible — that must read as
+    "not yet investigated", per `signals_from_facts`.)"""
+    inputs = derive([event_ev("layoff", EVENT_AT)])
     assert inputs.material_negative_event is UNKNOWN
-    assert inputs.freeze_or_pause is True
+    assert inputs.freeze_or_pause is UNKNOWN
     assert inputs.last_material_event_at is UNKNOWN
+
+
+def test_freeze_claim_sets_only_the_freeze_signal():
+    inputs = derive([searched_ev(), event_ev("hiring_freeze", EVENT_AT, materiality="material")])
+    assert inputs.freeze_or_pause is True
+    assert inputs.material_negative_event is False
+    assert inputs.last_material_event_at is None
+
+
+def test_minor_layoff_does_not_set_material_negative_event():
+    inputs = derive([searched_ev(), event_ev("layoff", EVENT_AT, materiality="minor")])
+    assert inputs.material_negative_event is False
+    assert inputs.last_material_event_at is None
+
+
+def test_unparseable_materiality_on_a_layoff_fails_safe_to_material():
+    """A `value` this probe version did not write must not silently downgrade a
+    layoff to `minor` — that would drop a `wait` on real bad news."""
+    inputs = derive([searched_ev(), event_ev("layoff", EVENT_AT, value="Acme lays off 200")])
+    assert inputs.material_negative_event is True
+    assert inputs.last_material_event_at == EVENT_AT
+
+
+def test_event_outside_the_window_is_ignored():
+    stale = NOW - timedelta(days=THRESHOLDS.negative_event_window_days + 5)
+    inputs = derive([searched_ev(), event_ev("layoff", stale)])
+    assert inputs.material_negative_event is False
+    assert inputs.last_material_event_at is None
+
+
+def test_last_material_event_at_is_the_most_recent_qualifying_event():
+    # Midnight UTC: the signal is day-granular (`company_events` stores a
+    # calendar date), so a claim's time-of-day never survives into the input.
+    older = EVENT_AT - timedelta(days=40)
+    newer = EVENT_AT - timedelta(days=5)
+    inputs = derive(
+        [
+            searched_ev(),
+            event_ev("layoff", older, eid="e-old"),
+            event_ev("shutdown", newer, eid="e-new"),
+        ]
+    )
+    assert inputs.last_material_event_at == newer
+
+
+def test_event_claims_from_another_probe_are_ignored():
+    """`claim_type` alone must not feed the rule — the probe has to be the one
+    spec.md §5 names as the source."""
+    impostor = ev(
+        "e-x",
+        "layoff",
+        probe="board_snapshot",
+        value=format_event_claim_value("material", "not from company_events"),
+        source_event_at=EVENT_AT,
+    )
+    assert derive([searched_ev(), impostor]).material_negative_event is False
+
+
+def test_material_event_claims_cites_only_the_qualifying_claims():
+    """The explanation helper selects exactly the claims that set the boolean."""
+    evidence = [
+        searched_ev(),
+        event_ev("funding", EVENT_AT, eid="e-fund", materiality="minor"),
+        event_ev("layoff", EVENT_AT, eid="e-layoff"),
+        event_ev("hiring_freeze", EVENT_AT, eid="e-freeze"),
+    ]
+    assert [c.id for c in material_event_claims(evidence, NOW, cfg=THRESHOLDS)] == ["e-layoff"]
+    assert [c.id for c in freeze_event_claims(evidence, NOW, cfg=THRESHOLDS)] == ["e-freeze"]
+
+
+def test_event_citation_helpers_are_empty_when_the_signal_is_false():
+    evidence = [searched_ev(), event_ev("funding", EVENT_AT, materiality="minor")]
+    assert material_event_claims(evidence, NOW, cfg=THRESHOLDS) == []
+    assert freeze_event_claims(evidence, NOW, cfg=THRESHOLDS) == []
 
 
 @pytest.mark.parametrize("pattern", ["repeated_unchanged", "changed", "none", UNKNOWN])
@@ -398,7 +539,7 @@ def test_corroborating_hiring_signal_keyword_injection():
 
 def test_naive_now_is_rejected():
     with pytest.raises(ValueError, match="timezone-aware"):
-        derive_policy_inputs([], None, None, datetime(2026, 9, 7), cfg=THRESHOLDS)
+        derive_policy_inputs([], None, datetime(2026, 9, 7), cfg=THRESHOLDS)
 
 
 def test_unpopulated_is_empty_for_a_fully_populated_case():

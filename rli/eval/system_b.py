@@ -156,17 +156,30 @@ execute a probe A would consider ineligible (no usable history, no
 
 It is filtered through the SAME neutralized gate System A uses
 (`rli.eval.system_a.ALL_DYNAMIC_INPUTS`), not through the case's actual
-unpopulated set. Two reasons, and the first is decisive:
+unpopulated set. There is now exactly ONE reason for that:
 
-* Using the real unpopulated set would drop `company_events` for every
-  company whose events have already been collected — because the case state
-  pre-populates both of its inputs from the local store (see
-  `rli.eval.case`'s judgment call) — which is exactly the case R2 and R3
-  route it for, and would leave a P3a `wait` with no evidence to cite.
 * B's routing tree already encodes its own "is this question still open?"
   logic, explicitly and visibly (R3's condition, R4's condition). Applying
   the registry's version on top would mean the same judgment is made twice,
   in two places, with no way to tell which one dropped a probe.
+
+A second reason used to stand in front of that one and was described as
+decisive: the real unpopulated set would have dropped `company_events` for
+every company whose events had already been collected, because
+`rli.eval.case` pre-populated that probe's policy inputs from the local
+event store before any probe ran — which is exactly the case R1/R3 route it
+for, and would have left a `wait` with no evidence to cite. **That reason is
+gone.** The pre-population is deleted (see `rli.eval.case`'s judgment call
+for why it was wrong), so the three event inputs now stay UNKNOWN until the
+`company_events` probe runs and the real unpopulated set would keep the
+probe eligible.
+
+The gate is deliberately left as it is anyway. Switching B to the real
+unpopulated set would change which probes B runs, and B is the fixed rule
+baseline the whole spec.md §6 comparison is measured against; moving it is a
+change to the experiment, not a cleanup, and it would make B's runs
+incomparable to every A/B/C number already recorded. The remaining bullet
+stands on its own merits and is the whole justification today.
 
 Duplicates are dropped preserving first-mention order, and the surviving
 list is capped at `[thresholds].max_dynamic_steps`. **A is uncapped and B is
@@ -578,6 +591,7 @@ def run_system_b(
             replay=replay,
             sleep=sleep,
             use_tool_cache=use_tool_cache,
+            collection_status_csv=collection_status_csv,
         ) as probes:
             # Recorded before anything else, so even a run that fails
             # mid-investigation says which rules produced it.
@@ -589,7 +603,6 @@ def run_system_b(
                 url=url,
                 now=moment,
                 probes=probes,
-                collection_status_csv=collection_status_csv,
             )
             run.set_posting_id(case.posting_id)
 

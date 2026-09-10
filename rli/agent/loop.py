@@ -940,8 +940,9 @@ def run_system_c(
         run_id: `runs.id` override, for deterministic tests/replay.
         sleep: injected into the retry backoff and the per-host rate limiter.
         use_tool_cache: `False` disconnects `tool_cache` entirely.
-        collection_status_csv: override for the pre-collected company-event
-            status file (`rli.eval.case._event_signals`).
+        collection_status_csv: pins the pre-collected company-event
+            collection-status file for this run's `ProbeContext`, i.e. for the
+            `company_events` probe (`rli.eval.runner.open_system_runner`).
         max_steps: override for `Budget.max_dynamic_steps` — spec.md §4's
             "at most `4` dynamic probe steps" — for a cheap smoke run,
             WITHOUT moving `[agent]`/`[thresholds]` for every other system.
@@ -978,7 +979,14 @@ def run_system_c(
         replay_at=replay_at,
     ) as run:
         with open_system_runner(
-            conn, cfg, run, moment, replay=hook, sleep=sleep, use_tool_cache=use_tool_cache
+            conn,
+            cfg,
+            run,
+            moment,
+            replay=hook,
+            sleep=sleep,
+            use_tool_cache=use_tool_cache,
+            collection_status_csv=collection_status_csv,
         ) as probes:
             # Recorded before anything else, exactly as System B records its
             # rules hash, so even a run that fails mid-investigation says
@@ -998,7 +1006,6 @@ def run_system_c(
                 url=url,
                 now=moment,
                 probes=probes,
-                collection_status_csv=collection_status_csv,
             )
             run.set_posting_id(case.posting_id)
 

@@ -10,7 +10,6 @@ routing/policy layers those two systems add on top.
 
 from __future__ import annotations
 
-import importlib
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -18,7 +17,6 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
-import pytest
 import respx
 from test_eval_helpers import COMPANY, add_capture, add_posting, evidence_rows, job
 
@@ -31,6 +29,7 @@ from rli.eval.case import (
     extend_case_state,
 )
 from rli.eval.runner import STEP_PROBE_SKIPPED, ProbeRunner, Run
+from rli.events.policy_signals import CLAIM_EVENTS_SEARCHED
 from rli.events.store import (
     CollectionStatus,
     CompanyEvent,
@@ -53,6 +52,12 @@ from rli.probes.company_events import CompanyEventsProbe
 NOW = datetime(2026, 9, 7, tzinfo=UTC)
 REFRESH_MATCH_DAYS = 3  # cfg.thresholds.refresh_match_days default (config.toml)
 
+#: A collection-status path that deliberately does not exist. A missing file
+#: degrades to an empty status map — "no company has been searched yet" — so
+#: pinning it keeps every test in this file independent of the real
+#: `data/events/collection_status.csv` in the working checkout.
+NO_COLLECTION_STATUS = "/nonexistent/collection_status.csv"
+
 GH_JOB = {
     "id": 5001,
     "title": "Backend Engineer",
@@ -71,7 +76,12 @@ GH_BOARD_EMPTY = {"jobs": []}
 
 @contextmanager
 def _run_and_probes(
-    conn: sqlite3.Connection, cfg: Config, *, system: str = "A", now: datetime = NOW
+    conn: sqlite3.Connection,
+    cfg: Config,
+    *,
+    system: str = "A",
+    now: datetime = NOW,
+    collection_status_csv: str | Path | None = NO_COLLECTION_STATUS,
 ) -> Iterator[tuple[Run, ProbeRunner]]:
     """Build a `Run` + `ProbeRunner` pair the way `run_system_a`/`b` do.
 
@@ -81,6 +91,13 @@ def _run_and_probes(
     module `NOW` but is overridable so a refresh-match test can put the run
     clock BEFORE a detecting capture (see the "available_at is a max" tests
     below) without disturbing every other test in this file.
+
+    `collection_status_csv` pins the `company_events` collection state on the
+    `ProbeContext` — the run-level handle the probe reads (see
+    `rli.probes.base.ProbeContext`). It defaults to a path that does not
+    exist, i.e. "no company has been searched yet", so no test in this file
+    accidentally depends on whatever `data/events/collection_status.csv`
+    happens to contain in the working checkout.
     """
     from rli.eval.runner import open_probe_runner
 
@@ -93,7 +110,13 @@ def _run_and_probes(
         started_at=now,
     ) as run:
         with open_probe_runner(
-            conn, cfg, run, now, sleep=lambda _s: None, use_tool_cache=False
+            conn,
+            cfg,
+            run,
+            now,
+            sleep=lambda _s: None,
+            use_tool_cache=False,
+            collection_status_csv=collection_status_csv,
         ) as probes:
             yield run, probes
 
@@ -288,15 +311,17 @@ def test_generic_ats_unresolved_identity_yields_no_case_file(
 
 
 @respx.mock
-def test_extend_case_state_appends_company_events_evidence_and_preserves_signals(
+def test_extend_case_state_appends_company_events_evidence(
     conn: sqlite3.Connection, cfg: Config
 ) -> None:
-    """`company_events` evidence is appended; pre-populated UNKNOWN signals hold.
+    """`company_events` evidence is appended; an UNSEARCHED company stays UNKNOWN.
 
-    Neither `acme.com` nor `globex.com` appears in the real
-    `data/events/collection_status.csv`, so `derive_policy_signals` reports
-    both booleans UNKNOWN both before and after the probe runs — the case
-    state's docstring says the two must "agree by construction".
+    The run is pinned at `NO_COLLECTION_STATUS`, so the probe emits no
+    `company_events_searched` claim — which is exactly what must keep all
+    three event inputs UNKNOWN even though a (minor, non-negative) event
+    claim WAS appended. "We hold an event for this company" is not the same
+    statement as "we searched this company", and only the latter can turn a
+    signal into a known `False`.
     """
     add_posting(conn, job_id="5001", first_observed=NOW, last_seen_open=NOW)
     # A real event so the probe has at least one claim to append.
@@ -327,7 +352,11 @@ def test_extend_case_state_appends_company_events_evidence_and_preserves_signals
         case = build_case_state(
             conn, cfg, url="https://boards.greenhouse.io/acme/jobs/5001", now=NOW, probes=probes
         )
-        assert case.event_signals == (UNKNOWN, UNKNOWN, UNKNOWN)
+        # The always-run pair reads no event store at all any more, so the
+        # three event inputs are UNKNOWN here by construction.
+        assert case.inputs.material_negative_event is UNKNOWN
+        assert case.inputs.freeze_or_pause is UNKNOWN
+        assert case.inputs.last_material_event_at is UNKNOWN
         before = len(case.evidence)
 
         extend_case_state(case, [CompanyEventsProbe], probes=probes)
@@ -336,10 +365,9 @@ def test_extend_case_state_appends_company_events_evidence_and_preserves_signals
     added = case.evidence[-1]
     assert added.probe == "company_events"
     assert added.claim_type == "funding"
-    # The probe's own answer replaces the pre-populated one; they agree.
-    assert case.event_signals == (UNKNOWN, UNKNOWN, UNKNOWN)
-    assert case.inputs.material_negative_event == UNKNOWN
-    assert case.inputs.freeze_or_pause == UNKNOWN
+    assert case.inputs.material_negative_event is UNKNOWN
+    assert case.inputs.freeze_or_pause is UNKNOWN
+    assert case.inputs.last_material_event_at is UNKNOWN
 
 
 @respx.mock
@@ -702,7 +730,7 @@ def test_hash_change_without_an_updated_at_claim_yields_no_refresh_claim(
 
 @respx.mock
 def test_material_event_after_last_refresh_forces_wait_on_p3c(
-    conn: sqlite3.Connection, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    conn: sqlite3.Connection, cfg: Config, tmp_path: Path
 ) -> None:
     """A 17-month-old open posting + a material layoff after the last refresh -> `wait`/P3c.
 
@@ -711,25 +739,15 @@ def test_material_event_after_last_refresh_forces_wait_on_p3c(
     `conn`, with the Greenhouse endpoints respx-mocked — no fallback to a
     lower-level `derive_policy_inputs`/`decide` call was needed.
 
-    Two `collection_status.csv` views are used deliberately:
-
-    * `build_case_state` is pointed at a status file that does NOT mention
-      this company (a nonexistent path degrades to "no company has been
-      investigated yet" — see `rli.eval.case._event_signals`), so its
-      pre-population leaves `material_negative_event` UNKNOWN. This is what
-      makes assertion (a) meaningful: the question really is still open
-      before `company_events` has run.
-    * `extend_case_state` runs `CompanyEventsProbe` through the ordinary
-      dynamic-probe path (`rli.probes.registry.build_args`), which always
-      builds `CompanyEventsArgs` with `collection_status_csv=None` — i.e. it
-      always reads `rli.probes.company_events.DEFAULT_COLLECTION_STATUS_CSV`
-      (see that module's docstring; there is no override plumbed through
-      `extend_case_state`/`build_args` the way `build_case_state` has one).
-      To exercise the probe without touching the real repo file, that module
-      constant is monkeypatched to a status file that HAS since recorded
-      this company as searched — the same "collection ran between the case
-      being opened and the probe being executed" story a real deployment
-      would tell.
+    ONE `collection_status.csv` is pinned, on the `ProbeContext`, and it
+    records this company as searched. That is all the plumbing this needs
+    now: `build_case_state` reads no event store at all, so assertion (a) —
+    "the question is still open before `company_events` has run" — holds by
+    construction rather than by pointing the case builder at a file that
+    happens to omit the company. The probe reads the pinned file through
+    `ctx.collection_status_csv` (`rli.probes.company_events`), which is also
+    why nothing here has to monkeypatch that module's default constant any
+    more.
     """
     company_id = COMPANY
     old_publish = NOW - timedelta(days=520)  # ~17 months
@@ -768,23 +786,20 @@ def test_material_event_after_last_refresh_forces_wait_on_p3c(
         ],
         populated_csv,
     )
-    not_yet_collected_csv = tmp_path / "collection_status_not_yet_written.csv"
 
     gh_job = _gh_job(job_id, first_published=to_utc_z(old_publish))
     _mock_greenhouse(job_id, gh_job)
 
-    with _run_and_probes(conn, cfg) as (run, probes):
+    with _run_and_probes(conn, cfg, collection_status_csv=str(populated_csv)) as (run, probes):
         case = build_case_state(
             conn,
             cfg,
             url=f"https://boards.greenhouse.io/acme/jobs/{job_id}",
             now=NOW,
             probes=probes,
-            collection_status_csv=str(not_yet_collected_csv),
         )
 
         # -- (a) BEFORE company_events has run ----------------------------
-        assert case.event_signals == (UNKNOWN, UNKNOWN, UNKNOWN)
         assert case.inputs.material_negative_event is UNKNOWN
         last_refreshed = last_publish_or_refresh(case.evidence)
         quality_before = evidence_quality_detail(case.evidence, case.inputs, case.failures, cfg)
@@ -809,24 +824,21 @@ def test_material_event_after_last_refresh_forces_wait_on_p3c(
         assert "material_negative_event" in changeable_before
 
         # -- (b) AFTER company_events has run, via extend_case_state ------
-        # `rli.probes.__init__` re-exports the FUNCTION `company_events`
-        # under the same name as this submodule (`from
-        # rli.probes.company_events import ..., company_events`), which
-        # shadows the submodule on `rli.probes.company_events` ATTRIBUTE
-        # access — both `import rli.probes.company_events as x` and
-        # `monkeypatch.setattr("rli.probes.company_events...", ...)` walk
-        # that attribute chain and would silently patch the function instead.
-        # `importlib.import_module` looks the submodule up in `sys.modules`
-        # by its fully-qualified name instead, sidestepping the shadowing.
-        monkeypatch.setattr(
-            importlib.import_module("rli.probes.company_events"),
-            "DEFAULT_COLLECTION_STATUS_CSV",
-            populated_csv,
-        )
         extend_case_state(case, [CompanyEventsProbe], probes=probes)
 
     assert case.inputs.material_negative_event is True
     assert isinstance(case.inputs.last_material_event_at, datetime)
+
+    # And the input is EVIDENCE-BACKED: the layoff claim the policy read is
+    # in the case's evidence, carrying its materiality prefix. This is the
+    # regression guard for the bug this pipeline was rebuilt around — a
+    # `wait` on P3c with no layoff evidence behind it.
+    layoffs = [c for c in case.evidence if c.probe == "company_events" and c.claim_type == "layoff"]
+    assert len(layoffs) == 1
+    assert layoffs[0].value.startswith("material: ")
+    assert any(
+        c.claim_type == CLAIM_EVENTS_SEARCHED and c.probe == "company_events" for c in case.evidence
+    )
 
     last_refreshed_after = last_publish_or_refresh(case.evidence)
     quality_after = evidence_quality_detail(case.evidence, case.inputs, case.failures, cfg)

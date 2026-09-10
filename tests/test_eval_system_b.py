@@ -12,10 +12,19 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import httpx
 import respx
-from test_eval_helpers import COMPANY, add_capture, add_posting, job
+from test_eval_helpers import (
+    COMPANY,
+    add_capture,
+    add_company_event,
+    add_posting,
+    decision_branch,
+    job,
+    write_status_csv,
+)
 
 from rli.config import Config
 from rli.eval.runner import STEP_ROUTE, STEP_SYSTEM_VERSION
@@ -283,3 +292,72 @@ def test_b_rules_hash_depends_on_team_signal_enabled(cfg: Config) -> None:
 
 def test_b_version_label_is_frozen_string() -> None:
     assert B_VERSION == "b1"
+
+
+# ---------------------------------------------------------------------------
+# spec.md §5 Amendment 2026-09-10: P3c, end to end and evidence-cited
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_system_b_waits_on_a_material_layoff_after_the_last_refresh(
+    conn: sqlite3.Connection, cfg: Config, tmp_path: Path
+) -> None:
+    """The same P3c scenario `tests/test_eval_system_a.py` runs, through B.
+
+    B reaches `company_events` by ROUTING it by name rather than through the
+    registry's unresolved-question gate, so this is the check that B's route
+    still delivers the evidence the P3c `wait` is explained by — and, since B
+    and A share one frozen policy (spec.md §6), that both systems land on the
+    same branch for the same corpus.
+
+    The layoff ids must appear among the decision's citations. That is the
+    assertion that would have failed before the events pipeline moved onto
+    claims: the probe ran, its `company_events` record contributed nothing
+    the policy read, and the `wait` came from an input nobody could cite.
+    """
+    job_id = "7900"
+    url = f"https://boards.greenhouse.io/acme/jobs/{job_id}"
+
+    add_posting(
+        conn,
+        job_id=job_id,
+        first_observed=NOW - timedelta(days=520),
+        last_seen_open=NOW,
+    )
+    for offset in (520, 300, 120, 40, 2):
+        add_capture(conn, NOW - timedelta(days=offset), [job(job_id)], company_id=COMPANY)
+    add_company_event(
+        conn,
+        event_date=(NOW - timedelta(days=18)).date(),
+        available_at=NOW - timedelta(days=18),
+    )
+    status_csv = write_status_csv(tmp_path / "collection_status.csv", NOW - timedelta(days=1))
+
+    _mock_greenhouse(job_id, _gh_job(job_id, first_published_days_ago=520))
+
+    result = run_system_b(
+        conn,
+        cfg,
+        url,
+        now=NOW,
+        sleep=lambda _s: None,
+        use_tool_cache=False,
+        collection_status_csv=status_csv,
+    )
+
+    assert "company_events" in result.probes_run
+    assert result.decision.recommended_action == "wait"
+    assert decision_branch(conn, result.run_id) == "P3c_material_event_unrefreshed"
+
+    layoff_ids = {
+        row["id"]
+        for row in conn.execute(
+            "SELECT id FROM evidence WHERE run_id = ? AND probe = 'company_events' "
+            "AND claim_type = 'layoff'",
+            (result.run_id,),
+        ).fetchall()
+    }
+    assert layoff_ids
+    cited = {eid for reason in result.decision.reason for eid in reason.evidence_ids}
+    assert layoff_ids <= cited

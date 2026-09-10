@@ -17,8 +17,15 @@ faraway anchor would make easy to get wrong by accident.
 from __future__ import annotations
 
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from pathlib import Path
 
+from rli.events.store import (
+    CollectionStatus,
+    CompanyEvent,
+    upsert_event,
+    write_collection_status_csv,
+)
 from rli.models.time import to_utc_z
 from rli.probes.board_snapshot import BoardJob
 from rli.probes.persist import save_board_snapshot
@@ -132,6 +139,84 @@ def add_posting(
     )
     conn.commit()
     return resolved_id
+
+
+def add_company_event(
+    conn: sqlite3.Connection,
+    *,
+    event_date: date,
+    available_at: datetime,
+    company_id: str = COMPANY,
+    event_type: str = "layoff",
+    headline: str = "Acme lays off 20% of staff",
+    materiality: str = "material",
+    source_url: str = "https://news.example.com/acme-layoff",
+) -> None:
+    """Insert one `company_events` row (creating the `companies` row it needs).
+
+    `available_at` is the article's own publish time, not collection time —
+    see `rli.events.store`'s module docstring for why that is not backdating
+    and why point-in-time replay depends on it.
+    """
+    add_company(conn, company_id)
+    upsert_event(
+        conn,
+        CompanyEvent(
+            company_id=company_id,
+            event_type=event_type,  # type: ignore[arg-type]
+            event_date=event_date,
+            available_at=available_at,
+            source_url=source_url,
+            headline=headline,
+            materiality=materiality,  # type: ignore[arg-type]
+            collected_at=available_at,
+        ),
+    )
+
+
+def write_status_csv(
+    path: Path, searched_at: datetime | None, *, company_id: str = COMPANY, events_found: int = 1
+) -> str:
+    """Write a `collection_status.csv` and return its path as a string.
+
+    `searched_at=None` writes an EMPTY file: "collection has run, but not for
+    this company", which `rli.probes.company_events` reads as UNKNOWN and for
+    which it emits no `company_events_searched` claim. Pin one of these on the
+    run's `ProbeContext` (`collection_status_csv=`) so a test never depends on
+    what the real `data/events/collection_status.csv` happens to contain.
+    """
+    rows = (
+        []
+        if searched_at is None
+        else [
+            CollectionStatus(
+                company_id=company_id,
+                searched_at=searched_at,
+                queries_run=5,
+                events_found=events_found,
+            )
+        ]
+    )
+    write_collection_status_csv(rows, path)
+    return str(path)
+
+
+def decision_branch(conn: sqlite3.Connection, run_id: str) -> str:
+    """The spec.md §5 policy branch this run recorded, from its canonical trace.
+
+    `rli.eval.runner.decide_and_finish` writes
+    `policy_decision:<branch>:<quality rule>` as a controller step (spec.md §7
+    makes `run_steps` the canonical trace), and the branch is deliberately not
+    a field on `Decision` — so a test that wants to pin WHICH §5 row fired
+    reads it from there rather than re-deriving it from the inputs, which
+    would just be a second copy of the policy.
+    """
+    row = conn.execute(
+        "SELECT decision_type FROM run_steps WHERE run_id = ? AND decision_type LIKE ?",
+        (run_id, "policy_decision:%"),
+    ).fetchone()
+    assert row is not None, f"no policy_decision step for run {run_id!r}"
+    return str(row["decision_type"]).split(":")[1]
 
 
 def run_row(conn: sqlite3.Connection, run_id: str) -> sqlite3.Row:

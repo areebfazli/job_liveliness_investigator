@@ -68,16 +68,22 @@ codebase put live Python objects into it, not only JSON scalars:
   reads `job.job_id` off them — a plain JSON round-trip would hand it dicts
   and raise `AttributeError`;
 * `company_events` returns `data["material_negative_event"]` /
-  `data["freeze_or_pause"]` as `bool | rli.models.policy_inputs.Unknown`,
-  and `rli.eval.case.extend_case_state` feeds them straight into
-  `derive_policy_inputs`. A plain JSON round-trip would turn the UNKNOWN
-  sentinel into the string `"__unknown__"`, which `PolicyInputs` rejects —
-  and, had it not rejected it, a truthy string would have read as a known
-  `True`, i.e. a fabricated layoff. Its third signal,
-  `data["last_material_event_at"]`, needs no new codec entry: the probe
-  renders a real date as an ISO-Z STRING and passes UNKNOWN / `None`
-  through, so the envelope already covers the only non-JSON value in it
-  (`_UNKNOWN_TYPE`), and `extend_case_state` parses the string back.
+  `data["freeze_or_pause"]` as `bool | rli.models.policy_inputs.Unknown`.
+  A plain JSON round-trip would turn the UNKNOWN sentinel into the string
+  `"__unknown__"`, which `PolicyInputs` rejects — and, had it not rejected
+  it, a truthy string would have read as a known `True`, i.e. a fabricated
+  layoff. Its third signal, `data["last_material_event_at"]`, needs no new
+  codec entry: the probe renders a real date as an ISO-Z STRING and passes
+  UNKNOWN / `None` through, so the envelope already covers the only
+  non-JSON value in it (`_UNKNOWN_TYPE`).
+
+  The DECISION no longer reads any of the three — `rli.policy.inputs`
+  derives them from this probe's `evidence` claims, which is what makes the
+  policy's answer and the probe's trace incapable of disagreeing — but the
+  codec entry stays, and must: `data` is what a reader of
+  `replay_probe_results` inspects to see what the probe found at `T`, and
+  silently corrupting `UNKNOWN` into a truthy string there would misinform
+  exactly the person auditing a `wait`.
 
 So the store uses a small typed-envelope codec (`_encode` / `_decode`)
 rather than bare `json.dumps`: `{"__rli_type__": "probe_claim", "v": {...}}`
@@ -121,6 +127,7 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict
@@ -623,6 +630,7 @@ def open_replay_probe_runner(
     store: ReplayProbeStore,
     posting_id: str,
     archive_claims: Sequence[ProbeClaim] = (),
+    collection_status_csv: str | Path | None = None,
 ) -> Iterator[ReplayProbeRunner]:
     """Build a `ReplayProbeRunner` (and its forbidden net clients), closing them.
 
@@ -630,6 +638,15 @@ def open_replay_probe_runner(
     pool can never make a call, and any attempt to make one is mirrored into
     `run_steps` as a `replay_violation:net_call` controller step so the
     leakage checker sees it in the canonical trace.
+
+    `collection_status_csv` pins the pre-collected `company_events`
+    collection state on the `ProbeContext`, exactly as `open_probe_runner`
+    does. It matters more here than live: it must be the SAME file the
+    dataset was built against, or a replayed `company_events` would answer
+    "had we searched this company by T?" from a different corpus than the one
+    the record was written from. It is not part of `args_hash` (see
+    `rli.probes.base.ProbeContext`), which is precisely what keeps a stored
+    record findable from any checkout.
     """
     pool = ReplayNetPool(cfg=cfg)
 
@@ -648,6 +665,7 @@ def open_replay_probe_runner(
         config=cfg,
         net_client_factory=pool.client_for,
         now=lambda: now,
+        collection_status_csv=collection_status_csv,
     )
     try:
         yield ReplayProbeRunner(
@@ -672,6 +690,7 @@ def replay_hook(
     store: ReplayProbeStore,
     posting_id: str,
     archive_claims: Sequence[ProbeClaim] = (),
+    collection_status_csv: str | Path | None = None,
 ) -> ReplayHook:
     """The `ReplayHook` `run_system_a` / `run_system_b` accept (spec.md §6).
 
@@ -680,6 +699,15 @@ def replay_hook(
     `runs.config_hash` already carries the dataset, but spec.md §7 makes
     `run_steps` the canonical trace, and a reader walking one run should not
     have to join to `runs` to learn which dataset produced it.
+
+    `collection_status_csv` is captured in the closure, and this is the ONLY
+    way it can reach a replayed run's probes: `ReplayHook.open_runner` has a
+    fixed `(conn, cfg, run, now)` signature — deliberately, so `rli.eval`
+    never has to know what a replay needs — so the system's own
+    `collection_status_csv=` argument cannot be forwarded into it. A replayed
+    system therefore uses the file pinned HERE, by whoever built the hook
+    (`rli.replay.run._replay_one`), which is the right authority: it is the
+    same value the dataset was built with.
     """
 
     @contextmanager
@@ -702,6 +730,7 @@ def replay_hook(
             store=store,
             posting_id=posting_id,
             archive_claims=archive_claims,
+            collection_status_csv=collection_status_csv,
         ) as probes:
             probes.note(f"{STEP_REPLAY_DATASET}:{replay.dataset_id}")
             yield probes

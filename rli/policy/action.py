@@ -331,8 +331,10 @@ class PolicyThresholds(BaseModel):
     # UPSTREAM, in `rli.eval.case`, which is what turns the pair into the
     # `refreshed_at` claim the policy then reads.
     # `negative_event_window_days` — the lookback applied by
-    # `rli.events.policy_signals.derive_policy_signals` before
-    # `material_negative_event` / `last_material_event_at` are ever set.
+    # `rli.events.policy_signals.signals_from_facts` (reached from
+    # `rli.policy.inputs.derive_policy_inputs` over the `company_events`
+    # claims, and from the probe itself) before `material_negative_event` /
+    # `last_material_event_at` are ever set.
     #
     # Both are nevertheless part of `fingerprint()`: they CHANGE DECISIONS.
     # `policy_version()` answers "would this system decide differently?", and

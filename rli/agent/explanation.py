@@ -26,6 +26,50 @@ citation rule exists to catch. So citations are validated against the run's
 real evidence ids, invalid ones are dropped and counted, and a reason left
 with no valid citation is dropped entirely.
 
+--------------------------------------------------------------------------
+JUDGMENT CALL: an existing id is not the same as a RELEVANT id
+--------------------------------------------------------------------------
+
+"Cites an id that exists" and "cites evidence the reason is actually about"
+are different claims, and the existence check above only makes the first
+one. A model can cite `e3` — a real, run-produced `posting_state` evidence
+item — while its reason text is about a company layoff; that reason has a
+citation that resolves, and no evidence whatsoever for what it says. This is
+not a hypothetical: it is the failure mode this guard was added to catch
+after a real run published exactly that sentence.
+
+So, after the existence/duplicate filtering above, a second, independent
+check asks whether the citation SUPPORTS the claim: `rli.policy.
+claim_families.classify_reason` reads the reason's own TEXT and returns the
+set of claim families it looks like it is about (e.g. a reason mentioning
+"layoff" classifies as `company_event`). The reason survives only if at
+least one of its surviving cited evidence items has a `claim_type` belonging
+to one of those families — i.e. the citation is not merely real, but real
+AND on-topic. A reason that fails this is dropped and counted as an
+UNSUPPORTED reason, distinct from an INVALID (nonexistent-id) one, because
+the fix for each is different: an invalid id is a fabrication; an
+unsupported one is a real citation attached to the wrong sentence.
+
+This reuses `rli.policy.claim_families` rather than re-deriving the same
+classification here, for the same reason `rli.agent.investigator`'s helpers
+are imported rather than restated (see below): `rli.eval.metrics` already
+depends on this exact classifier for its own `CitationSupport` data-quality
+figures, and a second copy of the family/keyword tables would be two
+lexicons that must agree forever about what "a reason about a layoff" means.
+`rli.policy.claim_families` is a small, dependency-light module for exactly
+this reason — the agent layer can depend on it without pulling in
+`rli.eval.metrics`'s SQL-reading, report-building machinery.
+
+The classifier is deliberately crude (a keyword substring match — see its
+docstring), and that crudeness is treated as a first-class case here, not an
+afterthought: a reason whose text matches NO known family is KEPT regardless
+of what it cites. The alternative — dropping anything the lexicon cannot
+classify — would silently punish a real, well-supported reason for a gap in
+a keyword list, which is a lexicon maintenance problem, not a citation
+integrity problem, and spec.md §9 cares about the latter. `rli.eval.metrics`
+makes the identical call for the identical reason, counting such reasons as
+`reasons_unclassified` — neither supported nor unsupported.
+
 There are two ways into this module. `explain` makes the call;
 `skip_explanation` publishes the deterministic floor WITHOUT making it, for
 when `rli.agent.loop` finds no room under spec.md §4's run-level cost or
@@ -125,6 +169,8 @@ Other judgment calls
   `kind:qualifier` convention) and the human-readable breakdown is in
   `error` — which is free text, and which a dropped citation legitimately
   is: something went wrong, in the model's output rather than in a probe.
+  `citation_unsupported:<n>` follows the identical convention, in its own
+  row, for the support guard described above.
 * **`ReasonDraft`/`ExplanationOutput` are `extra="forbid"` but not
   `frozen=True`**, for the reason `rli.agent.investigator` records for its
   own output models: `extra="forbid"` is what turns an invented field into
@@ -154,8 +200,10 @@ from rli.config import Config
 from rli.llm.client import LLMClient, LLMError, LLMSchemaError, UntrustedBlock
 from rli.llm.prompts import build_explanation_prompt, sanitize_untrusted
 from rli.models.decision import Decision, ReasonItem
+from rli.models.evidence import EvidenceItem
 from rli.models.policy_inputs import PolicyInputs
 from rli.models.time import to_utc_z
+from rli.policy.claim_families import CLAIM_FAMILIES, classify_reason
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from rli.eval.case import CaseState
@@ -166,6 +214,7 @@ __all__ = [
     "BUDGET_FALLBACKS",
     "MAX_HYPOTHESES",
     "STEP_CITATION_INVALID",
+    "STEP_CITATION_UNSUPPORTED",
     "STEP_EXPLANATION_FALLBACK",
     "ExplanationOutput",
     "ReasonDraft",
@@ -182,12 +231,24 @@ MAX_HYPOTHESES = 5
 # `rli.agent.loop`, which owns the trace vocabulary both model-calling
 # modules share.
 STEP_CITATION_INVALID = "citation_invalid"  # component='controller'
+# A reason whose cited evidence exists but does not belong to a claim family
+# the reason's own text is about — see the module docstring's judgment call.
+# Distinct from `STEP_CITATION_INVALID`: that one is a fabricated id, this
+# one is a real id attached to the wrong sentence.
+STEP_CITATION_UNSUPPORTED = "citation_unsupported"  # component='controller'
 STEP_EXPLANATION_FALLBACK = "explanation_fallback"  # component='controller'
 
 # Why the deterministic reasons were used instead of the model's.
 _FALLBACK_LLM_ERROR = "llm_error"
 _FALLBACK_SCHEMA_ERROR = "schema_error"
 _FALLBACK_ALL_CITATIONS_INVALID = "all_citations_invalid"
+# Sibling of `_FALLBACK_ALL_CITATIONS_INVALID` for the wipeout case where at
+# least one drop was a SUPPORT drop (an existing-but-irrelevant citation)
+# rather than purely fabricated ids. "invalid" specifically names a
+# nonexistent id; using it for a support-only wipeout would misdescribe what
+# actually happened. Chosen whenever the wipeout involved any support drops
+# at all, even mixed with invalid-id drops — see `explain`'s judgment call.
+_FALLBACK_ALL_CITATIONS_UNSUPPORTED = "all_citations_unsupported"
 _FALLBACK_NO_REASONS = "no_reasons"
 # The call was never made: `rli.agent.loop` found no room for it under
 # spec.md §4's run-level caps. Named for the cap that bound, matching the
@@ -397,15 +458,39 @@ class _CitationReport(BaseModel):
     invalid_ids: int = 0
     duplicate_ids: int = 0
     dropped_reasons: int = 0
+    #: Reasons dropped by the SUPPORT guard below: every citation existed,
+    #: but none of the surviving cited evidence items belonged to a claim
+    #: family the reason's own text classified as. Counted separately from
+    #: `dropped_reasons` (which is the existence/empty-text drop) because the
+    #: two are different failures with different fixes — see the module
+    #: docstring's judgment call.
+    unsupported_reasons: int = 0
+    #: The claim families expected (from the reason's text) vs. what the
+    #: surviving citations actually carried, one entry per unsupported
+    #: reason — feeds the `STEP_CITATION_UNSUPPORTED` row's `error` text.
+    unsupported_detail: tuple[str, ...] = ()
 
 
-def _validate_citations(drafts: Sequence[ReasonDraft], evidence_ids: set[str]) -> _CitationReport:
-    """Keep only reasons whose citations exist; count everything discarded.
+def _validate_citations(
+    drafts: Sequence[ReasonDraft], evidence: Sequence[EvidenceItem]
+) -> _CitationReport:
+    """Keep only reasons whose citations exist AND are relevant; count everything discarded.
 
-    Per drafted reason: cited ids are filtered to those that actually exist
-    in this run's evidence, PRESERVING the model's order and de-duplicating.
-    A reason left with no valid id — or with no text — is dropped entirely,
-    because spec.md §9 makes an uncited user-facing reason unpublishable.
+    Per drafted reason, in two passes:
+
+    1. **Existence.** Cited ids are filtered to those that actually exist in
+       this run's evidence, PRESERVING the model's order and de-duplicating.
+       A reason left with no valid id — or with no text — is dropped
+       entirely, because spec.md §9 makes an uncited user-facing reason
+       unpublishable.
+    2. **Support** (module docstring's judgment call). The surviving reason's
+       text is classified with `rli.policy.claim_families.classify_reason`.
+       If it matches no family, the reason is KEPT unconditionally — the
+       classifier is deliberately crude and must never cost a real reason
+       for a keyword-list gap. If it matches one or more families, the
+       reason is kept only if at least one surviving cited evidence item's
+       `claim_type` belongs to the union of those families' `CLAIM_FAMILIES`
+       sets; otherwise it is dropped as unsupported.
 
     `invalid_ids` counts ids that name no evidence item; `duplicate_ids`
     counts repeats of an id that does exist. They are counted separately and
@@ -413,10 +498,15 @@ def _validate_citations(drafts: Sequence[ReasonDraft], evidence_ids: set[str]) -
     fabrication is a correctness failure, and averaging the two would hide
     how often the model cites evidence that was never collected.
     """
+    claim_types = {item.id: item.claim_type for item in evidence}
+    evidence_ids = set(claim_types)
+
     reasons: list[ReasonItem] = []
     invalid = 0
     duplicates = 0
     dropped = 0
+    unsupported = 0
+    unsupported_detail: list[str] = []
 
     for draft in drafts:
         kept: list[str] = []
@@ -435,6 +525,20 @@ def _validate_citations(drafts: Sequence[ReasonDraft], evidence_ids: set[str]) -
         if not kept or not text:
             dropped += 1
             continue
+
+        families = classify_reason(text)
+        if families:
+            accepted = frozenset().union(*(CLAIM_FAMILIES.get(f, frozenset()) for f in families))
+            cited_types = {claim_types[eid] for eid in kept}
+            if not (cited_types & accepted):
+                unsupported += 1
+                unsupported_detail.append(
+                    f"reason {text!r} classified as {sorted(families)} (expects one of "
+                    f"claim_type {sorted(accepted)}) but cited claim_type(s) "
+                    f"{sorted(cited_types)}"
+                )
+                continue
+
         reasons.append(ReasonItem(text=text, evidence_ids=kept))
 
     return _CitationReport(
@@ -442,6 +546,8 @@ def _validate_citations(drafts: Sequence[ReasonDraft], evidence_ids: set[str]) -
         invalid_ids=invalid,
         duplicate_ids=duplicates,
         dropped_reasons=dropped,
+        unsupported_reasons=unsupported,
+        unsupported_detail=tuple(unsupported_detail),
     )
 
 
@@ -657,7 +763,7 @@ def explain(
     hypotheses: list[str] = []
 
     if output is not None:
-        report = _validate_citations(output.reason, {item.id for item in decision.evidence})
+        report = _validate_citations(output.reason, decision.evidence)
         if report.invalid_ids:
             # The count is in `decision_type` (queryable); the breakdown is in
             # `error`, which is the only free-text column and which a
@@ -673,6 +779,23 @@ def explain(
                     f"citation(s) collapsed"
                 ),
             )
+        if report.unsupported_reasons:
+            # Same convention as `citation_invalid`: the count is the
+            # queryable `decision_type` qualifier, the breakdown is the
+            # free-text `error`. A separate row from `citation_invalid`
+            # (module docstring: "one row per distinct diagnostic"), and
+            # written even when both counts are non-zero in the same call.
+            _note(
+                run,
+                f"{STEP_CITATION_UNSUPPORTED}:{report.unsupported_reasons}",
+                now,
+                error=(
+                    f"{report.unsupported_reasons} reason(s) dropped: every cited "
+                    "evidence id existed but none carried a claim_type belonging to "
+                    "the claim family the reason's own text was classified as; "
+                    + "; ".join(report.unsupported_detail)
+                ),
+            )
         reasons = list(report.reasons)
         # Hypotheses survive a citation wipeout — see the module docstring.
         hypotheses = _clean_hypotheses(output.hypotheses)
@@ -680,7 +803,17 @@ def explain(
         if not output.reason:
             failure = _FALLBACK_NO_REASONS
         elif not reasons:
-            failure = _FALLBACK_ALL_CITATIONS_INVALID
+            # Every reason was dropped, by invalid ids, by the support guard,
+            # or a mix of both. `_FALLBACK_ALL_CITATIONS_UNSUPPORTED` is
+            # chosen whenever ANY support drop contributed to the wipeout —
+            # "invalid" specifically means a fabricated/nonexistent id, which
+            # would misdescribe a wipeout that support drops (also) caused.
+            # See the module docstring and the constants' own comments.
+            failure = (
+                _FALLBACK_ALL_CITATIONS_UNSUPPORTED
+                if report.unsupported_reasons
+                else _FALLBACK_ALL_CITATIONS_INVALID
+            )
 
     if failure is not None:
         reasons = list(fallback_reasons)

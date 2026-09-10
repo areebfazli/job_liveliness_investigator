@@ -26,6 +26,20 @@ passes both straight through — it never re-derives them and never collapses
 empty status map, i.e. "no company has been investigated yet", not an
 error.
 
+That distinction has to survive the trip through the EVIDENCE table too,
+because `rli.policy.inputs` re-derives the three policy inputs from this
+probe's claims rather than from its `data` (spec.md §5 sources them from
+this probe; spec.md §9/§1 require every reason to map to evidence). Dated
+events give the `True` answers an evidence trail for free — each event is a
+claim. The `False` answer ("we searched this company and found nothing in
+the window") has no event to point at, so this probe emits a
+`company_events_searched` claim carrying `collection_status.searched_at`
+whenever `collected` is True. Without it, "no company_events evidence at
+all" and "searched, nothing found" would be the same observation to the
+policy layer, and the policy would have to read `False` out of an ABSENCE —
+precisely the assertion spec.md §9 forbids. With it, the honest reading of
+"no evidence" stays UNKNOWN.
+
 GUESSED / judgment calls made in this module
 --------------------------------------------
 
@@ -55,23 +69,46 @@ GUESSED / judgment calls made in this module
   requires probes to return facts, not verdicts, and the event type is a
   fact printed on the source; folding it into the `value` string would make
   it unqueryable in the `evidence` table.
+* **`value` carries the stored `materiality` as a prefix** —
+  `f"{materiality}: {headline}"`, written by
+  `rli.events.policy_signals.format_event_claim_value`. `material` vs.
+  `minor` is what separates a `layoff` that populates
+  `material_negative_event` from one that does not, the `evidence` table has
+  no column for it, and re-classifying the headline downstream could
+  disagree with the materiality this probe actually used. See that module's
+  docstring for the full argument, including the two encodings rejected.
+  Note the asymmetry with the previous bullet, which is deliberate: the
+  event TYPE is a queryable identity and belongs in `claim_type`; the
+  materiality is a derived attribute of one claim and rides in its value.
 * **`data["last_material_event_at"]` is an ISO-Z STRING, never a bare
   `datetime`.** `derive_policy_signals` returns
   `datetime | None | Unknown`; this probe passes UNKNOWN and `None` through
   unchanged (they are the two answers the Unknown-vs-False discipline above
   exists to keep apart) but renders a real datetime with `to_utc_z`, the
-  same way `data["as_of"]` is rendered. The consumer
-  (`rli.eval.case.extend_case_state`) parses it back with `parse_utc`. The
-  reason is that `ProbeResult.data` is a JSON blob in the replay dataset:
+  same way `data["as_of"]` is rendered. Nothing in the decision path reads
+  it any more — `rli.policy.inputs` derives all three signals from this
+  probe's CLAIMS — but it is still what a trace reader and the replay
+  dataset record see, so it must stay unambiguous. The reason for the string
+  is that `ProbeResult.data` is a JSON blob in the replay dataset:
   `rli.replay.mode` does carry a datetime envelope, but a probe payload that
   reads identically as JSON and as live Python is one less thing for a
   future reader of `replay_probe_results.data` to decode by hand, and the
   three-way UNKNOWN / null / timestamp distinction survives either way.
-* **`collection_status_csv` defaults to the real repo path**
-  (`REPO_ROOT/data/events/collection_status.csv`, matching
-  `scripts/collect_events.py`'s `DEFAULT_OUT_STATUS_CSV`). The argument
-  exists so tests can point at a fixture without monkeypatching module
-  state; production callers leave it `None`.
+* **The collection-status file is resolved in three steps:**
+  `args.collection_status_csv or ctx.collection_status_csv or
+  DEFAULT_COLLECTION_STATUS_CSV` (`REPO_ROOT/data/events/collection_status.csv`,
+  matching `scripts/collect_events.py`'s `DEFAULT_OUT_STATUS_CSV`).
+
+  Both overrides exist, and they are not redundant. `ctx` is the RUN-level
+  pin: whoever opens a run (an evaluation, a replay, `rli.eval.runner.
+  open_system_runner`) chooses which pre-collected corpus the whole run
+  reasons against, exactly as it chooses `ctx.conn` — and, crucially, a path
+  on `ctx` is invisible to `args_hash`, so a replay dataset record stays
+  portable across machines (see `rli.probes.base.ProbeContext`). `args` is
+  the CALL-level override: it predates `ctx`'s field, many tests construct
+  `CompanyEventsArgs` directly with no runner in sight, and it is the
+  narrower, more specific statement — so it wins. Production callers leave
+  both `None`.
 """
 
 from __future__ import annotations
@@ -83,7 +120,13 @@ from typing import ClassVar
 from pydantic import BaseModel, field_validator
 
 from rli.config import REPO_ROOT
-from rli.events.policy_signals import derive_policy_signals
+from rli.events.policy_signals import (
+    CLAIM_EVENTS_SEARCHED,
+    COLLECTION_STATUS_SOURCE_URL,
+    COMPANY_EVENTS_PROBE,
+    derive_policy_signals,
+    format_event_claim_value,
+)
 from rli.events.store import CollectionStatus, events_for, read_collection_status_csv
 from rli.models.probe import ProbeResult
 from rli.models.time import ensure_aware, to_utc_z
@@ -113,18 +156,26 @@ class CompanyEventsArgs(BaseModel):
         return ensure_aware(value, "as_of")
 
 
-def _load_collection_status(args: CompanyEventsArgs) -> dict[str, CollectionStatus]:
+def _collection_status_path(args: CompanyEventsArgs, ctx: ProbeContext) -> Path:
+    """`args` override, else the run-level `ctx` pin, else the repo default.
+
+    The precedence and the reason for both overrides are argued in the module
+    docstring. Resolved in one place so the path this probe READS and the
+    path a test or a replay THINKS it pinned can never be two different
+    files.
+    """
+    return Path(
+        args.collection_status_csv or ctx.collection_status_csv or DEFAULT_COLLECTION_STATUS_CSV
+    )
+
+
+def _load_collection_status(path: Path) -> dict[str, CollectionStatus]:
     """Read the pre-collected status CSV; a missing file is an empty map.
 
     "Collection has not run yet" is exactly the "not yet investigated" case
     `derive_policy_signals` reports as `UNKNOWN` — an absent file must
     therefore degrade to an empty map, never raise.
     """
-    path = (
-        Path(args.collection_status_csv)
-        if args.collection_status_csv
-        else DEFAULT_COLLECTION_STATUS_CSV
-    )
     if not path.is_file():
         return {}
     return read_collection_status_csv(path)
@@ -138,7 +189,7 @@ def company_events(args: CompanyEventsArgs, ctx: ProbeContext) -> ProbeResult:
     plus `UNKNOWN` signals), not an error.
     """
     now = ctx.now()
-    collection_status = _load_collection_status(args)
+    collection_status = _load_collection_status(_collection_status_path(args, ctx))
 
     # The window is resolved through `PolicyThresholds`, not read straight
     # off `[thresholds]`, because it is a POLICY threshold: it decides
@@ -166,7 +217,8 @@ def company_events(args: CompanyEventsArgs, ctx: ProbeContext) -> ProbeResult:
     claims = [
         ProbeClaim(
             claim_type=event.event_type,
-            value=event.headline,
+            # "<materiality>: <headline>" — see the module docstring.
+            value=format_event_claim_value(event.materiality, event.headline),
             source_url=event.source_url,
             raw_excerpt=event.raw_excerpt,
             source_quality="news",
@@ -176,6 +228,38 @@ def company_events(args: CompanyEventsArgs, ctx: ProbeContext) -> ProbeResult:
         )
         for event in events
     ]
+
+    if collected and status is not None:
+        # The collection fact the event claims hang off, so it goes FIRST.
+        # It is what makes "searched, nothing found" an evidence-backed
+        # `False` instead of an inference from silence (module docstring).
+        #
+        # `available_at = searched_at` is not cosmetic: it is what lets the
+        # point-in-time gate in `rli.eval.runner.ProbeRunner.save_evidence`
+        # (overridden by `rli.replay.mode`) drop this claim automatically
+        # when the search post-dates T, which collapses the derived inputs
+        # back to UNKNOWN — the same rule `derive_policy_signals` applies to
+        # `status.searched_at > as_of`, arrived at through the generic
+        # evidence gate rather than through a second copy of the comparison.
+        #
+        # `source_quality="enrichment"`, the lowest tier in spec.md §3, is
+        # the honest label: this is our own collection bookkeeping, not an
+        # observation of the employer or of the news.
+        claims.insert(
+            0,
+            ProbeClaim(
+                claim_type=CLAIM_EVENTS_SEARCHED,
+                value=to_utc_z(status.searched_at),
+                # A stable logical id, never the resolved local path — see
+                # `rli.events.policy_signals.COLLECTION_STATUS_SOURCE_URL`.
+                source_url=COLLECTION_STATUS_SOURCE_URL,
+                raw_excerpt=None,
+                source_quality="enrichment",
+                source_event_at=status.searched_at,
+                available_at=status.searched_at,
+                fetched_at=now,
+            ),
+        )
 
     return ProbeResult(
         ok=True,
@@ -200,7 +284,12 @@ def company_events(args: CompanyEventsArgs, ctx: ProbeContext) -> ProbeResult:
 class CompanyEventsProbe(Probe):
     """Dynamic probe: dated company events from the pre-collected store (spec.md §4)."""
 
-    name: ClassVar[str] = "company_events"
+    # The literal lives in `rli.events.policy_signals` (the shared events
+    # vocabulary `rli.policy.inputs` also reads) rather than here, because a
+    # `policy -> probes` import would be an unwanted edge and a
+    # `probes -> events -> probes` one an outright cycle. Binding it here is
+    # what keeps the two spellings provably identical.
+    name: ClassVar[str] = COMPANY_EVENTS_PROBE
     cost_tier: ClassVar[str] = "medium"
     history_required: ClassVar[bool] = False
     # `last_material_event_at` is populated by the same read of the same

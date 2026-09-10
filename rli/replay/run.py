@@ -270,9 +270,12 @@ def run_replay(
             selection is the dataset's own `(T, posting_id)` order, so a
             truncated replay is a prefix of the grid, not a sample of it —
             do not report metrics from one.
-        collection_status_csv: pinned company-event collection state
-            (`rli.eval.case._event_signals`). Pass the same value the build
-            used, or a replay reads whatever the working checkout holds today.
+        collection_status_csv: pinned company-event collection state, for the
+            `company_events` probe (`rli.probes.company_events`). Pass the
+            same value the build used, or a replay reads whatever the working
+            checkout holds today — and would then answer "had we searched
+            this company by T?" from a different corpus than the one the
+            dataset record was written from.
         replace: delete this dataset's previous replay runs for `system`
             first (see the module docstring).
 
@@ -385,11 +388,20 @@ def _replay_one(
         probe_name=ARCHIVE_BOARD_STATE_PROBE,
         args_hash=archive_state_args_hash(posting_id, replay_at),
     )
+    # The pinned path goes into the HOOK, because that is what builds the
+    # replayed run's `ProbeContext` (`ReplayHook.open_runner`'s signature is
+    # fixed at `(conn, cfg, run, now)`, so a system cannot forward its own
+    # copy into it — see `rli.replay.mode.replay_hook`). It is ALSO passed to
+    # the system below: `SystemRunner` declares that keyword, a system that
+    # cannot know whether it is replaying passes it on unconditionally, and
+    # `rli.eval.runner.open_system_runner` ignores it in the replay branch.
+    # Both are the same value here, which is the only sane way to hold it.
     hook = replay_hook(
         replay=ReplayContext(T=replay_at, dataset_id=dataset_id),
         store=store,
         posting_id=posting_id,
         archive_claims=archive_claims,
+        collection_status_csv=collection_status_csv,
     )
 
     try:

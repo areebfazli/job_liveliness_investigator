@@ -171,6 +171,7 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
@@ -704,6 +705,7 @@ def open_probe_runner(
     *,
     sleep: Callable[[float], None] = time.sleep,
     use_tool_cache: bool = True,
+    collection_status_csv: str | Path | None = None,
 ) -> Iterator[ProbeRunner]:
     """Build a `ProbeRunner` (and its net clients), closing them on exit.
 
@@ -716,6 +718,14 @@ def open_probe_runner(
     `sleep` is injected into both the retry backoff and the per-host rate
     limiter (`NetClient.from_config` threads it into both), so a test never
     waits on a real token bucket.
+
+    `collection_status_csv` pins the pre-collected `company_events`
+    collection-status file for every probe in this run. It rides on the
+    `ProbeContext` rather than on any probe's args because it names WHICH
+    corpus is read, not what is being asked of it — see
+    `rli.probes.base.ProbeContext`, which also explains why keeping it out of
+    `args_hash` is what makes a replay dataset portable. `None` leaves each
+    probe on its own default.
     """
     pool = _NetClientPool(cfg=cfg, conn=conn if use_tool_cache else None, sleep=sleep)
     ctx = ProbeContext(
@@ -723,6 +733,7 @@ def open_probe_runner(
         config=cfg,
         net_client_factory=pool.client_for,
         now=lambda: now,
+        collection_status_csv=collection_status_csv,
     )
     try:
         yield ProbeRunner(run=run, ctx=ctx, cfg=cfg, now=now, pool=pool)
@@ -815,6 +826,7 @@ def open_system_runner(
     replay: ReplayHook | None,
     sleep: Callable[[float], None] = time.sleep,
     use_tool_cache: bool = True,
+    collection_status_csv: str | Path | None = None,
 ) -> Iterator[ProbeRunner]:
     """`open_probe_runner`, or the replay hook's cached-record runner.
 
@@ -822,13 +834,35 @@ def open_system_runner(
     here rather than in each system for the same reason as
     `replay_run_shape`, and it keeps `rli.eval` free of any import from
     `rli.replay` (see `ReplayHook`).
+
+    `collection_status_csv` is the pinned `company_events` collection state
+    for the run, and reaches the probes through the `ProbeContext` — which is
+    why it is threaded HERE rather than into `rli.eval.case.build_case_state`
+    as it once was: the case builder no longer reads the events store at all,
+    the `company_events` PROBE does (see that module's docstring).
+
+    **In the replay branch this argument is ignored, deliberately.** There the
+    `ProbeContext` is constructed by the `ReplayHook`'s `open_runner`, whose
+    signature is fixed at `(conn, cfg, run, now)`, so the hook carries its own
+    pinned path in the closure `rli.replay.mode.replay_hook` builds. A system
+    still passes its `collection_status_csv=` through to here unconditionally
+    (it cannot know whether it is replaying, and that is the point of this
+    seam); under replay the hook's value — the one the dataset was built
+    against — is the one that wins. Passing two different paths is therefore
+    not an error but it is pointless: pin the same file in both places.
     """
     if replay is not None:
         with replay.open_runner(conn, cfg, run, now) as probes:
             yield probes
         return
     with open_probe_runner(
-        conn, cfg, run, now, sleep=sleep, use_tool_cache=use_tool_cache
+        conn,
+        cfg,
+        run,
+        now,
+        sleep=sleep,
+        use_tool_cache=use_tool_cache,
+        collection_status_csv=collection_status_csv,
     ) as probes:
         yield probes
 

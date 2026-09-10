@@ -221,49 +221,63 @@ history features and a NULL `evidence.posting_id` — the honest state for a
 posting nobody has been snapshotting.
 
 --------------------------------------------------------------------------
-JUDGMENT CALL: event signals are pre-populated from the local store
+JUDGMENT CALL: the three event inputs stay UNKNOWN until the probe runs
 --------------------------------------------------------------------------
 
-`build_case_state` calls `rli.events.policy_signals.derive_policy_signals`
-directly and feeds the result into `derive_policy_inputs(event_signals=...)`,
-so `material_negative_event` and `freeze_or_pause` may already be populated
-BEFORE the `company_events` probe has run.
+`build_case_state` does **not** read the `company_events` store, and leaves
+`material_negative_event`, `freeze_or_pause` and `last_material_event_at`
+UNKNOWN. They are populated only when the `company_events` PROBE runs and
+its claims land in the evidence list, from which `rli.policy.inputs` derives
+them like every other input.
 
-Under spec.md §4's strict eligibility rule — "a candidate probe is eligible
-only if it can populate at least one of [the unpopulated policy inputs]",
-implemented as `populates & unpopulated` in `rli.probes.registry` — that
-makes `CompanyEventsProbe` INELIGIBLE for any company whose events have
-already been collected, because the only two inputs it populates are already
-answered. This is deliberate, for two reasons:
+This module used to do the opposite: it called
+`rli.events.policy_signals.derive_policy_signals` over the local store and
+handed the resulting triple to `derive_policy_inputs`, so all three inputs
+could arrive already answered — with **no evidence item behind them**. The
+argument for it was that the read is free (spec.md §4 forbids live search
+here, so the probe is a local read too) and that modelling a cost that does
+not exist would flatter any system that "discovered" what it already had.
 
-* **It costs nothing to read.** spec.md §4 requires that historical company
-  events be pre-collected and replayed by `available_at` ("do not live-search
-  during benchmark replay"), and `rli.probes.company_events` therefore makes
-  no network call at all — it reads the same local `company_events` table and
-  the same `collection_status.csv` this function reads. Leaving the two
-  inputs UNKNOWN until the probe "discovers" them would model a cost that
-  does not exist and would let a system look thorough for spending a
-  `medium`-cost step on data it already had.
-* **The probe still earns its place.** It is what produces the CITED
-  `EvidenceItem`s the explanation layer needs — `rli.policy.explain_stub`
-  emits the freeze/layoff reasons only when `company_events` evidence is
-  present, per spec.md §9 ("every user-facing reason maps to evidence") —
-  and its `run_steps` row is what makes "we checked the event store" visible
-  in the trace. System B's routing (`rli.eval.system_b`, rules R1/R3) routes
-  it explicitly for that reason, rather than relying on the eligibility gate.
+That argument was wrong, and the ways it was wrong were observed on real
+runs rather than reasoned about:
 
-**The alternative, and what it would change.** Leaving both inputs UNKNOWN
-until the probe runs would make `company_events` eligible on every case,
-which under System A changes nothing (A runs every eligible probe anyway)
-but inflates spec.md §6's medium/high-cost probe count for *any* system that
-runs it — including the future System C, whose gate is "C medium/high-cost
-probe use <= 70% of B". Since both A and B would gain the same probe on the
-same cases, the ratio is roughly preserved either way; what would change is
-the absolute cost figure spec.md §6 also asks to be reported, which would
-then overstate the cost of a purely local read. The current choice keeps the
-reported cost honest and keeps the eligibility rule's meaning intact ("is
-this question still open?"), at the price of `company_events` appearing
-ineligible in the registry while still being routed by name.
+* **spec.md §5 sources these inputs from the `company_events` probe**, and
+  spec.md §9/§1 require every user-facing reason to map to evidence. A
+  populated-but-uncited input is a policy input the explanation cannot
+  legitimately talk about.
+* **A populated input made the probe ineligible.** spec.md §4's rule —
+  "a candidate probe is eligible only if it can populate at least one [of
+  the unpopulated policy inputs]", implemented as `populates & unpopulated`
+  in `rli.probes.registry` — dropped `CompanyEventsProbe` for every company
+  whose events had been collected, which is most of the corpus.
+* **So System C stopped before it started.** With the event questions
+  already "answered", the controller's pre-flight hit
+  `no_unresolved_question`, the investigator was never called, and
+  `company_events` never ran. C then returned `wait` via the P3c
+  `material_event_unrefreshed` branch holding four evidence items, none of
+  them a layoff, and the LLM explanation — asked to cite something for a
+  layoff nobody had produced — cited an unrelated evidence id.
+* **And System B's probe produced nothing.** B routes `company_events` by
+  name (rules R1/R3) rather than through the eligibility gate, so it did run
+  it — but in replay its claims were the only thing the probe contributed,
+  and the recorded outcome was that `company_events` "produced zero evidence
+  in every run": the answer had already been supplied by this function, so
+  nothing downstream needed the claims and nothing noticed they were absent.
+
+**The accepted cost, stated honestly.** `company_events` is now eligible on
+every case, so it is counted in spec.md §6's medium/high-cost probe use for
+every system that runs it — System A always did, System B routes it by name,
+and System C now actually reaches it. The reported ABSOLUTE cost figure
+therefore goes up. That figure is now the true one: the probe really is run,
+and a spec.md §6 cost metric that hides a step the system took is worse than
+one that reports a local read as costing something. A-vs-B-vs-C stay
+comparable because all three pay the same price on the same cases, which is
+what the ratio gates (e.g. "C medium/high-cost probe use <= 70% of B")
+actually measure.
+
+The pinned collection-status file that used to be threaded into this
+function is now threaded into the `ProbeContext` instead
+(`rli.eval.runner.open_system_runner`), because the PROBE is what reads it.
 
 --------------------------------------------------------------------------
 Other judgment calls
@@ -299,15 +313,12 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Sequence
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any, NamedTuple
 
 from pydantic import BaseModel, ConfigDict
 
 from rli.config import Config
 from rli.eval.runner import STEP_PROBE_SKIPPED, ProbeRunner
-from rli.events.policy_signals import EventSignals, derive_policy_signals
-from rli.events.store import read_collection_status_csv
 from rli.history.features import PostingHistoryFeatures, posting_features
 from rli.models.case_file import CaseFile
 from rli.models.evidence import EvidenceItem
@@ -325,7 +336,6 @@ from rli.policy.inputs import (
 from rli.policy.quality import QualityVerdict, evidence_quality_detail
 from rli.probes.base import Probe, ProbeClaim
 from rli.probes.board_snapshot import BoardJob, BoardSnapshotArgs, BoardSnapshotProbe
-from rli.probes.company_events import DEFAULT_COLLECTION_STATUS_CSV, CompanyEventsProbe
 from rli.probes.lookups import posting_row
 from rli.probes.registry import build_args
 from rli.probes.resolve_posting import ResolvePostingArgs, ResolvePostingProbe
@@ -401,7 +411,6 @@ class CaseState(BaseModel):
     inputs: PolicyInputs = PolicyInputs()
     quality: QualityVerdict | None = None
     features: PostingHistoryFeatures | None = None
-    event_signals: EventSignals | None = None
 
     # ALWAYS-RUN probe failures only — the set `rli.policy.quality` documents
     # as the correct `failures=` argument. Dynamic failures are traced in
@@ -788,62 +797,6 @@ def _refresh_claim(
 
 
 # ---------------------------------------------------------------------------
-# Event signals
-# ---------------------------------------------------------------------------
-
-
-def _event_signals(
-    conn: sqlite3.Connection,
-    cfg: Config,
-    company_id: str | None,
-    now: datetime,
-    collection_status_csv: str | Path | None = None,
-) -> EventSignals | None:
-    """The pre-collected `EventSignals` triple, or `None`.
-
-    `None` (not a triple of UNKNOWNs) when there is no company to ask about, so
-    `derive_policy_inputs` reports both inputs UNKNOWN through its own
-    documented `event_signals is None` path rather than through a value this
-    module synthesized.
-
-    The default status-file path is imported from `rli.probes.company_events`
-    rather than restated, so the probe and the case state can never read
-    different files. A missing file is an empty map — "no company has been
-    investigated yet", which `derive_policy_signals` turns into UNKNOWN.
-
-    `collection_status_csv` overrides that default, mirroring
-    `rli.probes.company_events.CompanyEventsArgs.collection_status_csv`,
-    which exists for exactly this reason. Without it, this function — and so
-    every A/B run — reads a file from the working checkout, which makes two
-    things unpleasant: a test's synthetic company id silently depends on
-    whether it collides with a real row in `data/events/collection_status.csv`,
-    and an M4 point-in-time replay could not pin the collection state it is
-    replaying against. Threading the override keeps the probe and the case
-    state pointed at ONE file, whichever file the caller chose.
-    """
-    if company_id is None:
-        return None
-    path = Path(collection_status_csv or DEFAULT_COLLECTION_STATUS_CSV)
-    collection_status = read_collection_status_csv(path) if path.is_file() else {}
-    # Resolved through `PolicyThresholds`, not read off `cfg.thresholds`:
-    # the window is a POLICY threshold that happens to be applied one layer
-    # upstream of `rli.policy.action._branch`, and it is part of
-    # `policy_version()`. Reading `[thresholds]` directly would let a
-    # `[policy] negative_event_window_days` override change the recorded
-    # policy version while changing nothing about the decision — a footgun
-    # that only shows up as an unexplained version bump months later. With
-    # the override unset (the default) this resolves to the identical
-    # `[thresholds]` value, so it is behaviourally a no-op today.
-    return derive_policy_signals(
-        conn,
-        company_id,
-        now,
-        collection_status,
-        window_days=PolicyThresholds.coerce(cfg).negative_event_window_days,
-    )
-
-
-# ---------------------------------------------------------------------------
 # build_case_state
 # ---------------------------------------------------------------------------
 
@@ -855,7 +808,6 @@ def build_case_state(
     url: str,
     now: datetime,
     probes: ProbeRunner,
-    collection_status_csv: str | Path | None = None,
 ) -> CaseState:
     """Run the always-run pair and derive everything it implies (spec.md §4).
 
@@ -869,10 +821,6 @@ def build_case_state(
         cfg: loaded configuration.
         url: the user-supplied job URL.
         now: the run clock; every claim's `available_at`/`fetched_at`.
-        collection_status_csv: override for the pre-collected company-event
-            status file (see `_event_signals`); `None` uses the project
-            default. Pass it to pin the event-collection state a test or a
-            replay is reasoning against.
         probes: the run's `rli.eval.runner.ProbeRunner`. It bundles the
             `Run` and the `ProbeContext`, which is why this signature takes
             it rather than the two separately — an untraced probe call would
@@ -1014,12 +962,9 @@ def build_case_state(
         if posting_row_exists and posting_id is not None
         else None
     )
-    event_signals = _event_signals(conn, cfg, company_id, now, collection_status_csv)
-
     inputs = derive_policy_inputs(
         evidence,
         features,
-        event_signals,
         now,
         cfg=cfg,
         resolver_ok=resolver.ok,
@@ -1049,7 +994,6 @@ def build_case_state(
         inputs=inputs,
         quality=quality,
         features=features,
-        event_signals=event_signals,
         failures=failures,
         resolver_ok=resolver.ok,
         unpopulated=inputs.unpopulated(),
@@ -1097,16 +1041,9 @@ def extend_case_state(
     invite a second `refreshed_at` claim for the same refresh. If a future
     probe ever emits `updated_at`, this is the function that must change.
 
-    Two inputs cannot be read from evidence alone and are threaded through
+    ONE input cannot be read from evidence alone and is threaded through
     explicitly:
 
-    * `event_signals` — `rli.probes.company_events` returns
-      `material_negative_event` / `freeze_or_pause` as structured `data`, and
-      its claims are dated news items rather than a boolean claim, so the
-      probe's own answer replaces the pre-populated one from the case state
-      when it ran. The two agree by construction (both come from
-      `derive_policy_signals` over the same store at the same `as_of`); the
-      probe's is preferred because it is the one the trace can point at.
     * `team_signal` — spec.md §4 makes `team_signal` the only source for
       `corroborating_hiring_signal`. The documented path is a
       `corroborating_hiring_signal` CLAIM (`rli.policy.inputs.CLAIM_TEAM_SIGNAL`),
@@ -1117,6 +1054,18 @@ def extend_case_state(
       genuinely a `bool`. `NullTeamSignalSource` returns `ok=False`, so an
       unlicensed run never populates the input — which is the whole point of
       that class (see `rli.probes.team_signal`).
+
+    The company-event signals used to be threaded the same way, from
+    `company_events`' `ProbeResult.data`, on top of a triple this module had
+    pre-populated from the local store. Both halves of that are gone:
+    `derive_policy_inputs` reads `material_negative_event`,
+    `freeze_or_pause` and `last_material_event_at` out of the probe's own
+    claims. The probe's `data` still reports all three (the replay codec in
+    `rli.replay.mode` decodes them, and a trace reader wants to see them),
+    but nothing in the decision path reads them any more — which is what
+    makes it impossible for the trace and the policy to disagree about
+    whether there was a layoff. See this module's docstring for the bug that
+    made the difference matter.
     """
     case_file = case.case_file()
     if case_file is None:
@@ -1136,18 +1085,6 @@ def extend_case_state(
                 probe=probe_cls.name, claims=claims, posting_id=evidence_posting_id
             )
 
-    events = case.probe_results.get(CompanyEventsProbe.name)
-    if events is not None and events.ok and events.data is not None:
-        stamp = events.data["last_material_event_at"]
-        case.event_signals = (
-            events.data["material_negative_event"],
-            events.data["freeze_or_pause"],
-            # The probe renders a real date as an ISO-Z string (see
-            # `rli.probes.company_events`); UNKNOWN and None pass through
-            # unchanged and must stay distinguishable from each other.
-            parse_utc(stamp) if isinstance(stamp, str) else stamp,
-        )
-
     team = case.probe_results.get(TeamSignalProbe.name)
     team_value: bool | Unknown = UNKNOWN
     if team is not None and team.ok and team.data is not None:
@@ -1158,7 +1095,6 @@ def extend_case_state(
     case.inputs = derive_policy_inputs(
         case.evidence,
         case.features,
-        case.event_signals,
         probes.now,
         cfg=probes.cfg,
         resolver_ok=case.resolver_ok,

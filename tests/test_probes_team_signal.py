@@ -409,7 +409,7 @@ def test_emitted_true_claim_is_read_by_derive_policy_inputs(
     )
     item = EvidenceItem(id="e1", run_id="r1", probe="team_signal", **claim.model_dump())
 
-    inputs = derive_policy_inputs([item], None, None, NOW)
+    inputs = derive_policy_inputs([item], None, NOW)
 
     assert inputs.corroborating_hiring_signal is True
 
@@ -429,7 +429,7 @@ def test_emitted_false_claim_is_read_by_derive_policy_inputs(
     )
     item = EvidenceItem(id="e1", run_id="r1", probe="team_signal", **claim.model_dump())
 
-    inputs = derive_policy_inputs([item], None, None, NOW)
+    inputs = derive_policy_inputs([item], None, NOW)
 
     assert inputs.corroborating_hiring_signal is False
 

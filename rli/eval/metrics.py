@@ -190,6 +190,8 @@ from rli.eval.baseline import HoldoutSplitRequestedError, load_split_map
 from rli.eval.report import cost_tier_for
 from rli.eval.runner import STEP_PROBE_RUN
 from rli.models.time import now_utc, parse_utc
+from rli.policy.claim_families import CLAIM_FAMILIES, FAMILY_KEYWORDS
+from rli.policy.claim_families import classify_reason as _classify_reason
 from rli.policy.splits import DEFAULT_SEED
 from rli.probes.board_snapshot import BoardSnapshotProbe
 from rli.probes.registry import DYNAMIC_PROBES
@@ -723,65 +725,17 @@ def _case_set_for(
 # 3. Data quality (spec.md §6 "Data quality")
 # ---------------------------------------------------------------------------
 
-#: Claim family -> the `evidence.claim_type` values that belong to it. These
-#: are the claim types this system actually emits (see `rli.probes.*`), not
-#: an aspirational taxonomy: a family whose claim types never appear simply
-#: never matches. `board_listing` and `version_change` deliberately appear in
-#: two families each — a board listing supports both "is it still posted" and
-#: "was it reposted", and a version change supports both "was it reposted"
-#: and "did the requirements move".
-CLAIM_FAMILIES: dict[str, frozenset[str]] = {
-    "posting_state": frozenset({"posting_state", "board_present", "board_absent", "board_listing"}),
-    # `refreshed_at` is `rli.eval.case`'s synthesized claim (an ATS
-    # `updated_at` corroborated by an observed content-hash change); it is a
-    # publish-family claim because it is what spec.md §5's amended `recent`
-    # rule reads alongside `first_published`.
-    "publish": frozenset({"first_published", "updated_at", "refreshed_at"}),
-    "expiry": frozenset({"declared_expiry"}),
-    "repost": frozenset({"disappeared_interval", "reappeared", "version_change", "board_listing"}),
-    "requirements": frozenset({"requirements_changed", "requirements_unchanged", "version_change"}),
-    "company_event": frozenset(
-        {
-            "layoff",
-            "layoffs",
-            "hiring_freeze",
-            "freeze",
-            "funding",
-            "expansion",
-            "acquisition",
-            "restructuring",
-        }
-    ),
-}
-
-#: Claim family -> lowercase substrings that identify that family in a
-#: human-readable `reason.text`. This is a deliberately crude classifier and
-#: is treated as one: a reason matching NO keyword is counted as
-#: `reasons_unclassified` and is neither "supported" nor "unsupported",
-#: because this module cannot tell whether the citation is wrong or the
-#: keyword list is incomplete. Guessing would turn a lexicon gap into a
-#: quality finding. All matching families are collected, not just the first,
-#: so a reason spanning two claims is supported by either.
-FAMILY_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "posting_state": (
-        "still listed",
-        "no longer listed",
-        "job board",
-        "board snapshot",
-        "removed",
-        "closed",
-        "open",
-        "listed",
-    ),
-    # "updated" / "refreshed" classify `rli.policy.explain_stub`'s refresh
-    # reason ("The posting was updated on ..."), which would otherwise land
-    # in `reasons_unclassified` as a lexicon gap rather than a finding.
-    "publish": ("published", "posted", "days ago", "first published", "updated", "refreshed"),
-    "expiry": ("expire", "expiry", "valid through", "closing"),
-    "repost": ("repost", "reappear", "relisted", "disappeared", "previously"),
-    "requirements": ("requirement", "description chang", "unchanged", "drift"),
-    "company_event": ("layoff", "freeze", "hiring pause", "funding", "expansion", "acquisition"),
-}
+#: `CLAIM_FAMILIES` and `FAMILY_KEYWORDS` now live in `rli.policy.
+#: claim_families` (imported above) — a shared lexicon between this module's
+#: `CitationSupport` data-quality reporting and `rli.agent.explanation`'s
+#: citation SUPPORT guard, which needs the same classifier without pulling in
+#: this whole (heavier) eval-reporting module. They are re-exported here
+#: under their original names — see `__all__` — so any existing importer of
+#: `rli.eval.metrics.CLAIM_FAMILIES` / `FAMILY_KEYWORDS` keeps working
+#: unchanged. `_classify_reason` (imported above as an alias of `rli.policy.
+#: claim_families.classify_reason`) is kept private and under its original
+#: name because every call site inside this module already spells it that
+#: way.
 
 DEFAULT_MATCH_PRECISION_PATH = "data/match_precision.md"
 
@@ -939,16 +893,6 @@ def read_match_precision(
         if 0.0 <= value <= 1.0:
             return value, f"parsed {value:.1%} from {destination}"
     return None, f"pending: no precision figure found in {destination}"
-
-
-def _classify_reason(text: str) -> set[str]:
-    """The `CLAIM_FAMILIES` keys whose keywords appear in `text` (lowercased)."""
-    lowered = text.lower()
-    return {
-        family
-        for family, keywords in FAMILY_KEYWORDS.items()
-        if any(keyword in lowered for keyword in keywords)
-    }
 
 
 def _evidence_by_run(

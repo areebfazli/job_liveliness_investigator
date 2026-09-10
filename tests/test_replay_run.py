@@ -11,11 +11,19 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import timedelta
+from pathlib import Path
 
 import httpx
 import pytest
 import respx
-from test_eval_helpers import COMPANY, add_capture, add_posting, job
+from test_eval_helpers import (
+    COMPANY,
+    add_capture,
+    add_company_event,
+    add_posting,
+    job,
+    write_status_csv,
+)
 from test_replay_helpers import (
     CLOSED_JOB,
     NOW,
@@ -30,6 +38,7 @@ from test_replay_helpers import (
 from rli.config import Config
 from rli.eval.runner import Run
 from rli.eval.system_a import run_system_a
+from rli.events.policy_signals import CLAIM_EVENTS_SEARCHED
 from rli.models.time import parse_utc, to_utc_z
 from rli.policy.inputs import CLAIM_POSTING_STATE
 from rli.probes.registry import DYNAMIC_PROBES
@@ -431,3 +440,89 @@ def test_archive_state_record_is_loaded_under_the_agreed_args_hash(
         args_hash=archive_state_args_hash(OPEN_POSTING, ARCHIVE_T),
     )
     assert [c.claim_type for c in claims] == [CLAIM_POSTING_STATE, "board_present"]
+
+
+# ---------------------------------------------------------------------------
+# `company_events` in replay: the probe must contribute EVIDENCE, not just data
+# ---------------------------------------------------------------------------
+
+EVENTS_DATASET = "ds-run-events"
+
+
+@respx.mock
+def _build_with_events(conn: sqlite3.Connection, cfg: Config, status_csv: str) -> None:
+    """A dataset whose company HAS a collected, replay-visible layoff.
+
+    Both the event's `available_at` and the collection `searched_at` are set
+    70 days back — before the earliest grid point — so every case in the
+    dataset sees them and the assertion below is not about one lucky `T`.
+    """
+    seed_corpus(conn)
+    add_company_event(
+        conn,
+        event_date=(NOW - timedelta(days=70)).date(),
+        available_at=NOW - timedelta(days=70),
+    )
+    mock_ats()
+    summary = build_dataset(
+        conn,
+        cfg,
+        dataset_id=EVENTS_DATASET,
+        split="dev",
+        split_kind="temporal",
+        grid_step_days=30,
+        now=NOW,
+        cutoff=dev_everything_cutoff(),
+        use_tool_cache=False,
+        collection_status_csv=status_csv,
+    )
+    assert summary.postings_failed == 0, summary.failures
+
+
+def test_company_events_produces_evidence_in_a_replay_run(
+    conn: sqlite3.Connection, cfg: Config, tmp_path: Path
+) -> None:
+    """The probe's claims must reach the `evidence` table in replay.
+
+    This is the replay half of the bug the events pipeline was rebuilt for.
+    `company_events` used to "produce zero evidence in every run": the three
+    policy inputs it answers were pre-populated by `rli.eval.case` from the
+    same local store, so nothing downstream read the probe's claims and
+    nobody noticed they were doing no work. Now the policy reads ONLY the
+    claims, so zero evidence would mean zero answers — and this asserts the
+    claims survive the whole build/replay round trip, typed codec included.
+
+    The same `collection_status.csv` is pinned at BUILD and at REPLAY. It has
+    to be: the build records what the probe found at `T` under an `args_hash`
+    that deliberately excludes the path (`rli.probes.base.ProbeContext`), so
+    pinning two different files would silently compare two different worlds.
+    """
+    status_csv = write_status_csv(tmp_path / "collection_status.csv", NOW - timedelta(days=70))
+    _build_with_events(conn, cfg, status_csv)
+
+    summary = run_replay(
+        conn,
+        cfg,
+        dataset_id=EVENTS_DATASET,
+        system="A",
+        collection_status_csv=status_csv,
+    )
+    assert summary.errors == 0
+    assert summary.violations == 0
+    assert summary.probe_counts.get("company_events")
+
+    rows = conn.execute(
+        """
+        SELECT e.claim_type, COUNT(*) AS n
+        FROM evidence e JOIN runs r ON r.id = e.run_id
+        WHERE r.mode = 'replay' AND r.config_hash LIKE ? AND e.probe = 'company_events'
+        GROUP BY e.claim_type
+        """,
+        (f"%|dataset:{EVENTS_DATASET}",),
+    ).fetchall()
+    by_type = {row["claim_type"]: row["n"] for row in rows}
+
+    # Both halves of the contract: the dated event, and the collection-status
+    # claim that makes a "checked, none found" answer citable at all.
+    assert by_type.get("layoff")
+    assert by_type.get(CLAIM_EVENTS_SEARCHED)

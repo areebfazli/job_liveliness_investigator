@@ -76,15 +76,17 @@ class PolicyInputs(BaseModel):
     # refresh -> wait", which needs the event's DATE, not merely the boolean.
     #
     # The window is applied UPSTREAM, by
-    # `rli.events.policy_signals.derive_policy_signals`, before this value is
-    # ever set. That is why `rli.policy.action._branch` does not re-check it,
+    # `rli.events.policy_signals.signals_from_facts` — the one rule both the
+    # `company_events` probe and `rli.policy.inputs`' claims adapter run —
+    # before this value is ever set. That is why `rli.policy.action._branch`
+    # does not re-check it,
     # and must not: `_branch` is deliberately clock-free so the precedence
     # table is testable without a clock, and a window is a statement about
     # `now`. The consequence is that `negative_event_window_days` changes
     # decisions from outside the policy function, which is why it is part of
     # `rli.policy.action.PolicyThresholds.fingerprint()`.
     #
-    # INVARIANT (guaranteed by `derive_policy_signals`, which produces both
+    # INVARIANT (guaranteed by `signals_from_facts`, which produces both
     # values from the same filtered event list): once populated,
     # `material_negative_event is True` <=> `last_material_event_at` is a
     # `datetime`. `False` pairs with `None` ("checked; no qualifying event"),

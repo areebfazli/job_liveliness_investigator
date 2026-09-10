@@ -72,12 +72,28 @@ def net_client_factory(
 def ctx_factory(
     cfg: Config, conn: sqlite3.Connection, net_client_factory: Callable[[str], NetClient]
 ) -> Callable[..., ProbeContext]:
-    def build(*, now: Callable[[], object] = now_utc) -> ProbeContext:
+    """Build a `ProbeContext` over the temp DB.
+
+    `collection_status_csv` is the run-level pin of the pre-collected
+    `company_events` collection-status file (see `rli.probes.base.
+    ProbeContext`). It defaults to `None`, which leaves the probe on the
+    repo's real `data/events/collection_status.csv` — fine for the many
+    tests whose synthetic company ids appear nowhere in it, and overridable
+    by any test that actually cares what "has this company been searched?"
+    answers.
+    """
+
+    def build(
+        *,
+        now: Callable[[], object] = now_utc,
+        collection_status_csv: str | Path | None = None,
+    ) -> ProbeContext:
         return ProbeContext(
             conn=conn,
             config=cfg,
             net_client_factory=net_client_factory,
             now=now,
+            collection_status_csv=collection_status_csv,
         )
 
     return build

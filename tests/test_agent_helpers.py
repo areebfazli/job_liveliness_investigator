@@ -61,11 +61,13 @@ TENANT = "acme"
 # Greenhouse `first_published` field alone.
 NO_JSONLD_PAGE = "<html><body>no structured data</body></html>"
 
-# A path that deliberately does not exist. `rli.eval.case._event_signals`
+# A path that deliberately does not exist. `rli.probes.company_events`
 # documents a missing collection-status file as an empty map ("no company has
-# been investigated yet" -> UNKNOWN), so passing this pins every run in this
-# suite to that state instead of to whatever `data/events/collection_status.csv`
-# happens to hold in the working checkout.
+# been investigated yet" -> UNKNOWN, and no `company_events_searched` claim),
+# so passing this pins every run in this suite to that state instead of to
+# whatever `data/events/collection_status.csv` happens to hold in the working
+# checkout. It reaches the probe on the `ProbeContext`, via
+# `rli.eval.runner.open_system_runner`.
 NO_COLLECTION_STATUS = Path(__file__).with_name("_no_collection_status.csv")
 
 # `rli.llm.client.compute_cost_usd` prices a call from `[llm.prices]`, and an
