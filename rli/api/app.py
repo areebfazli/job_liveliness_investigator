@@ -51,9 +51,7 @@ from rli.net import DisallowedHostError, check_allowed
 _UI_INDEX = Path(__file__).parent.parent / "ui" / "index.html"
 
 SystemChoice = Literal["A", "B", "C"]
-OutcomeType = Literal[
-    "applied", "reply", "screen", "interview", "offer", "rejection", "silence"
-]
+OutcomeType = Literal["applied", "reply", "screen", "interview", "offer", "rejection", "silence"]
 
 
 class InvestigateRequest(BaseModel):
@@ -178,9 +176,7 @@ def create_app(
                     # close it: one httpx connection pool per /investigate
                     # call would otherwise be released only by the garbage
                     # collector.
-                    system_c_llm = CachedClient(
-                        OpenAICompatibleClient.from_config(cfg), conn
-                    )
+                    system_c_llm = CachedClient(OpenAICompatibleClient.from_config(cfg), conn)
                     try:
                         result = run_system_c(conn, cfg, body.url, system_c_llm)
                     finally:
@@ -188,9 +184,7 @@ def create_app(
                     system_used = "C"
                     if _run_model_calls_all_failed(conn, result.run_id):
                         degraded = True
-                        degraded_reason = (
-                            "all System C model calls failed; decision is policy-only"
-                        )
+                        degraded_reason = "all System C model calls failed; decision is policy-only"
 
             payload = _decision_response(
                 result,

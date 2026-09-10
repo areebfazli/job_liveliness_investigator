@@ -606,9 +606,7 @@ def test_recovery_after_a_failed_probe(conn: sqlite3.Connection, cfg: Config) ->
     assert metrics.recovery_rate == pytest.approx(0.5)
 
 
-def test_recovery_rate_is_none_when_nothing_failed(
-    conn: sqlite3.Connection, cfg: Config
-) -> None:
+def test_recovery_rate_is_none_when_nothing_failed(conn: sqlite3.Connection, cfg: Config) -> None:
     splits: dict[str, str] = {}
     _pair(conn, "p1", a_action="wait", b_action="wait", split_map=splits)
     metrics = agent_efficiency(
@@ -770,9 +768,7 @@ def test_a_system_with_no_runs_is_reported_as_zero_not_dropped(
 ) -> None:
     splits: dict[str, str] = {}
     _pair(conn, "p1", a_action="wait", b_action="wait", split_map=splits)
-    case_set = collect_system_runs(
-        conn, dataset_id=DATASET, splits=splits, systems=("A", "B", "C")
-    )
+    case_set = collect_system_runs(conn, dataset_id=DATASET, splits=splits, systems=("A", "B", "C"))
     assert case_set.counts_by_system == {"A": 1, "B": 1, "C": 0}
     assert case_set.cases_for("A", "B", "C") == ()
 
@@ -821,15 +817,27 @@ def test_publish_date_coverage_is_bucketed_by_source_quality(
         _add_run(conn, f"a-{posting_id}", system="A", posting_id=posting_id, action="wait")
         _add_probes(conn, f"a-{posting_id}")
     _add_evidence(
-        conn, "a-p1", "e1", probe="resolve_posting", claim_type="first_published",
+        conn,
+        "a-p1",
+        "e1",
+        probe="resolve_posting",
+        claim_type="first_published",
         source_quality="ats_native",
     )
     _add_evidence(
-        conn, "a-p1", "e2", probe="board_snapshot", claim_type="updated_at",
+        conn,
+        "a-p1",
+        "e2",
+        probe="board_snapshot",
+        claim_type="updated_at",
         source_quality="archive",
     )
     _add_evidence(
-        conn, "a-p2", "e1", probe="board_snapshot", claim_type="board_present",
+        conn,
+        "a-p2",
+        "e1",
+        probe="board_snapshot",
+        claim_type="board_present",
         source_quality="archive",
     )
 
@@ -884,9 +892,7 @@ def test_citation_support_separates_missing_ids_from_unsupported_from_unclassifi
     _add_probes(conn, "a-p1")
     _add_evidence(conn, "a-p1", "e1", probe="board_snapshot", claim_type="posting_state")
 
-    citation = data_quality(
-        conn, cfg, dataset_id=DATASET, splits=splits, systems=("A",)
-    ).citation
+    citation = data_quality(conn, cfg, dataset_id=DATASET, splits=splits, systems=("A",)).citation
     assert citation.runs_checked == 1
     assert citation.runs_with_reasons == 1
     assert citation.reasons_total == 5
@@ -958,8 +964,7 @@ def test_data_quality_records_the_leakage_audit(
 
 
 def test_every_metric_degrades_cleanly_on_an_empty_database(
-    tmp_path: Path,
-    conn: sqlite3.Connection, cfg: Config
+    tmp_path: Path, conn: sqlite3.Connection, cfg: Config
 ) -> None:
     case_set = collect_system_runs(
         conn, dataset_id="nothing-here", splits={}, systems=("A", "B", "C")

@@ -194,9 +194,7 @@ def net_call_count(pool: ReplayNetPool) -> int:
     return len(pool.attempts)
 
 
-def _dataset_runs(
-    conn: sqlite3.Connection, dataset_id: str
-) -> list[sqlite3.Row]:
+def _dataset_runs(conn: sqlite3.Connection, dataset_id: str) -> list[sqlite3.Row]:
     suffix = f"|dataset:{dataset_id}"
     rows = conn.execute(
         """

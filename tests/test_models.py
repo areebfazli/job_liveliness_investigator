@@ -102,10 +102,13 @@ EXPECTED_POLICY_INPUT_FIELDS = {
     "declared_expiry",
     "repost_pattern",
     "corroborating_hiring_signal",
+    # spec.md §5's Amendment 2026-09-10 (the P3c `wait` row) needs the DATE
+    # of the most recent material negative event, not just the boolean.
+    "last_material_event_at",
 }
 
 
-def test_policy_inputs_unpopulated_returns_exactly_seven_fields() -> None:
+def test_policy_inputs_unpopulated_returns_exactly_the_named_fields() -> None:
     inputs = PolicyInputs()
     assert inputs.unpopulated() == EXPECTED_POLICY_INPUT_FIELDS
     assert "evidence_quality" not in inputs.unpopulated()
@@ -119,6 +122,7 @@ def test_policy_inputs_known_absent_values_are_populated() -> None:
         corroborating_hiring_signal=False,
         repost_pattern="none",
         posting_state="unknown",
+        last_material_event_at=None,
     )
     unpopulated = inputs.unpopulated()
     assert "declared_expiry" not in unpopulated
@@ -127,6 +131,9 @@ def test_policy_inputs_known_absent_values_are_populated() -> None:
     assert "corroborating_hiring_signal" not in unpopulated
     assert "repost_pattern" not in unpopulated
     assert "posting_state" not in unpopulated
+    # `None` here means "checked; no qualifying material event", the partner
+    # of material_negative_event=False.
+    assert "last_material_event_at" not in unpopulated
     # publish_recency was never set, so it remains unpopulated.
     assert unpopulated == {"publish_recency"}
 
@@ -139,6 +146,7 @@ def test_policy_inputs_json_round_trip_preserves_unknown_and_known_absent() -> N
         corroborating_hiring_signal=False,
         repost_pattern="none",
         posting_state="unknown",
+        last_material_event_at=None,
     )
     assert inputs.publish_recency is UNKNOWN
 
@@ -264,12 +272,8 @@ def test_case_file_constructs_with_defaults() -> None:
 
 
 def test_case_file_policy_inputs_default_is_independent_per_instance() -> None:
-    c1 = CaseFile(
-        posting_id="p1", company_id="acme.com", canonical_url="https://example.com/1"
-    )
-    c2 = CaseFile(
-        posting_id="p2", company_id="acme.com", canonical_url="https://example.com/2"
-    )
+    c1 = CaseFile(posting_id="p1", company_id="acme.com", canonical_url="https://example.com/1")
+    c2 = CaseFile(posting_id="p2", company_id="acme.com", canonical_url="https://example.com/2")
     c1.policy_inputs = c1.policy_inputs.model_copy(update={"posting_state": "open"})
     assert c2.policy_inputs.posting_state is UNKNOWN
     assert c1.policy_inputs is not c2.policy_inputs

@@ -625,9 +625,7 @@ def product_gate(
     """
     scope_splits = ("test",) if allowed_splits is None else tuple(allowed_splits)
 
-    outcome_rows = conn.execute(
-        "SELECT posting_id, outcome_type FROM outcomes"
-    ).fetchall()
+    outcome_rows = conn.execute("SELECT posting_id, outcome_type FROM outcomes").fetchall()
 
     outcomes_total = len(outcome_rows)
     all_postings = {str(row["posting_id"]) for row in outcome_rows}
@@ -640,9 +638,7 @@ def product_gate(
         held_out = set()
     else:
         held_out = {
-            posting_id
-            for posting_id in all_postings
-            if splits.get(posting_id) in scope_splits
+            posting_id for posting_id in all_postings if splits.get(posting_id) in scope_splits
         }
 
     # Everything downstream is measured over the in-scope postings only:
@@ -727,8 +723,7 @@ def product_gate(
         )
     elif not held_out:
         missing.append(
-            f"no posting with recorded outcomes falls in the held-out split(s) "
-            f"{scope_splits!r}"
+            f"no posting with recorded outcomes falls in the held-out split(s) {scope_splits!r}"
         )
     if outcomes_total and not matched:
         missing.append(

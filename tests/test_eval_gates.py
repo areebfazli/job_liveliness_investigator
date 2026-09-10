@@ -193,9 +193,7 @@ def _add_outcome(
 # ---------------------------------------------------------------------------
 
 
-def test_probe_use_passes_at_exactly_seventy_percent(
-    conn: sqlite3.Connection, cfg: Config
-) -> None:
+def test_probe_use_passes_at_exactly_seventy_percent(conn: sqlite3.Connection, cfg: Config) -> None:
     # Baseline B: 30 medium/high steps over 10 runs -> 3.0 per run.
     # Candidate C: 21 steps over 10 runs            -> 2.1 per run = exactly 70%.
     # In IEEE-754, 0.7 * 3.0 == 2.0999999999999996, so `2.1 <= 0.7 * 3.0` is
@@ -212,9 +210,7 @@ def test_probe_use_passes_at_exactly_seventy_percent(
     assert result.passed is True
 
 
-def test_probe_use_fails_just_above_seventy_percent(
-    conn: sqlite3.Connection, cfg: Config
-) -> None:
+def test_probe_use_fails_just_above_seventy_percent(conn: sqlite3.Connection, cfg: Config) -> None:
     # 22/10 = 2.2 per run against a 3.0 baseline = 73.3%.
     candidate = _metrics("C", runs=10, medium_high_steps=22, overall=0.9, macro=0.9)
     baseline = _metrics("B", runs=10, medium_high_steps=30, overall=0.9, macro=0.9)
@@ -282,11 +278,19 @@ def test_overall_alone_is_not_enough_macro_must_pass_too(
     # candidate that collapses onto the majority class keeps overall
     # agreement (0.90 vs 0.91) and loses the minority classes (0.40 vs 0.80).
     candidate = _metrics(
-        "C", runs=10, medium_high_steps=0, overall=0.90, macro=0.40,
+        "C",
+        runs=10,
+        medium_high_steps=0,
+        overall=0.90,
+        macro=0.40,
         actions={"quick_apply": 10},
     )
     baseline = _metrics(
-        "B", runs=10, medium_high_steps=0, overall=0.91, macro=0.80,
+        "B",
+        runs=10,
+        medium_high_steps=0,
+        overall=0.91,
+        macro=0.80,
         actions={"quick_apply": 7, "wait": 3},
     )
 
@@ -363,9 +367,7 @@ def test_notes_carry_the_system_a_structural_caveat_and_the_exact_numbers(
     assert SYSTEM_A_CAVEAT in result.describe()
 
 
-def test_reading_the_holdout_is_flagged_in_the_notes(
-    conn: sqlite3.Connection, cfg: Config
-) -> None:
+def test_reading_the_holdout_is_flagged_in_the_notes(conn: sqlite3.Connection, cfg: Config) -> None:
     candidate = _metrics("C", runs=10, medium_high_steps=0, overall=0.9, macro=0.9)
     baseline = _metrics("B", runs=10, medium_high_steps=0, overall=0.9, macro=0.9)
 
@@ -400,9 +402,7 @@ def test_gate_tolerance_is_small_enough_to_be_meaningless_on_real_corpora() -> N
 # ---------------------------------------------------------------------------
 
 
-def test_agent_gate_end_to_end_over_synthetic_runs(
-    conn: sqlite3.Connection, cfg: Config
-) -> None:
+def test_agent_gate_end_to_end_over_synthetic_runs(conn: sqlite3.Connection, cfg: Config) -> None:
     # 10 cases. A and B and C all agree on the action. B runs
     # `company_events` (medium) on every case; C runs it on 7 of them, so
     # C's rate is exactly 70% of B's.
@@ -554,9 +554,7 @@ def test_product_gate_passes_only_with_enough_held_out_evidence(
     assert "pass:" in result.reason
 
     # Same data, recommendation reversed: enough evidence, worse result.
-    conn.execute(
-        "UPDATE runs SET final_decision = ? WHERE id = 'a-rec'", (_decision("wait"),)
-    )
+    conn.execute("UPDATE runs SET final_decision = ? WHERE id = 'a-rec'", (_decision("wait"),))
     conn.execute(
         "UPDATE runs SET final_decision = ? WHERE id = 'a-other'", (_decision("apply_now"),)
     )
@@ -569,9 +567,7 @@ def test_product_gate_defaults_to_the_held_out_split(conn: sqlite3.Connection) -
     # every other entry point, and deliberately so.
     splits = {"dev-posting": "dev"}
     _add_posting(conn, "dev-posting")
-    _add_run(
-        conn, "a-dev", system="A", posting_id="dev-posting", action="quick_apply", mode="live"
-    )
+    _add_run(conn, "a-dev", system="A", posting_id="dev-posting", action="quick_apply", mode="live")
     _add_outcome(conn, "dev-posting", "applied", count=40)
 
     result = product_gate(conn, splits=splits)

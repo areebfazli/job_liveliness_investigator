@@ -267,9 +267,7 @@ def test_archive_only_posting_carries_the_derived_interval(conn: sqlite3.Connect
 def test_first_observed_moves_earlier_and_last_seen_open_moves_later(
     conn: sqlite3.Connection,
 ) -> None:
-    posting_id = add_posting(
-        conn, job_id="j1", first_observed=at(5), last_seen_open=at(6)
-    )
+    posting_id = add_posting(conn, job_id="j1", first_observed=at(5), last_seen_open=at(6))
     # Archive discovers the posting existed earlier; own capture is newer.
     add_capture(conn, at(1), [job("j1", title="Backend Engineer")], source="archive")
     add_capture(conn, at(9), [job("j1", title="Backend Engineer")], source="own")
@@ -285,9 +283,7 @@ def test_first_observed_moves_earlier_and_last_seen_open_moves_later(
 
 
 def test_later_derived_values_never_widen_a_stored_lifecycle(conn: sqlite3.Connection) -> None:
-    posting_id = add_posting(
-        conn, job_id="j1", first_observed=at(0), last_seen_open=at(20)
-    )
+    posting_id = add_posting(conn, job_id="j1", first_observed=at(0), last_seen_open=at(20))
     # Archive history is strictly weaker: it starts later and ends earlier.
     add_capture(conn, at(3), [job("j1", title="Backend Engineer")], source="archive")
     add_capture(conn, at(5), [job("j1", title="Backend Engineer")], source="archive")
@@ -305,9 +301,7 @@ def test_archive_absence_never_regresses_an_own_confirmed_open_posting(
     # Own daily snapshots saw this posting open on day 10. A sparse archive
     # capture on day 5 did not list it — that is the archive being a weaker
     # observer, NOT the posting closing.
-    posting_id = add_posting(
-        conn, job_id="j1", first_observed=at(0), last_seen_open=at(10)
-    )
+    posting_id = add_posting(conn, job_id="j1", first_observed=at(0), last_seen_open=at(10))
     add_capture(conn, at(2), [job("j1", title="Backend Engineer")], source="archive")
     add_capture(conn, at(5), [job("j2", title="Designer")], source="archive")
 
@@ -323,9 +317,7 @@ def test_archive_absence_never_regresses_an_own_confirmed_open_posting(
 def test_first_seen_absent_is_written_when_own_data_does_not_contradict_it(
     conn: sqlite3.Connection,
 ) -> None:
-    posting_id = add_posting(
-        conn, job_id="j1", first_observed=at(0), last_seen_open=at(2)
-    )
+    posting_id = add_posting(conn, job_id="j1", first_observed=at(0), last_seen_open=at(2))
     add_capture(conn, at(2), [job("j1", title="Backend Engineer")], source="archive")
     add_capture(conn, at(6), [], source="archive")
 

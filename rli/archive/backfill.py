@@ -578,9 +578,7 @@ def _extract_greenhouse(soup: BeautifulSoup, tenant: str, *, min_chars: int) -> 
 
         paragraphs = [c for c in anchor.children if isinstance(c, Tag) and c.name == "p"]
         title_text = _text_skipping_metadata(paragraphs[0]) if paragraphs else None
-        location = (
-            _clean(paragraphs[1].get_text(" ", strip=True)) if len(paragraphs) > 1 else None
-        )
+        location = _clean(paragraphs[1].get_text(" ", strip=True)) if len(paragraphs) > 1 else None
 
         card = anchor.find_parent("tr") or anchor.parent or anchor
         department = anchor.find_parent(class_="job-posts--table--department")
@@ -739,9 +737,7 @@ def _extract_generic(
         out.append(
             _Extracted(
                 job_id=job_id,
-                title_candidates=_title_candidates(
-                    card, anchor, primary=(), min_chars=min_chars
-                ),
+                title_candidates=_title_candidates(card, anchor, primary=(), min_chars=min_chars),
                 team=None,
                 location=_select_text(card, ".location, .job-location"),
                 url=href,
@@ -886,8 +882,7 @@ def _parse_html_board(
     reasons: list[str] = []
     if not entries:
         reasons.append(
-            "no job entries could be extracted from the archived board page "
-            "(JS-rendered board?)"
+            "no job entries could be extracted from the archived board page (JS-rendered board?)"
         )
     elif drop_reasons:
         reasons.append(
@@ -1093,8 +1088,8 @@ def run_backfill(
     closed before returning.
     """
     owns_net = net is None
-    client = net if net is not None else NetClient.from_config(
-        cfg, probe="archive_backfill", conn=conn
+    client = (
+        net if net is not None else NetClient.from_config(cfg, probe="archive_backfill", conn=conn)
     )
     try:
         return [

@@ -37,10 +37,12 @@ def _long_history(
     add_posting(conn, job_id="old1", title=TITLE, team="Infrastructure", location="Remote")
     add_posting(conn, job_id="twin1", title=TITLE, team="Infrastructure", location="Remote")
 
-    old = job("old1", title=TITLE, team="Infrastructure", location="Remote",
-              description_hash=old_hash)
-    twin = job("twin1", title=TITLE, team="Infrastructure", location="Remote",
-               description_hash=twin_hash)
+    old = job(
+        "old1", title=TITLE, team="Infrastructure", location="Remote", description_hash=old_hash
+    )
+    twin = job(
+        "twin1", title=TITLE, team="Infrastructure", location="Remote", description_hash=twin_hash
+    )
 
     for day in (0, 10, 20):
         add_capture(conn, at(day), [old])
@@ -121,9 +123,7 @@ def test_partial_capture_day_is_attempted_but_not_covered(conn: sqlite3.Connecti
 # ---------------------------------------------------------------------------
 
 
-def test_thin_history_yields_unknown_repost_pattern(
-    conn: sqlite3.Connection, cfg: Config
-) -> None:
+def test_thin_history_yields_unknown_repost_pattern(conn: sqlite3.Connection, cfg: Config) -> None:
     # Five days of history, well under thresholds.min_history_days.
     add_posting(conn, job_id="old1", title=TITLE)
     add_capture(conn, at(0), [job("old1", title=TITLE)])
@@ -144,9 +144,7 @@ def test_thin_history_yields_unknown_repost_pattern(
     assert features.censoring == "interval"
 
 
-def test_no_history_at_all_yields_unknown_not_none(
-    conn: sqlite3.Connection, cfg: Config
-) -> None:
+def test_no_history_at_all_yields_unknown_not_none(conn: sqlite3.Connection, cfg: Config) -> None:
     add_posting(conn, job_id="old1", title=TITLE, first_observed=at(0), first_seen_absent=at(1))
 
     features = posting_features(conn, cfg, OLD_POSTING)
@@ -156,9 +154,7 @@ def test_no_history_at_all_yields_unknown_not_none(
     assert features.repost_pattern is UNKNOWN
 
 
-def test_sufficient_history_with_no_link_yields_none(
-    conn: sqlite3.Connection, cfg: Config
-) -> None:
+def test_sufficient_history_with_no_link_yields_none(conn: sqlite3.Connection, cfg: Config) -> None:
     add_posting(conn, job_id="old1", title=TITLE)
     add_capture(conn, at(0), [job("old1", title=TITLE)])
     add_capture(conn, at(40), [])
@@ -245,9 +241,20 @@ def test_long_lived_is_true_once_the_age_lower_bound_passes_the_threshold(
     assert features.long_lived is True
 
 
-def test_long_lived_is_unknown_when_history_cannot_rule_out_an_older_posting(
+def test_long_lived_is_false_on_thin_history_now_that_the_hedge_is_gone(
     conn: sqlite3.Connection, cfg: Config
 ) -> None:
+    """spec.md §5's Amendment 2026-09-10 removed the coverage hedge.
+
+    A 40-day-old posting used to report `long_lived=UNKNOWN` whenever the
+    company's own history span was shorter than `long_lived_days`, on the
+    grounds that the posting might predate our first capture. The amendment
+    replaces that: `age_days` now starts from the earliest of the ATS publish
+    date, the earliest archive capture and `first_observed`, and `long_lived`
+    is the plain comparison against the threshold. See
+    `rli.history.features`' module docstring for why a wrong `False` is safe
+    — it can only BLOCK the policy's P4 `skip`, never enable it.
+    """
     add_posting(conn, job_id="old1", title=TITLE)
     add_capture(conn, at(0), [job("old1", title=TITLE)])
     add_capture(conn, at(40), [job("old1", title=TITLE)])
@@ -256,10 +263,52 @@ def test_long_lived_is_unknown_when_history_cannot_rule_out_an_older_posting(
     features = posting_features(conn, cfg, OLD_POSTING, now=at(40))
 
     assert features.age_days == 40.0
-    assert features.long_lived is UNKNOWN, "40 days of history cannot prove 'not long-lived'"
+    assert features.long_lived is False
 
 
-def test_long_lived_is_false_only_when_history_reaches_back_far_enough(
+def test_long_lived_is_unknown_only_when_every_origin_is_absent(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    """No publish date, no archive capture, no `first_observed` -> UNKNOWN.
+
+    The one remaining UNKNOWN case: with nothing at all to date the posting
+    from, `age_days` is not a number and `long_lived` must not be `False`
+    (spec.md §4: "missing history never means flat hiring").
+    """
+    add_posting(conn, job_id="old1", title=TITLE, first_observed=None)
+
+    features = posting_features(conn, cfg, OLD_POSTING, now=at(40))
+
+    assert features.age_days is UNKNOWN
+    assert features.long_lived is UNKNOWN
+
+
+def test_the_ats_publish_date_can_make_a_young_looking_posting_long_lived(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    """The amendment's point: `long_lived` no longer depends on OUR start date.
+
+    We first observed this posting 10 days ago, but the ATS says it was
+    published well beyond the threshold — so it is long-lived, and the
+    caller's `first_published` is what says so.
+    """
+    add_posting(conn, job_id="old1", title=TITLE, first_observed=at(30))
+    add_capture(conn, at(30), [job("old1", title=TITLE)])
+    apply_to_postings(conn)
+
+    features = posting_features(
+        conn,
+        cfg,
+        OLD_POSTING,
+        now=at(40),
+        first_published=at(40 - cfg.thresholds.long_lived_days - 5),
+    )
+
+    assert features.age_days == pytest.approx(cfg.thresholds.long_lived_days + 5)
+    assert features.long_lived is True
+
+
+def test_long_lived_is_false_when_the_earliest_origin_is_inside_the_threshold(
     conn: sqlite3.Connection, cfg: Config
 ) -> None:
     span = cfg.thresholds.long_lived_days + 20

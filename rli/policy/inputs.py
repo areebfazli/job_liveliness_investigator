@@ -28,9 +28,22 @@ as the contract that layer must satisfy:
 * `board_absent` — the posting's job id was NOT in a `board_snapshot`
   capture. Needed for the "resolver says open but a fresher board snapshot
   lacks the job" contradiction (see `rli.policy.quality`).
+* `refreshed_at` — an ATS `updated_at` timestamp that COINCIDES with a
+  content-hash change actually observed in our own or archived captures
+  (spec.md §5, Amendment 2026-09-10). `value`/`source_event_at` are the ATS
+  timestamp; `available_at` is the later of the `updated_at` claim's own
+  `available_at` and the capture that revealed the change, because we could
+  not have known about the change before that capture. Synthesized by
+  `rli.eval.case` (which holds the corpus connection) and attributed to its
+  own non-network probe name, for the same reason `board_absent` is: no
+  probe fetched it, it is a re-reading of captures we already hold.
 
 Already emitted by `rli.probes.resolve_posting`: `first_published`,
-`updated_at`, `declared_expiry`, `board_listing`.
+`updated_at`, `declared_expiry`, `board_listing`. Note that `updated_at`
+comes from the ALWAYS-RUN resolver and from nowhere else — no dynamic probe
+emits publish or refresh evidence — which is why `publish_recency` cannot
+move during the agent loop and why `could_change_action` holds
+`last_refreshed_at` fixed rather than enumerating it.
 
 --------------------------------------------------------------------------
 Judgment calls (documented because they are not forced by spec.md)
@@ -45,6 +58,15 @@ Judgment calls (documented because they are not forced by spec.md)
   `not_recent`. Under the current §5 table both block `apply_now`
   identically, but only UNKNOWN keeps the question open for the controller
   (and `rli.policy.quality` separately marks archive-only evidence weak).
+* **`publish_recency` measures the latest of publication and REFRESH.**
+  spec.md §5's Amendment 2026-09-10 redefines `recent` as "latest of first
+  publish **or** an ATS `updated_at` that coincides with an observed
+  content-hash change, <= 30 days ago". `last_publish_or_refresh` is that
+  "latest of"; a bare `updated_at` never reaches it, because only a
+  corroborated refresh is turned into a `refreshed_at` claim upstream. With
+  neither a primary publish claim nor a `refreshed_at` claim the input stays
+  UNKNOWN — unchanged behaviour, and still "we have not established a
+  trustworthy date" rather than `not_recent`.
 * **Ties are broken toward the EARLIEST date.** Within the best available
   source tier, the earliest `source_event_at` wins, because `first_published`
   means the first publication; taking the latest would understate the
@@ -71,11 +93,12 @@ Judgment calls (documented because they are not forced by spec.md)
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from datetime import datetime, timedelta
 from itertools import product
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
+from rli.events.policy_signals import EventSignals
 from rli.models.decision import EvidenceQuality, RecommendedAction
 from rli.models.evidence import EvidenceItem
 from rli.models.policy_inputs import (
@@ -98,11 +121,14 @@ __all__ = [
     "CLAIM_DECLARED_EXPIRY",
     "CLAIM_FIRST_PUBLISHED",
     "CLAIM_POSTING_STATE",
+    "CLAIM_REFRESHED_AT",
     "CLAIM_TEAM_SIGNAL",
     "PRIMARY_PUBLISH_QUALITIES",
     "best_publish_claim",
     "could_change_action",
     "derive_policy_inputs",
+    "last_publish_or_refresh",
+    "newest_refresh_claim",
     "unpopulated",
 ]
 
@@ -112,6 +138,7 @@ CLAIM_DECLARED_EXPIRY = "declared_expiry"
 CLAIM_BOARD_LISTING = "board_listing"
 CLAIM_BOARD_ABSENT = "board_absent"
 CLAIM_TEAM_SIGNAL = "corroborating_hiring_signal"
+CLAIM_REFRESHED_AT = "refreshed_at"
 
 # spec.md §3 source ranking, best first. Only these two count as "primary
 # publish evidence" for spec.md §5's `apply_now` branch.
@@ -181,13 +208,60 @@ def best_publish_claim(evidence: Sequence[EvidenceItem]) -> EvidenceItem | None:
     )
 
 
+def newest_refresh_claim(evidence: Sequence[EvidenceItem]) -> EvidenceItem | None:
+    """The freshest `refreshed_at` claim, or `None`.
+
+    The sibling of `best_publish_claim`, and public for the same reason: the
+    explanation layer must cite the very claim whose date the policy used,
+    not merely restate the date.
+
+    There is no source ranking to apply — `refreshed_at` is synthesized only
+    from an `ats_native` `updated_at` corroborated by an observed hash change
+    (`rli.eval.case`), so every such claim is already primary. Freshness is
+    therefore the only ordering, and it is `_newest`'s (`available_at` first,
+    matching the replay window). Claims without a parsed `source_event_at`
+    are dropped for the same reason `best_publish_claim` drops them: a date
+    we cannot place on the timeline cannot answer "is it recent?".
+    """
+    return _newest(
+        [c for c in _claims(evidence, CLAIM_REFRESHED_AT) if c.source_event_at is not None]
+    )
+
+
+def last_publish_or_refresh(evidence: Sequence[EvidenceItem]) -> datetime | None:
+    """The latest of the best primary publish date and the newest refresh date.
+
+    This is spec.md §5 Amendment 2026-09-10's "latest of first publish **or**
+    an ATS `updated_at` that coincides with an observed content-hash change".
+    `None` when neither exists — "we hold no date for when this posting last
+    moved", which the policy's P3c branch reads as "not refreshed since the
+    event" and `_publish_recency` reads as UNKNOWN.
+
+    Note the asymmetry with `best_publish_claim`, which breaks ties toward
+    the EARLIEST date because `first_published` means the first publication.
+    Here the reduction is MAX, because the question is the opposite one: when
+    did this posting last show any sign of life.
+    """
+    best = best_publish_claim(evidence)
+    refresh = newest_refresh_claim(evidence)
+    dates = [
+        d
+        for d in (
+            best.source_event_at if best is not None else None,
+            refresh.source_event_at if refresh is not None else None,
+        )
+        if d is not None
+    ]
+    return max(dates) if dates else None
+
+
 def _publish_recency(
     evidence: Sequence[EvidenceItem], now: datetime, recent_publish_days: int
 ) -> PublishRecency | Unknown:
-    best = best_publish_claim(evidence)
-    if best is None or best.source_event_at is None:
+    latest = last_publish_or_refresh(evidence)
+    if latest is None:
         return UNKNOWN
-    age = now - best.source_event_at
+    age = now - latest
     return "recent" if age <= timedelta(days=recent_publish_days) else "not_recent"
 
 
@@ -214,11 +288,7 @@ def _declared_expiry(
 
 def _team_signal(evidence: Sequence[EvidenceItem]) -> bool | Unknown:
     claim = _newest(
-        [
-            c
-            for c in _claims(evidence, CLAIM_TEAM_SIGNAL)
-            if c.probe == _TEAM_SIGNAL_PROBE
-        ]
+        [c for c in _claims(evidence, CLAIM_TEAM_SIGNAL) if c.probe == _TEAM_SIGNAL_PROBE]
     )
     if claim is None:
         return UNKNOWN
@@ -238,7 +308,7 @@ def _team_signal(evidence: Sequence[EvidenceItem]) -> bool | Unknown:
 def derive_policy_inputs(
     evidence: Sequence[EvidenceItem],
     features: PostingHistoryFeatures | None,
-    event_signals: tuple[bool | Unknown, bool | Unknown] | None,
+    event_signals: EventSignals | None,
     now: datetime,
     *,
     cfg: Config | PolicyThresholds | None = None,
@@ -252,9 +322,13 @@ def derive_policy_inputs(
         features: `rli.history.features.posting_features` output, or `None`
             when no history exists (leaves `repost_pattern` UNKNOWN — spec.md
             §4: "missing history never means flat hiring").
-        event_signals: the `(material_negative_event, freeze_or_pause)` pair
-            returned by `rli.events.policy_signals.derive_policy_signals`, or
-            `None` when `company_events` has not run (both UNKNOWN).
+        event_signals: the `EventSignals` triple
+            `(material_negative_event, freeze_or_pause,
+            last_material_event_at)` returned by
+            `rli.events.policy_signals.derive_policy_signals`, or `None` when
+            `company_events` has not run (all three UNKNOWN). The three are
+            taken as a unit precisely because they are three readings of one
+            windowed event list; see that module.
         now: the decision clock. Must be timezone-aware.
         cfg: `Config` or `PolicyThresholds`; supplies `recent_publish_days`.
             Defaults to the loaded project config.
@@ -270,8 +344,8 @@ def derive_policy_inputs(
     thresholds = _PolicyThresholds.coerce(cfg)
 
     posting_state = _posting_state(evidence)
-    material_negative_event, freeze_or_pause = (
-        event_signals if event_signals is not None else (UNKNOWN, UNKNOWN)
+    material_negative_event, freeze_or_pause, last_material_event_at = (
+        event_signals if event_signals is not None else (UNKNOWN, UNKNOWN, UNKNOWN)
     )
 
     from_evidence = _team_signal(evidence)
@@ -285,6 +359,7 @@ def derive_policy_inputs(
         declared_expiry=_declared_expiry(evidence, posting_state, resolver_ok=resolver_ok),
         repost_pattern=(features.repost_pattern if features is not None else UNKNOWN),
         corroborating_hiring_signal=corroborating,
+        last_material_event_at=last_material_event_at,
     )
 
 
@@ -305,12 +380,24 @@ def unpopulated(inputs: PolicyInputs) -> set[str]:
 
 # Enumeration domains for the brute-force relevance search below. Every
 # domain includes UNKNOWN so that "stays unresolved" is one of the outcomes
-# considered. `declared_expiry` is a datetime, i.e. an infinite domain, so it
-# is sampled at the four points the policy can distinguish: absent, already
-# passed, inside the recheck cap, and beyond the recheck cap.
+# considered, and **UNKNOWN is index 0 of every domain** — the flat-index
+# arithmetic in `could_change_action` relies on that to locate the "all other
+# free fields still unresolved" slice without searching for it.
+#
+# Two fields are datetimes, i.e. infinite domains, so each is sampled at the
+# points the policy can distinguish, expressed as TOKENS that a per-field
+# materializer turns into real datetimes anchored to something:
+#
+# * `declared_expiry` is anchored to `now` (absent, already passed, inside
+#   the recheck cap, beyond the cap) — the four cases `_recheck_after_days`
+#   separates;
+# * `last_material_event_at` is anchored to `last_refreshed_at` (absent,
+#   before the refresh, after the refresh) — the only distinction P3c draws.
 _EXPIRY_PAST = "past"
 _EXPIRY_SOON = "soon"
 _EXPIRY_FAR = "far"
+_EVENT_BEFORE_REFRESH = "event_before_refresh"
+_EVENT_AFTER_REFRESH = "event_after_refresh"
 
 _INPUT_DOMAINS: dict[str, tuple[Any, ...]] = {
     "posting_state": (UNKNOWN, "open", "closed", "reposted", "unknown"),
@@ -320,20 +407,65 @@ _INPUT_DOMAINS: dict[str, tuple[Any, ...]] = {
     "declared_expiry": (UNKNOWN, None, _EXPIRY_PAST, _EXPIRY_SOON, _EXPIRY_FAR),
     "repost_pattern": (UNKNOWN, "repeated_unchanged", "changed", "none"),
     "corroborating_hiring_signal": (UNKNOWN, True, False),
+    "last_material_event_at": (
+        UNKNOWN,
+        None,
+        _EVENT_BEFORE_REFRESH,
+        _EVENT_AFTER_REFRESH,
+    ),
 }
 
 _QUALITY_DOMAIN = ("strong", "mixed", "weak")
 _LONG_LIVED_DOMAIN: tuple[bool | Unknown, ...] = (UNKNOWN, True, False)
 
 
-def _materialize_expiry(token: Any, now: datetime, cap_days: int) -> Any:
+class _Anchors(NamedTuple):
+    """The reference points the datetime domains are materialized against."""
+
+    now: datetime
+    cap_days: int
+    last_refreshed_at: datetime | None | Unknown
+
+
+def _materialize_expiry(token: Any, anchors: _Anchors) -> Any:
     if token is _EXPIRY_PAST:
-        return now - timedelta(days=1)
+        return anchors.now - timedelta(days=1)
     if token is _EXPIRY_SOON:
-        return now + timedelta(days=max(cap_days - 1, 0))
+        return anchors.now + timedelta(days=max(anchors.cap_days - 1, 0))
     if token is _EXPIRY_FAR:
-        return now + timedelta(days=cap_days + 30)
+        return anchors.now + timedelta(days=anchors.cap_days + 30)
     return token
+
+
+def _materialize_event_date(token: Any, anchors: _Anchors) -> Any:
+    """Place a material-event date on either side of `last_refreshed_at`.
+
+    When there is no refresh date, "before" and "after" are not distinct
+    situations — P3c's `not (refresh > event)` conjunct is vacuously true
+    whatever the event date is — so both tokens collapse onto the same
+    instant. That is behaviourally identical and keeps the domain a constant
+    size, so the flat-index arithmetic does not have to special-case it.
+    """
+    anchor = anchors.last_refreshed_at
+    if not isinstance(anchor, datetime):
+        if token in (_EVENT_BEFORE_REFRESH, _EVENT_AFTER_REFRESH):
+            return anchors.now - timedelta(days=1)
+        return token
+    if token is _EVENT_BEFORE_REFRESH:
+        return anchor - timedelta(days=1)
+    if token is _EVENT_AFTER_REFRESH:
+        return anchor + timedelta(days=1)
+    return token
+
+
+#: Per-field token -> value. A field absent from this map has a literal
+#: domain and is used as-is. Generalized from the two inline `name ==
+#: "declared_expiry"` special cases the single-datetime version had, so a
+#: third sampled datetime field is a dict entry rather than another branch.
+_MATERIALIZERS: dict[str, Callable[[Any, _Anchors], Any]] = {
+    "declared_expiry": _materialize_expiry,
+    "last_material_event_at": _materialize_event_date,
+}
 
 
 def could_change_action(
@@ -342,6 +474,7 @@ def could_change_action(
     *,
     quality: EvidenceQuality | None = None,
     long_lived: bool | Unknown = UNKNOWN,
+    last_refreshed_at: datetime | None | Unknown = UNKNOWN,
     now: datetime | None = None,
     cfg: Config | PolicyThresholds | None = None,
 ) -> set[str]:
@@ -388,10 +521,61 @@ def could_change_action(
             enumerated when UNKNOWN. It is never a member of the returned
             set: that set is always a subset of `PolicyInputs` field names,
             which is what the controller maps to probes.
+        last_refreshed_at: `last_publish_or_refresh(evidence)`, read by the
+            P3c branch. Held FIXED, never enumerated, unlike `long_lived`:
+            publish and refresh evidence comes only from the always-run
+            `resolve_posting` and from `rli.eval.case`'s re-reading of
+            captures we already hold, so no dynamic probe can move it during
+            the loop and enumerating it would multiply the search space for
+            no gain. Its default (UNKNOWN, i.e. "no refresh date") is also
+            the conservative direction: it is the value under which
+            `material_negative_event` and `last_material_event_at` stay
+            relevant, so a caller that forgets to pass it can only keep a
+            question open too long, never close one too early.
 
-    Cost: bounded by the product of the domains above (<= 8100 assignments
-    times up to 3 qualities times up to 3 `long_lived` values), each a pure
-    dict/branch evaluation. Fully populated inputs cost nothing.
+    Cost: bounded by the product of the domains above (<= 32400 assignments
+    times up to 3 qualities times up to 3 `long_lived` values, i.e. <= 291600
+    `_branch` evaluations), each a pure dict/branch evaluation. Fully
+    populated inputs cost nothing.
+
+    --------------------------------------------------------------------
+    How the enumeration is made cheap (and why it is still honest)
+    --------------------------------------------------------------------
+
+    Two optimizations, both forced by that bound — a straightforward
+    implementation spends most of its time in pydantic and in tuple/dict
+    bookkeeping rather than in the policy:
+
+    1. **One stand-in `PolicyInputs`, mutated in place through
+       `__dict__`.** Constructing a model per assignment dominated the
+       profile. `_branch` is a PURE function: it reads fields off its
+       argument, returns a tuple, and neither retains nor mutates the
+       object — so a single instance can be re-used for every assignment.
+       Writing `stand_in.__dict__[name] = value` bypasses pydantic's
+       `__setattr__` (and its validation) entirely, which is safe here
+       because every value written comes from a CLOSED enumeration domain
+       defined in this module, not from user input; there is nothing to
+       validate. It is a real `PolicyInputs`, so nothing about `_branch`'s
+       type contract is being faked. **Revisit this if `_branch` ever
+       retains, mutates or hashes its argument.**
+    2. **A flat `list` indexed by a mixed-radix index**, over the dimensions
+       `(quality, long_lived, *free_fields)` with the outer dimensions
+       first, instead of a dict keyed by tuples. Because UNKNOWN is index 0
+       of every domain, the "vary field `i`, hold every other free field
+       unresolved" slice the DIRECT test needs is exactly
+       `base + k * stride_i`, and the groups the JOINT test needs (two
+       assignments differing ONLY at index `i`, same quality and
+       `long_lived`) are exactly the arithmetic sequences of stride
+       `stride_i` and length `size_i` inside each `stride_i * size_i` span.
+       That equivalence is what makes this the same test the tuple-keyed
+       version performed, just without materializing the keys.
+
+    Measured on the all-UNKNOWN worst case (every field free, all three
+    qualities, all three `long_lived` values — 291,600 `_branch` calls): the
+    straightforward implementation takes ~3.9 s, this one ~0.63 s. The
+    numbers are indicative of one machine, not a contract; what is a
+    contract is that this function runs inside the agent loop once per
+    iteration, so a multi-second worst case would be a real cost.
     """
     # `_branch`, not `decide`: branch selection IS the action, and it is the
     # function `policy_version()` hashes, so this enumeration can never drift
@@ -408,74 +592,71 @@ def could_change_action(
         return set()
 
     qualities = (quality,) if quality is not None else _QUALITY_DOMAIN
-    long_lived_values = (
-        (long_lived,) if not isinstance(long_lived, Unknown) else _LONG_LIVED_DOMAIN
-    )
+    long_lived_values = (long_lived,) if not isinstance(long_lived, Unknown) else _LONG_LIVED_DOMAIN
 
-    base = inputs.model_dump()
-    # Materialize the expiry tokens once, up front: the inner loop below runs
-    # tens of thousands of times and must stay pure tuple/dict work.
-    domains = [
-        tuple(
-            _materialize_expiry(token, now, thresholds.recheck_cap_days)
-            for token in _INPUT_DOMAINS[name]
+    # Materialize the datetime tokens once, up front: the inner loop below
+    # runs hundreds of thousands of times and must stay pure attribute work.
+    anchors = _Anchors(now, thresholds.recheck_cap_days, last_refreshed_at)
+    domains: list[tuple[Any, ...]] = []
+    for name in free_fields:
+        materializer = _MATERIALIZERS.get(name)
+        raw = _INPUT_DOMAINS[name]
+        domains.append(
+            raw if materializer is None else tuple(materializer(t, anchors) for t in raw)
         )
-        if name == "declared_expiry"
-        else _INPUT_DOMAINS[name]
-        for name in free_fields
-    ]
 
-    # action_by[(quality, long_lived, assignment)] -> action, where
-    # `assignment` is the tuple of values for `free_fields` in order.
-    action_by: dict[tuple[Any, ...], RecommendedAction] = {}
-    for q, ll, assignment in product(qualities, long_lived_values, product(*domains)):
-        candidate = dict(base)
-        candidate.update(zip(free_fields, assignment, strict=True))
-        action_by[(q, ll, assignment)] = _branch(
-            PolicyInputs.model_construct(**candidate),
-            q,  # type: ignore[arg-type]
-            ll,
-        )[1]
+    sizes = [len(domain) for domain in domains]
+    # Mixed-radix strides over the free fields, last field varying fastest —
+    # which is precisely the order `itertools.product` yields.
+    strides = [0] * len(free_fields)
+    block_size = 1
+    for index in range(len(free_fields) - 1, -1, -1):
+        strides[index] = block_size
+        block_size *= sizes[index]
 
-    # Every free field is UNKNOWN by definition, and UNKNOWN is in every
-    # domain, so the current assignment is always a key of `action_by`.
-    current_assignment = tuple(UNKNOWN for _ in free_fields)
+    # Built once and reused for every (quality, long_lived) block: the
+    # assignment sequence does not depend on either.
+    assignments = list(product(*domains))
+
+    stand_in = PolicyInputs.model_construct(**inputs.model_dump())
+    fields = stand_in.__dict__  # see docstring: deliberate, and safe here
+    actions: list[RecommendedAction] = []
+    for q in qualities:
+        for ll in long_lived_values:
+            for assignment in assignments:
+                for name, value in zip(free_fields, assignment, strict=True):
+                    fields[name] = value
+                actions.append(_branch(stand_in, q, ll, last_refreshed_at)[1])  # type: ignore[arg-type]
+
     relevant: set[str] = set()
-
     for index, name in enumerate(free_fields):
-        domain = domains[index]
+        size_i, stride_i = sizes[index], strides[index]
 
         # Direct test: vary `name` alone, against the action we hold now.
-        for q in qualities:
-            for ll in long_lived_values:
-                for value in domain:
-                    key = (q, ll, _replaced(current_assignment, index, value))
-                    if action_by[key] != current_action:
-                        relevant.add(name)
-                        break
-                if name in relevant:
-                    break
-            if name in relevant:
-                break
-        if name in relevant:
+        # Every other free field is UNKNOWN, i.e. index 0 of its domain, so
+        # the current assignment sits at offset 0 of each block.
+        if any(
+            actions[base + k * stride_i] != current_action
+            for base in range(0, len(actions), block_size)
+            for k in range(size_i)
+        ):
+            relevant.add(name)
             continue
 
         # Joint test: does `name` ever move the action, holding some
-        # assignment of the other unresolved inputs fixed?
-        seen: dict[tuple[Any, ...], RecommendedAction] = {}
-        for key, action in action_by.items():
-            q, ll, assignment = key
-            others = (q, ll, _replaced(assignment, index, None))
-            previous = seen.setdefault(others, action)
-            if previous != action:
-                relevant.add(name)
-                break
+        # assignment of the other unresolved inputs (and of quality /
+        # long_lived) fixed? Each `stride_i * size_i` span contains exactly
+        # `stride_i` such groups, interleaved.
+        span = stride_i * size_i
+        if any(
+            actions[start + offset + k * stride_i] != actions[start + offset]
+            for start in range(0, len(actions), span)
+            for offset in range(stride_i)
+            for k in range(1, size_i)
+        ):
+            relevant.add(name)
 
     return relevant
-
-
-def _replaced(assignment: tuple[Any, ...], index: int, value: Any) -> tuple[Any, ...]:
-    return assignment[:index] + (value,) + assignment[index + 1 :]
 
 
 def _reference_now() -> datetime:

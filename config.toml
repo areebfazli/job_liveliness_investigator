@@ -29,8 +29,21 @@ max_dynamic_steps = 4
 
 # A posting's publish evidence is considered "recent" if its age in days is
 # <= this value. Used to populate the `publish_recency` policy input.
+# Raised from 14 to 30 by spec.md §5's Amendment 2026-09-10, which also
+# redefines WHAT is measured: not just the first publish date, but the later
+# of that and a corroborated ATS refresh (see refresh_match_days below).
 # PLACEHOLDER — not yet tuned.
-recent_publish_days = 14
+recent_publish_days = 30
+
+# How close (in days) an ATS `updated_at` timestamp must be to an OBSERVED
+# content-hash change before the two count as the SAME event — spec.md §5
+# Amendment 2026-09-10: "an ATS `updated_at` that coincides with an observed
+# content-hash change". Captures only BRACKET a change (we see hash A at one
+# capture and hash B at the next), so "coincides" means the timestamp falls
+# inside that capture interval widened by this many days at each end. A bare
+# `updated_at` with no observed hash change never counts, at any tolerance.
+# PLACEHOLDER — not yet tuned.
+refresh_match_days = 3
 
 # A posting/board history is considered "long-lived" if its observed history
 # span in days is >= this value. Used for the repost + long-lived branch of
@@ -277,15 +290,21 @@ team_signal = []
 # PLACEHOLDER — not yet tuned.
 contradiction_days = 3
 
-# The four keys below are OVERRIDES of the identically named [thresholds]
+# The six keys below are OVERRIDES of the identically named [thresholds]
 # keys, not copies: when unset (the default), the policy reads the
 # [thresholds] value, so there is exactly one source of truth. Set one here
 # only to pin the POLICY's notion of a term at freeze time (spec.md §5)
 # independently of the history/feature layer that shares the name.
-# recent_publish_days = 14
+# recent_publish_days = 30
 # long_lived_days = 180
 # recheck_default_days = 14
 # recheck_cap_days = 14
+# The last two are applied upstream of the policy function (rli.eval.case
+# and rli.events.policy_signals) but are resolved through
+# rli.policy.action.PolicyThresholds there, so an override set here really
+# does change behaviour — and, like the rest, changes policy_version().
+# refresh_match_days = 3
+# negative_event_window_days = 180
 
 # Numeric cost tiers + rough latency estimates for the dynamic probes
 # (spec.md §4 "Dynamic probes" cost column; PLAN.md M3). rli.probes.registry
@@ -300,12 +319,26 @@ latency_low_s = 2.0
 latency_medium_s = 5.0
 latency_high_s = 12.0
 
-# spec.md §4: team_signal has "no licensed enrichment source" yet
-# (rli.probes.team_signal.NullTeamSignalSource). `enabled = false` keeps it
-# out of rli.probes.registry.eligible_probes entirely until a real source is
-# wired in; corroborating_hiring_signal stays UNKNOWN until then.
+# spec.md §5 "Amendment 2026-09-10" re-sourced this probe: corroborating_hiring_signal
+# now comes from our OWN board history (own + archive snapshots) rather than a licensed
+# enrichment feed — "new roles on the same team in the last 30 days, or closures on the
+# same team in the last 60 days; unknown when team history < min_history_days". See
+# rli.probes.team_signal.BoardHistoryTeamSignalSource. No licence, no network call, so
+# `enabled` now defaults to true; it remains a kill switch, read by TeamSignalProbe.eligible
+# and therefore by rli.probes.registry.eligible_probes.
+#
+# The "watched long enough" bar is deliberately NOT repeated here: the probe reuses
+# [thresholds].min_history_days, the same one repost_history and has_usable_history use
+# (rli.config.TeamSignal explains why one knob, not two). min_coverage is the separate
+# "watched densely enough" bar that lets a count of zero be reported as false instead of
+# UNKNOWN. The 30/60 windows are the frozen policy values from the amendment table.
 [team_signal]
-enabled = false
+enabled = true
+new_roles_window_days = 30
+closures_window_days = 60
+min_new_roles = 1
+min_closures = 1
+min_coverage = 0.5
 
 # spec.md §2: "one structured-output-capable LLM API" (spec.md §7), with LLM
 # outputs cached by `(model_id, prompt_hash, structured_input_hash)` for exact

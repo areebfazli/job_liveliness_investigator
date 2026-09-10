@@ -85,6 +85,11 @@ def _enable_team_signal(ctx: ProbeContext) -> ProbeContext:
     return dataclasses.replace(ctx, config=new_cfg)
 
 
+def _disable_team_signal(ctx: ProbeContext) -> ProbeContext:
+    new_cfg: Config = ctx.config.model_copy(update={"team_signal": TeamSignal(enabled=False)})
+    return dataclasses.replace(ctx, config=new_cfg)
+
+
 def _names(probes: list[type[Probe]]) -> list[str]:
     return [cls.name for cls in probes]
 
@@ -155,9 +160,7 @@ def test_build_args_rejects_an_unregistered_probe_class(
 # ---------------------------------------------------------------------------
 
 
-def test_unpopulated_intersection_gates_every_probe(
-    conn: sqlite3.Connection, ctx_factory
-) -> None:
+def test_unpopulated_intersection_gates_every_probe(conn: sqlite3.Connection, ctx_factory) -> None:
     _seed(conn, history_days=40)
     ctx = _enable_team_signal(_ctx(ctx_factory))
     case = _case()
@@ -187,13 +190,19 @@ def test_unpopulated_intersection_gates_every_probe(
 def test_insufficient_history_excludes_only_the_history_probes(
     conn: sqlite3.Connection, ctx_factory
 ) -> None:
+    """`team_signal` is now ALSO a history probe (`history_required=True`), so
+    thin history excludes it too, alongside `repost_history` and
+    `requirements_drift`. `company_events` is the one dynamic probe with no
+    history gate at all.
+    """
     _seed(conn, history_days=5)
     ctx = _enable_team_signal(_ctx(ctx_factory))
 
     names = _names(eligible_probes(ctx, _case(), set(ALL_INPUTS)))
-    assert names == ["company_events", "team_signal"]
+    assert names == ["company_events"]
     assert "repost_history" not in names
     assert "requirements_drift" not in names
+    assert "team_signal" not in names
 
 
 def test_a_company_with_no_history_at_all_excludes_the_history_probes(
@@ -207,9 +216,12 @@ def test_team_signal_is_gated_by_config(conn: sqlite3.Connection, ctx_factory) -
     _seed(conn, history_days=40)
     ctx = _ctx(ctx_factory)
 
-    # Shipped config: no licensed source -> never a candidate.
-    assert "team_signal" not in _names(eligible_probes(ctx, _case(), set(ALL_INPUTS)))
-    assert eligible_probes(ctx, _case(), {"corroborating_hiring_signal"}) == []
+    # Explicitly disabled config -> never a candidate (the shipped default is
+    # now `enabled=True`, so the "off" half must build its own config rather
+    # than lean on the default).
+    disabled = _disable_team_signal(ctx)
+    assert "team_signal" not in _names(eligible_probes(disabled, _case(), set(ALL_INPUTS)))
+    assert eligible_probes(disabled, _case(), {"corroborating_hiring_signal"}) == []
 
     enabled = _enable_team_signal(ctx)
     assert _names(eligible_probes(enabled, _case(), {"corroborating_hiring_signal"})) == [
@@ -234,9 +246,7 @@ def test_probe_owned_eligibility_excludes_a_posting_that_does_not_exist(
 # ---------------------------------------------------------------------------
 
 
-def test_ranking_is_cheapest_first_then_alphabetical(
-    conn: sqlite3.Connection, ctx_factory
-) -> None:
+def test_ranking_is_cheapest_first_then_alphabetical(conn: sqlite3.Connection, ctx_factory) -> None:
     _seed(conn, history_days=40)
     ctx = _enable_team_signal(_ctx(ctx_factory))
 

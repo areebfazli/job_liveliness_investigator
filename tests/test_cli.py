@@ -100,9 +100,7 @@ def test_load_targets_command_populates_companies_table(tmp_path: Path) -> None:
     csv_path.write_text(TARGETS_CSV_BODY, encoding="utf-8")
     db_path = tmp_path / "rli.db"
 
-    result = runner.invoke(
-        app, ["load-targets", "--targets", str(csv_path), "--db", str(db_path)]
-    )
+    result = runner.invoke(app, ["load-targets", "--targets", str(csv_path), "--db", str(db_path)])
 
     assert result.exit_code == 0, result.stdout
     conn = connect(db_path)
@@ -127,9 +125,7 @@ def test_snapshot_command_runs_capture_and_prints_summary(tmp_path: Path) -> Non
         respx.get("https://boards-api.greenhouse.io/v1/boards/acme/jobs").mock(
             return_value=httpx.Response(200, json=GH_BOARD)
         )
-        result = runner.invoke(
-            app, ["snapshot", "--targets", str(csv_path), "--db", str(db_path)]
-        )
+        result = runner.invoke(app, ["snapshot", "--targets", str(csv_path), "--db", str(db_path)])
 
     assert result.exit_code == 0, result.stdout
     assert "companies: ok=1" in result.stdout

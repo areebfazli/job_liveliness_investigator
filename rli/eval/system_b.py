@@ -454,9 +454,7 @@ def select_routed_probes(
 
     allowed = {
         probe_cls.name
-        for probe_cls in eligible_probes(
-            ctx, case_file, unpopulated_inputs=set(ALL_DYNAMIC_INPUTS)
-        )
+        for probe_cls in eligible_probes(ctx, case_file, unpopulated_inputs=set(ALL_DYNAMIC_INPUTS))
     }
 
     selected: list[type[Probe]] = []
@@ -559,9 +557,7 @@ def run_system_b(
     `|dataset:<id>` match — so B's replay hash reads
     `cfg:<hash>|b1:<rules hash>|dataset:<id>`.
     """
-    moment, mode, run_config_hash, replay_at = replay_run_shape(
-        replay, now, b_config_hash(cfg)
-    )
+    moment, mode, run_config_hash, replay_at = replay_run_shape(replay, now, b_config_hash(cfg))
 
     with Run(
         conn,
@@ -600,9 +596,7 @@ def run_system_b(
             decision_route = route_detail(case, cfg)
             probes.note(f"{STEP_ROUTE}:{decision_route.rule}")
 
-            selected, dropped = select_routed_probes(
-                case, cfg, probes.ctx, decision_route.probes
-            )
+            selected, dropped = select_routed_probes(case, cfg, probes.ctx, decision_route.probes)
             for name, why in dropped:
                 probes.note(f"{STEP_PROBE_SKIPPED}:{why}", probe_name=name)
 

@@ -29,7 +29,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ValidationInfo, field_validator
 
 from rli.models.time import ensure_aware
 
@@ -70,20 +70,49 @@ class PolicyInputs(BaseModel):
     declared_expiry: datetime | None | Unknown = UNKNOWN
     repost_pattern: RepostPattern | Unknown = UNKNOWN
     corroborating_hiring_signal: bool | Unknown = UNKNOWN
+    # The date of the most recent MATERIAL negative event that is already
+    # INSIDE `thresholds.negative_event_window_days`. spec.md §5's Amendment
+    # 2026-09-10 adds the row "open + material negative event after last
+    # refresh -> wait", which needs the event's DATE, not merely the boolean.
+    #
+    # The window is applied UPSTREAM, by
+    # `rli.events.policy_signals.derive_policy_signals`, before this value is
+    # ever set. That is why `rli.policy.action._branch` does not re-check it,
+    # and must not: `_branch` is deliberately clock-free so the precedence
+    # table is testable without a clock, and a window is a statement about
+    # `now`. The consequence is that `negative_event_window_days` changes
+    # decisions from outside the policy function, which is why it is part of
+    # `rli.policy.action.PolicyThresholds.fingerprint()`.
+    #
+    # INVARIANT (guaranteed by `derive_policy_signals`, which produces both
+    # values from the same filtered event list): once populated,
+    # `material_negative_event is True` <=> `last_material_event_at` is a
+    # `datetime`. `False` pairs with `None` ("checked; no qualifying event"),
+    # and UNKNOWN pairs with UNKNOWN ("not checked").
+    #
+    # Dates are DAY-granular: `company_events` stores a calendar date and
+    # this is midnight UTC on it (`rli.events.store`'s own convention), so a
+    # refresh later on the same calendar day counts as "after the event".
+    last_material_event_at: datetime | None | Unknown = UNKNOWN
 
-    @field_validator("declared_expiry")
+    @field_validator("declared_expiry", "last_material_event_at")
     @classmethod
-    def _declared_expiry_tz_aware_utc(
-        cls, value: datetime | None | Unknown
+    def _tz_aware_utc(
+        cls, value: datetime | None | Unknown, info: ValidationInfo
     ) -> datetime | None | Unknown:
+        """Both datetime fields live on the `available_at <= T` timeline.
+
+        One validator rather than two siblings: the rule is identical (a
+        naive datetime cannot be placed on the point-in-time replay timeline
+        of spec.md §3/§6) and `info.field_name` keeps the error message
+        specific, so nothing is lost by sharing it.
+        """
         if value is None or isinstance(value, Unknown):
             return value
-        return ensure_aware(value, "declared_expiry")
+        return ensure_aware(value, info.field_name or "datetime field")
 
     def unpopulated(self) -> set[str]:
         """Return the set of field names still at the `UNKNOWN` sentinel."""
         return {
-            name
-            for name in type(self).model_fields
-            if isinstance(getattr(self, name), Unknown)
+            name for name in type(self).model_fields if isinstance(getattr(self, name), Unknown)
         }

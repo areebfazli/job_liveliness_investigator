@@ -107,9 +107,7 @@ class RepostHistoryArgs(BaseModel):
     posting_id: str
 
 
-def _capture_source(
-    conn: sqlite3.Connection, company_id: str, captured_at: datetime
-) -> str | None:
+def _capture_source(conn: sqlite3.Connection, company_id: str, captured_at: datetime) -> str | None:
     """The `board_snapshots.source` of the capture at exactly `captured_at`.
 
     A plain point lookup rather than a range/nearest match: the timestamp

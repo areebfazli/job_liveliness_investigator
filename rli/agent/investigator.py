@@ -351,9 +351,7 @@ def _probe_catalogue(
     else:
         eligible_names = {
             probe_cls.name
-            for probe_cls in eligible_probes(
-                ctx, case_file, unpopulated_inputs=set(could_change)
-            )
+            for probe_cls in eligible_probes(ctx, case_file, unpopulated_inputs=set(could_change))
         }
 
     catalogue: list[dict[str, Any]] = []
@@ -460,8 +458,7 @@ def build_investigator_input(
     }
 
     policy_inputs = {
-        name: _json_scalar(getattr(case.inputs, name))
-        for name in type(case.inputs).model_fields
+        name: _json_scalar(getattr(case.inputs, name)) for name in type(case.inputs).model_fields
     }
 
     # `evidence_quality` is deliberately not a `PolicyInputs` field (see
@@ -512,9 +509,7 @@ def build_investigator_input(
         UntrustedBlock(
             source=item.id,
             # Truncate, THEN sanitize — see the module docstring.
-            content=sanitize_untrusted(
-                (item.raw_excerpt or "")[: cfg.agent.max_excerpt_chars]
-            ),
+            content=sanitize_untrusted((item.raw_excerpt or "")[: cfg.agent.max_excerpt_chars]),
         )
         for item in case.evidence
         if item.raw_excerpt

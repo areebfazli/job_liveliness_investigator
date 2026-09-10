@@ -57,6 +57,8 @@ user-facing statement maps to evidence). This module satisfies that contract:
   on the board?" is not a question that can be asked without an X, and
   inventing `board_absent` from a missing id would fabricate a
   contradiction. The skip is recorded as a controller step instead.
+* **`refreshed_at`** — an ATS `updated_at` timestamp that COINCIDES with a
+  content-hash change we actually observed. See "The refresh match" below.
 
 **Why a same-instant `posting_state` + `board_absent` pair is NOT a
 contradiction, and why that is correct.** `rli.policy.quality`'s C2 rule
@@ -80,6 +82,65 @@ is not a conflict at all — it is agreement. Cross-run staleness is exactly
 what C2 is for, and it will fire the moment a later board capture (or a
 stored `board_absent` claim from a previous run, once replay assembles
 evidence across runs) postdates the resolver's answer.
+
+--------------------------------------------------------------------------
+The refresh match (spec.md §5, Amendment 2026-09-10)
+--------------------------------------------------------------------------
+
+The amendment redefines `recent` as "latest of first publish **or** an ATS
+`updated_at` that **coincides with an observed content-hash change**". The
+second half is the point: a bare `updated_at` proves nothing (ATSes bump it
+for a typo fix, a department rename, a re-index), so it counts only when our
+own or archived captures independently show the posting's content actually
+moving at around the same time. That corroboration is computed here, and it
+is emitted as a `refreshed_at` claim rather than plumbed to the policy as a
+boolean, because `rli.policy.inputs` derives every input from evidence and
+spec.md §9 requires every user-facing statement to map to an evidence id.
+
+Why THIS module: the match needs the corpus connection (`posting_snapshots`
+and `board_snapshot_jobs`), which the policy layer deliberately does not
+have, and it needs the resolver's `updated_at` claims, which only exist once
+the always-run pair has run. It is the same shape as the `board_absent`
+claim above.
+
+Attribution: the claim is attributed to `REFRESH_MATCH_PROBE`
+(`"refresh_match"`), a name no probe answers to. **No probe fetched it.** It
+is a re-reading of captures we already hold, exactly like the archive-state
+claims contributed through `probes.always_run_extra()`
+(`rli.replay.mode.ARCHIVE_BOARD_STATE_PROBE`), and attributing it to
+`resolve_posting` would make the `evidence` table say the resolver observed
+something it did not. `source_quality` is `"ats_native"` because the
+TIMESTAMP is the ATS's own; the captures only corroborate it.
+
+Three details that are judgment calls, and are load-bearing:
+
+* **The change is dated to an INTERVAL, not to an instant.** Captures
+  BRACKET a change: we saw hash A at capture N and hash B at capture N+1, so
+  all we know is that the content moved somewhere in `[N, N+1]`. The
+  `updated_at` timestamp matches when it falls inside that interval widened
+  by `refresh_match_days` at each end (inclusive: exactly at the limit
+  matches). This is the same interval-censoring discipline the rest of the
+  codebase applies to closures (spec.md §4: "Do not invent an exact
+  `closed_at` from sparse captures") — pinning the change to the detecting
+  capture alone would make the tolerance silently one-sided and would reject
+  real refreshes whenever captures are sparse.
+* **`available_at` is `max(the updated_at claim's available_at, the
+  DETECTING capture's captured_at)`.** We could not know the content had
+  changed before the capture that revealed it, and spec.md §3 forbids
+  backdating a current discovery onto the moment the underlying event
+  happened. Getting this wrong would let an archive-era replay (spec.md §6)
+  read a refresh out of a capture taken months after `T`.
+* **When one `updated_at` matches SEVERAL changes, the EARLIEST change's
+  detecting capture wins** (earliest by detecting capture, which is what
+  `available_at` is measured on) — the earliest moment we could verifiably
+  have known. Taking the latest would postpone the claim past the point it
+  became knowable, i.e. hide it from replays that should see it.
+
+When several `updated_at` claims match, ONE claim is emitted, for the LATEST
+of them: the question the policy asks is "when did this posting last show a
+sign of life". When nothing matches, NOTHING is emitted — silence, never a
+manufactured claim, and `publish_recency` falls back to the publish date
+alone exactly as before.
 
 --------------------------------------------------------------------------
 Replay seams (spec.md §6) — two, and only two
@@ -237,25 +298,28 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from pydantic import BaseModel, ConfigDict
 
 from rli.config import Config
 from rli.eval.runner import STEP_PROBE_SKIPPED, ProbeRunner
-from rli.events.policy_signals import derive_policy_signals
+from rli.events.policy_signals import EventSignals, derive_policy_signals
 from rli.events.store import read_collection_status_csv
 from rli.history.features import PostingHistoryFeatures, posting_features
 from rli.models.case_file import CaseFile
 from rli.models.evidence import EvidenceItem
 from rli.models.policy_inputs import UNKNOWN, PolicyInputs, Unknown
 from rli.models.probe import ProbeResult
-from rli.models.time import ensure_aware, parse_utc
+from rli.models.time import ensure_aware, parse_utc, to_utc_z
+from rli.policy.action import PolicyThresholds
 from rli.policy.inputs import (
     CLAIM_BOARD_ABSENT,
     CLAIM_POSTING_STATE,
+    CLAIM_REFRESHED_AT,
+    best_publish_claim,
     derive_policy_inputs,
 )
 from rli.policy.quality import QualityVerdict, evidence_quality_detail
@@ -271,6 +335,7 @@ from rli.resolvers.common import normalize_domain
 __all__ = [
     "BOARD_SNAPSHOT_URL_PLACEHOLDER",
     "CLAIM_BOARD_PRESENT",
+    "REFRESH_MATCH_PROBE",
     "CaseState",
     "build_case_state",
     "extend_case_state",
@@ -290,6 +355,18 @@ CLAIM_BOARD_PRESENT = "board_present"
 
 # ATSes with a board-listing endpoint (`rli.probes.board_snapshot.AtsName`).
 _BOARD_ATSES = frozenset({"greenhouse", "ashby", "lever"})
+
+# The `evidence.probe` attribution for the `refreshed_at` claim. NOT a probe:
+# no network call is made and no `Probe` subclass answers to this name. It
+# exists so the evidence table never says `resolve_posting` observed a
+# content-hash change it never looked at — the same reasoning that gives
+# `rli.replay.mode.ARCHIVE_BOARD_STATE_PROBE` its own name. See the module
+# docstring's "The refresh match" section.
+REFRESH_MATCH_PROBE = "refresh_match"
+
+# The claim type the resolver emits for an ATS-reported last-modified time.
+# Only `rli.probes.resolve_posting` emits it, and only for Greenhouse today.
+_CLAIM_UPDATED_AT = "updated_at"
 
 
 class CaseState(BaseModel):
@@ -324,7 +401,7 @@ class CaseState(BaseModel):
     inputs: PolicyInputs = PolicyInputs()
     quality: QualityVerdict | None = None
     features: PostingHistoryFeatures | None = None
-    event_signals: tuple[bool | Unknown, bool | Unknown] | None = None
+    event_signals: EventSignals | None = None
 
     # ALWAYS-RUN probe failures only — the set `rli.policy.quality` documents
     # as the correct `failures=` argument. Dynamic failures are traced in
@@ -508,8 +585,7 @@ def _board_claim(
         return ProbeClaim(
             claim_type=CLAIM_BOARD_PRESENT,
             value=job_id,
-            source_url=match.url
-            or BOARD_SNAPSHOT_URL_PLACEHOLDER.format(ats=ats, tenant=tenant),
+            source_url=match.url or BOARD_SNAPSHOT_URL_PLACEHOLDER.format(ats=ats, tenant=tenant),
             raw_excerpt=match.title,
             source_quality="ats_native",
             available_at=now,
@@ -528,6 +604,190 @@ def _board_claim(
 
 
 # ---------------------------------------------------------------------------
+# The refresh match (see the module docstring)
+# ---------------------------------------------------------------------------
+
+
+class _HashChange(NamedTuple):
+    """One OBSERVED content change, interval-censored between two captures.
+
+    `start` is the capture that last showed the OLD hash and `end` the
+    capture that first showed the NEW one; the change happened somewhere in
+    between and we cannot say where (spec.md §4). `end` is therefore also the
+    DETECTING capture — the first moment the change was knowable to us — and
+    is what `available_at` is measured on.
+    """
+
+    start: datetime
+    end: datetime
+    source: str
+    old_hash: str
+    new_hash: str
+
+
+def _changes_from_rows(rows: Sequence[tuple[str, str]], source: str) -> list[_HashChange]:
+    """Consecutive rows with DIFFERING hashes, as interval-censored changes.
+
+    `rows` must already be ordered by capture time, and the callers' SQL has
+    already dropped rows with a NULL hash — a capture that stored no hash is
+    not evidence that the content did or did not move. Pairing the SURVIVING
+    rows deliberately bridges across such a gap, WIDENING the interval to
+    cover it: if we saw hash A, then a hashless capture, then hash B, the
+    change could have happened at either step and the honest bracket is the
+    outer one. Narrowing it to the last two hashed captures would assert a
+    precision the captures do not have (spec.md §4's interval censoring),
+    and would be the direction that manufactures matches.
+    """
+    changes: list[_HashChange] = []
+    for (previous_at, previous_hash), (current_at, current_hash) in zip(
+        rows, rows[1:], strict=False
+    ):
+        if previous_hash != current_hash:
+            changes.append(
+                _HashChange(
+                    start=parse_utc(previous_at),
+                    end=parse_utc(current_at),
+                    source=source,
+                    old_hash=previous_hash,
+                    new_hash=current_hash,
+                )
+            )
+    return changes
+
+
+def _observed_hash_changes(
+    conn: sqlite3.Connection, posting_id: str | None, company_id: str | None, ats_job_id: str | None
+) -> list[_HashChange]:
+    """Every observed content change for this posting, from both capture tables.
+
+    Two independent sources, because the corpus holds two kinds of capture
+    and a posting may appear in either or both:
+
+    * `posting_snapshots.content_hash` — per-posting captures, own + archive.
+      Keyed by `posting_id`.
+    * `board_snapshot_jobs.description_hash` — the per-job rows of a
+      company-wide board capture. `board_snapshots` carries no ATS or tenant
+      column, so the key is `(company_id, ats_job_id)`, which
+      `rli.history.closures` documents as THE correlation key between a board
+      capture and a `postings` row.
+
+    A source whose key we do not have is SKIPPED, never guessed at: an
+    unresolved `ats_job_id` would otherwise match every job on the board.
+    """
+    changes: list[_HashChange] = []
+
+    if posting_id is not None:
+        rows = conn.execute(
+            """
+            SELECT captured_at, content_hash FROM posting_snapshots
+            WHERE posting_id = ? AND source IN ('own', 'archive')
+                  AND content_hash IS NOT NULL
+            ORDER BY captured_at, id
+            """,
+            (posting_id,),
+        ).fetchall()
+        changes += _changes_from_rows(
+            [(row["captured_at"], row["content_hash"]) for row in rows], "posting_snapshots"
+        )
+
+    if company_id is not None and ats_job_id is not None:
+        rows = conn.execute(
+            """
+            SELECT s.captured_at AS captured_at, j.description_hash AS description_hash
+            FROM board_snapshot_jobs AS j
+            JOIN board_snapshots AS s ON s.id = j.board_snapshot_id
+            WHERE s.company_id = ? AND j.job_id = ? AND j.description_hash IS NOT NULL
+            ORDER BY s.captured_at, j.id
+            """,
+            (company_id, ats_job_id),
+        ).fetchall()
+        changes += _changes_from_rows(
+            [(row["captured_at"], row["description_hash"]) for row in rows],
+            "board_snapshot_jobs",
+        )
+
+    return changes
+
+
+def _refresh_claim(
+    conn: sqlite3.Connection,
+    *,
+    evidence: Sequence[EvidenceItem],
+    posting_id: str | None,
+    company_id: str | None,
+    ats_job_id: str | None,
+    refresh_match_days: int,
+    now: datetime,
+) -> ProbeClaim | None:
+    """The `refreshed_at` claim, or `None` when nothing corroborates a refresh.
+
+    See the module docstring's "The refresh match" section for every judgment
+    call here. Returning `None` — silence — is the common case and the
+    correct one: a manufactured claim would flatter `publish_recency` on
+    exactly the postings we hold the least capture history for.
+    """
+    candidates = [
+        item
+        for item in evidence
+        if item.claim_type == _CLAIM_UPDATED_AT
+        # "an ATS `updated_at` claim" (spec.md §5 amendment): a page-scraped
+        # or archive-derived modification time is not the ATS's own answer,
+        # and an unparsed timestamp cannot be placed against an interval.
+        and item.source_quality == "ats_native"
+        and item.source_event_at is not None
+    ]
+    if not candidates:
+        return None
+
+    changes = _observed_hash_changes(conn, posting_id, company_id, ats_job_id)
+    if not changes:
+        return None
+
+    tolerance = timedelta(days=refresh_match_days)
+    # Latest matching `updated_at` wins: the policy asks when the posting
+    # last showed a sign of life. Ties broken by evidence id so the choice is
+    # total and therefore reproducible.
+    matched: tuple[EvidenceItem, list[_HashChange]] | None = None
+    for claim in sorted(candidates, key=lambda c: (c.source_event_at, c.id)):
+        stamp = claim.source_event_at
+        assert stamp is not None  # filtered above; narrows the type
+        hits = [c for c in changes if c.start - tolerance <= stamp <= c.end + tolerance]
+        if hits:
+            matched = (claim, hits)
+    if matched is None:
+        return None
+
+    claim, hits = matched
+    # EARLIEST detecting capture among the matching changes — the earliest
+    # moment the refresh was verifiably knowable (module docstring).
+    change = min(hits, key=lambda c: (c.end, c.start, c.source))
+    stamp = claim.source_event_at
+    assert stamp is not None
+
+    return ProbeClaim(
+        claim_type=CLAIM_REFRESHED_AT,
+        # Normalized rather than the ATS's raw string (which `claim.value`
+        # still holds), so `value` and `source_event_at` cannot disagree.
+        value=to_utc_z(stamp),
+        # The ATS record the timestamp came from — a real, fetchable URL.
+        source_url=claim.source_url,
+        raw_excerpt=(
+            f"ATS updated_at {to_utc_z(stamp)} coincides (within {refresh_match_days}d) "
+            f"with a content change observed in {change.source} between "
+            f"{to_utc_z(change.start)} (hash {change.old_hash[:12]}) and "
+            f"{to_utc_z(change.end)} (hash {change.new_hash[:12]})"
+        ),
+        # The timestamp is the ATS's own; the captures corroborate it.
+        source_quality="ats_native",
+        source_event_at=stamp,
+        # We could not know about the change before the capture that revealed
+        # it (spec.md §3 forbids backdating a discovery).
+        available_at=max(claim.available_at, change.end),
+        fetched_at=now,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Event signals
 # ---------------------------------------------------------------------------
 
@@ -538,10 +798,10 @@ def _event_signals(
     company_id: str | None,
     now: datetime,
     collection_status_csv: str | Path | None = None,
-) -> tuple[bool | Unknown, bool | Unknown] | None:
-    """Pre-collected `(material_negative_event, freeze_or_pause)`, or `None`.
+) -> EventSignals | None:
+    """The pre-collected `EventSignals` triple, or `None`.
 
-    `None` (not a pair of UNKNOWNs) when there is no company to ask about, so
+    `None` (not a triple of UNKNOWNs) when there is no company to ask about, so
     `derive_policy_inputs` reports both inputs UNKNOWN through its own
     documented `event_signals is None` path rather than through a value this
     module synthesized.
@@ -565,12 +825,21 @@ def _event_signals(
         return None
     path = Path(collection_status_csv or DEFAULT_COLLECTION_STATUS_CSV)
     collection_status = read_collection_status_csv(path) if path.is_file() else {}
+    # Resolved through `PolicyThresholds`, not read off `cfg.thresholds`:
+    # the window is a POLICY threshold that happens to be applied one layer
+    # upstream of `rli.policy.action._branch`, and it is part of
+    # `policy_version()`. Reading `[thresholds]` directly would let a
+    # `[policy] negative_event_window_days` override change the recorded
+    # policy version while changing nothing about the decision — a footgun
+    # that only shows up as an unexplained version bump months later. With
+    # the override unset (the default) this resolves to the identical
+    # `[thresholds]` value, so it is behaviourally a no-op today.
     return derive_policy_signals(
         conn,
         company_id,
         now,
         collection_status,
-        window_days=cfg.thresholds.negative_event_window_days,
+        window_days=PolicyThresholds.coerce(cfg).negative_event_window_days,
     )
 
 
@@ -645,9 +914,7 @@ def build_case_state(
     ats, tenant, job_id = data.get("ats"), data.get("tenant"), data.get("job_id")
     board: ProbeResult | None = None
     if ats in _BOARD_ATSES and tenant:
-        board = probes.execute(
-            BoardSnapshotProbe, BoardSnapshotArgs(ats=ats, tenant=tenant)
-        )
+        board = probes.execute(BoardSnapshotProbe, BoardSnapshotArgs(ats=ats, tenant=tenant))
         if not board.ok:
             failures.append(board)
         elif job_id:
@@ -694,9 +961,56 @@ def build_case_state(
             probe=extra_probe, claims=extra_claims, posting_id=evidence_posting_id
         )
 
+    # -- the refresh match (module docstring: "The refresh match") --------
+    # Computed ONCE, here, because only the always-run `resolve_posting`
+    # emits `updated_at` — no dynamic probe does — so the candidate set this
+    # reads is complete the moment the resolver's evidence is saved, and the
+    # capture tables it reads are a corpus this module never writes to. See
+    # `extend_case_state` for why it is not recomputed there.
+    #
+    # `ats_job_id` prefers the COLLECTED row's value over the resolver's:
+    # both name the same job, but the collected one is the id the board
+    # captures were actually indexed under (an archive-only posting has a
+    # `postings` row whose id no resolver can reconstruct — see
+    # `_posting_by_correlation_key`), and matching against captures is the
+    # entire purpose here.
+    ats_job_id = (
+        str(collected_row["ats_job_id"])
+        if collected_row is not None and collected_row["ats_job_id"] is not None
+        else (str(job_id) if job_id else None)
+    )
+    refresh = _refresh_claim(
+        conn,
+        evidence=evidence,
+        # `posting_snapshots` rows can only exist for a collected posting.
+        posting_id=posting_id if posting_row_exists else None,
+        company_id=company_id,
+        ats_job_id=ats_job_id,
+        refresh_match_days=PolicyThresholds.coerce(cfg).refresh_match_days,
+        now=now,
+    )
+    if refresh is not None:
+        # Through `probes.save_evidence` like every other always-run claim,
+        # so the replay point-in-time gate applies to it too.
+        evidence += probes.save_evidence(
+            probe=REFRESH_MATCH_PROBE, claims=[refresh], posting_id=evidence_posting_id
+        )
+
     # -- derived state ----------------------------------------------------
+    # The publish date reaches the history layer from HERE rather than being
+    # re-derived there: `rli.policy.inputs` owns spec.md §3's source ranking
+    # and the primary-quality rule, and `rli.history.features` holds no
+    # evidence at all, so re-deriving it there would duplicate that ranking
+    # in a module with no way to apply it.
+    publish = best_publish_claim(evidence)
     features = (
-        posting_features(conn, cfg, posting_id, now=now)
+        posting_features(
+            conn,
+            cfg,
+            posting_id,
+            now=now,
+            first_published=publish.source_event_at if publish is not None else None,
+        )
         if posting_row_exists and posting_id is not None
         else None
     )
@@ -771,6 +1085,18 @@ def extend_case_state(
     half-updated input set to decide what to run next — which is exactly the
     controller's job in M5, not this function's.
 
+    **The refresh match is NOT recomputed here**, and does not need to be.
+    `build_case_state` derives the `refreshed_at` claim from the `updated_at`
+    claims in hand, and `rli.probes.resolve_posting` — an ALWAYS-RUN probe
+    that has therefore already finished — is the only probe in this codebase
+    that emits `updated_at`. No dynamic probe can add one, so the candidate
+    set cannot grow; the capture tables the match reads are a corpus no probe
+    writes to (`rli.eval.runner`'s write invariant), so the observed changes
+    cannot grow either. Recomputing would spend two queries per dynamic step
+    to reproduce a claim already in `case.evidence` — and, worse, would
+    invite a second `refreshed_at` claim for the same refresh. If a future
+    probe ever emits `updated_at`, this is the function that must change.
+
     Two inputs cannot be read from evidence alone and are threaded through
     explicitly:
 
@@ -812,9 +1138,14 @@ def extend_case_state(
 
     events = case.probe_results.get(CompanyEventsProbe.name)
     if events is not None and events.ok and events.data is not None:
+        stamp = events.data["last_material_event_at"]
         case.event_signals = (
             events.data["material_negative_event"],
             events.data["freeze_or_pause"],
+            # The probe renders a real date as an ISO-Z string (see
+            # `rli.probes.company_events`); UNKNOWN and None pass through
+            # unchanged and must stay distinguishable from each other.
+            parse_utc(stamp) if isinstance(stamp, str) else stamp,
         )
 
     team = case.probe_results.get(TeamSignalProbe.name)

@@ -188,9 +188,7 @@ class ReplayRunSummary(BaseModel):
         ]
         for outcome in self.outcomes:
             if outcome.error is not None:
-                lines.append(
-                    f"    ! {outcome.posting_id} @ {outcome.replay_at}: {outcome.error}"
-                )
+                lines.append(f"    ! {outcome.posting_id} @ {outcome.replay_at}: {outcome.error}")
         return "\n".join(lines)
 
     def __str__(self) -> str:  # pragma: no cover - trivial delegation
@@ -284,8 +282,7 @@ def run_replay(
     rows = dataset_case_rows(conn, dataset_id)
     if not rows:
         raise LookupError(
-            f"replay dataset {dataset_id!r} has no cases; build it first "
-            "(`rli replay build`)"
+            f"replay dataset {dataset_id!r} has no cases; build it first (`rli replay build`)"
         )
 
     system_name = str(system)
@@ -296,9 +293,7 @@ def run_replay(
             f"(this module ships {sorted(SYSTEM_RUNNERS)})"
         )
 
-    replaced = (
-        clear_replay_runs(conn, dataset_id=dataset_id, system=system_name) if replace else 0
-    )
+    replaced = clear_replay_runs(conn, dataset_id=dataset_id, system=system_name) if replace else 0
 
     outcomes: list[CaseOutcome] = []
     actions: dict[str, int] = {}

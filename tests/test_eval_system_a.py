@@ -116,9 +116,12 @@ def test_system_a_end_to_end_runs_every_eligible_dynamic_probe(
     assert ids == [f"e{i}" for i in range(1, len(ids) + 1)]
 
     # -- the contract claims rli.eval.case owes -------------------------------
-    claim_types = {row["claim_type"] for row in conn.execute(
-        "SELECT DISTINCT claim_type FROM evidence WHERE run_id = ?", (result.run_id,)
-    ).fetchall()}
+    claim_types = {
+        row["claim_type"]
+        for row in conn.execute(
+            "SELECT DISTINCT claim_type FROM evidence WHERE run_id = ?", (result.run_id,)
+        ).fetchall()
+    }
     assert "posting_state" in claim_types
     assert ("board_present" in claim_types) or ("board_absent" in claim_types)
 
@@ -135,14 +138,20 @@ def test_system_a_end_to_end_runs_every_eligible_dynamic_probe(
     # -- A runs every eligible dynamic probe, derived from the registry ------
     expected = _expected_probes(conn, cfg)
     assert set(result.probes_run) == expected
-    assert "team_signal" not in result.probes_run
+    # `[team_signal].enabled` now defaults to `True` (spec.md §5's Amendment
+    # 2026-09-10), and this corpus's 50 days of history clears
+    # `min_history_days`, so `team_signal` is allowed to be genuinely
+    # eligible here too — the assertion above already covers "A runs every
+    # eligible probe, whichever those are".
 
 
 @respx.mock
 def test_system_a_disables_team_signal_when_config_says_so(
     conn: sqlite3.Connection, cfg: Config
 ) -> None:
-    assert cfg.team_signal.enabled is False
+    disabled = cfg.model_copy(
+        update={"team_signal": cfg.team_signal.model_copy(update={"enabled": False})}
+    )
     _seed_corpus(conn)
     respx.get("https://boards-api.greenhouse.io/v1/boards/acme/jobs/6001").mock(
         return_value=httpx.Response(200, json=GH_JOB_OPEN)
@@ -152,7 +161,7 @@ def test_system_a_disables_team_signal_when_config_says_so(
         return_value=httpx.Response(200, json={"jobs": [GH_JOB_OPEN]})
     )
 
-    result = run_system_a(conn, cfg, URL, now=NOW, sleep=lambda _s: None, use_tool_cache=False)
+    result = run_system_a(conn, disabled, URL, now=NOW, sleep=lambda _s: None, use_tool_cache=False)
 
     assert "team_signal" not in result.probes_run
 

@@ -239,9 +239,7 @@ def test_model_id_comes_from_the_response_body() -> None:
 
 @respx.mock
 def test_an_unpriced_model_costs_zero_and_still_answers() -> None:
-    respx.post(CHAT_URL).mock(
-        return_value=httpx.Response(200, json=chat_body(model="llama3.2:3b"))
-    )
+    respx.post(CHAT_URL).mock(return_value=httpx.Response(200, json=chat_body(model="llama3.2:3b")))
     response = make_client(model_id="llama3.2:3b").complete_structured(make_prompt(), Answer)
     assert response.cost_usd == 0.0
     assert response.parsed.verdict == "live"  # type: ignore[attr-defined]
@@ -602,7 +600,10 @@ def test_a_keyboard_interrupt_is_not_swallowed() -> None:
             raise KeyboardInterrupt
 
     client = OpenAICompatibleClient(
-        BASE_URL, "", "test-model", client=Interrupting()  # type: ignore[arg-type]
+        BASE_URL,
+        "",
+        "test-model",
+        client=Interrupting(),  # type: ignore[arg-type]
     )
     with pytest.raises(KeyboardInterrupt):
         client.complete_structured(make_prompt(), Answer)
@@ -781,9 +782,7 @@ def test_scripted_client_prices_against_config_when_given_one(cfg: Config) -> No
         output_tokens=500,
         cfg=cfg,
     )
-    assert client.complete_structured(make_prompt(), Answer).cost_usd == pytest.approx(
-        0.00155
-    )
+    assert client.complete_structured(make_prompt(), Answer).cost_usd == pytest.approx(0.00155)
 
 
 # ---------------------------------------------------------------------------
@@ -849,9 +848,7 @@ def test_second_identical_call_is_a_free_hit_and_does_not_call_inner(
 
 def test_a_hit_survives_a_new_client_instance(conn: sqlite3.Connection) -> None:
     prompt = make_prompt(posting_id="p1")
-    CachedClient(ScriptedClient([Answer(verdict="live")]), conn).complete_structured(
-        prompt, Answer
-    )
+    CachedClient(ScriptedClient([Answer(verdict="live")]), conn).complete_structured(prompt, Answer)
 
     # A fresh process would build a fresh wrapper over a fresh inner client;
     # the row must still serve it (this is what replay depends on).

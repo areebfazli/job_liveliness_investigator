@@ -524,8 +524,7 @@ def _stop(
         decision="stop",
         reason=reason,
         considered=tuple(considered),
-        rejected=tuple((item.probe, item.reason, item.detail) for item in rejected)
-        + tuple(notes),
+        rejected=tuple((item.probe, item.reason, item.detail) for item in rejected) + tuple(notes),
         ranking=tuple(ranking),
     )
 
@@ -625,9 +624,7 @@ def decide(
         if case_file is None
         else {
             probe_cls.name
-            for probe_cls in eligible_probes(
-                ctx, case_file, unpopulated_inputs=set(could_change)
-            )
+            for probe_cls in eligible_probes(ctx, case_file, unpopulated_inputs=set(could_change))
         }
     )
 
@@ -653,9 +650,7 @@ def decide(
 
         if case_file is None:
             rejected.append(
-                RejectedCandidate(
-                    probe=name, reason="ineligible", detail="identity_unresolved"
-                )
+                RejectedCandidate(probe=name, reason="ineligible", detail="identity_unresolved")
             )
             continue
 

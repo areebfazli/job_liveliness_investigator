@@ -73,7 +73,11 @@ codebase put live Python objects into it, not only JSON scalars:
   `derive_policy_inputs`. A plain JSON round-trip would turn the UNKNOWN
   sentinel into the string `"__unknown__"`, which `PolicyInputs` rejects —
   and, had it not rejected it, a truthy string would have read as a known
-  `True`, i.e. a fabricated layoff.
+  `True`, i.e. a fabricated layoff. Its third signal,
+  `data["last_material_event_at"]`, needs no new codec entry: the probe
+  renders a real date as an ISO-Z STRING and passes UNKNOWN / `None`
+  through, so the envelope already covers the only non-JSON value in it
+  (`_UNKNOWN_TYPE`), and `extend_case_state` parses the string back.
 
 So the store uses a small typed-envelope codec (`_encode` / `_decode`)
 rather than bare `json.dumps`: `{"__rli_type__": "probe_claim", "v": {...}}`
@@ -572,9 +576,7 @@ class ReplayProbeRunner(ProbeRunner):
             cost_usd=float(self.cfg.probe_costs.value_for(probe_cls.cost_tier)),
             latency_s=latency_s,
             error=(
-                None
-                if record.result.ok
-                else (record.result.error or "unspecified probe failure")
+                None if record.result.ok else (record.result.error or "unspecified probe failure")
             ),
             created_at=self.now,
         )
@@ -689,8 +691,7 @@ def replay_hook(
             # same value, or `runs.replay_at` would describe a different
             # moment than the one the evidence gate used.
             raise ReplayViolation(
-                f"replay clock mismatch: system now={to_utc_z(moment)} but "
-                f"T={to_utc_z(replay.T)}"
+                f"replay clock mismatch: system now={to_utc_z(moment)} but T={to_utc_z(replay.T)}"
             )
         with open_replay_probe_runner(
             conn,

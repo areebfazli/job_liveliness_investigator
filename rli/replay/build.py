@@ -206,9 +206,7 @@ _CLAIM_BOARD_PRESENT = "board_present"
 # ---------------------------------------------------------------------------
 
 
-def grid_times(
-    first_observed: datetime, end: datetime, step_days: int
-) -> list[datetime]:
+def grid_times(first_observed: datetime, end: datetime, step_days: int) -> list[datetime]:
     """Evaluation times for one posting: `first_observed`, +N days, ..., `end`.
 
     Both endpoints are included; see the module docstring for why the end
@@ -327,9 +325,7 @@ def archive_state_claims(
         board_claim_type = CLAIM_BOARD_ABSENT
         # An absence has no fetchable URL by construction; cite the capture
         # record itself, in the established self-describing scheme.
-        source_url = BOARD_HISTORY_URL_PLACEHOLDER.format(
-            company_id=company_id, job_id=job_id
-        )
+        source_url = BOARD_HISTORY_URL_PLACEHOLDER.format(company_id=company_id, job_id=job_id)
         excerpt = f"{len(witness.jobs)} job(s) listed at capture, none with id {job_id}"
 
     seen_at = witness.captured_at
@@ -681,8 +677,7 @@ class BuildSummary(BaseModel):
             f"replay dataset {self.dataset_id!r}: split={self.split_kind}/{self.split_name} "
             f"grid={self.grid_step_days}d created_at={self.created_at}",
             f"  postings={self.postings} companies={self.companies} cases={self.cases}",
-            f"  probe records={self.probe_records} "
-            f"(live executions={self.live_probe_executions})",
+            f"  probe records={self.probe_records} (live executions={self.live_probe_executions})",
             f"  archive board-state records={self.archive_state_records} "
             f"(cases with an observable archive state: {self.cases_with_archive_state})",
             f"  postings that failed to build: {self.postings_failed}",
@@ -1095,9 +1090,7 @@ def build_dataset(
     )
 
 
-def dataset_case_rows(
-    conn: sqlite3.Connection, dataset_id: str
-) -> list[sqlite3.Row]:
+def dataset_case_rows(conn: sqlite3.Connection, dataset_id: str) -> list[sqlite3.Row]:
     """Every `replay_cases` row of `dataset_id`, ordered `(replay_at, posting_id)`.
 
     Ordered by `T` first because `rli.replay.run` opens one point-in-time
@@ -1120,8 +1113,7 @@ def dataset_companies(conn: sqlite3.Connection, dataset_id: str) -> list[str]:
     return [
         row[0]
         for row in conn.execute(
-            "SELECT DISTINCT company_id FROM replay_cases WHERE dataset_id = ? "
-            "ORDER BY company_id",
+            "SELECT DISTINCT company_id FROM replay_cases WHERE dataset_id = ? ORDER BY company_id",
             (dataset_id,),
         )
     ]

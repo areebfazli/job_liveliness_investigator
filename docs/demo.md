@@ -150,11 +150,16 @@ gh_job = {
     "departments": [{"name": "Engineering"}],
     "offices": [{"name": "Remote"}],
 }
-jsonld_html = f"""<html><head><script type="application/ld+json">{json.dumps({
-    "@context": "https://schema.org/", "@type": "JobPosting",
-    "title": "Senior Backend Engineer",
-    "datePosted": (NOW - timedelta(days=120)).strftime("%Y-%m-%d"),
-})}</script></head><body>Senior Backend Engineer</body></html>"""
+jsonld_html = f"""<html><head><script type="application/ld+json">{
+    json.dumps(
+        {
+            "@context": "https://schema.org/",
+            "@type": "JobPosting",
+            "title": "Senior Backend Engineer",
+            "datePosted": (NOW - timedelta(days=120)).strftime("%Y-%m-%d"),
+        }
+    )
+}</script></head><body>Senior Backend Engineer</body></html>"""
 
 init_db("ambiguous_demo.db")
 conn = connect("ambiguous_demo.db")
@@ -162,10 +167,12 @@ cfg = load_config()
 
 with respx.mock:
     respx.get(f"https://boards-api.greenhouse.io/v1/boards/{TENANT}/jobs/{JOB_ID}").mock(
-        return_value=httpx.Response(200, json=gh_job))
+        return_value=httpx.Response(200, json=gh_job)
+    )
     respx.get(URL).mock(return_value=httpx.Response(200, text=jsonld_html))
     respx.get(f"https://boards-api.greenhouse.io/v1/boards/{TENANT}/jobs").mock(
-        return_value=httpx.Response(200, json={"jobs": [gh_job]}))
+        return_value=httpx.Response(200, json={"jobs": [gh_job]})
+    )
     result = run_system_b(conn, cfg, URL, now=NOW, sleep=lambda _s: None, use_tool_cache=False)
 
 print(json.dumps(result.decision.model_dump(mode="json"), indent=2, default=str))
@@ -232,25 +239,35 @@ JOB_ID, TENANT = "9002", "acme"
 URL = f"https://boards.greenhouse.io/{TENANT}/jobs/{JOB_ID}"
 
 gh_job = {
-    "id": int(JOB_ID), "title": "Senior Backend Engineer", "absolute_url": URL,
+    "id": int(JOB_ID),
+    "title": "Senior Backend Engineer",
+    "absolute_url": URL,
     "first_published": (NOW - timedelta(days=5)).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "content": "<p>Build things.</p>",
-    "departments": [{"name": "Engineering"}], "offices": [{"name": "Remote"}],
+    "departments": [{"name": "Engineering"}],
+    "offices": [{"name": "Remote"}],
 }
-jsonld_html = f"""<html><head><script type="application/ld+json">{json.dumps({
-    "@context": "https://schema.org/", "@type": "JobPosting",
-    "title": "Senior Backend Engineer",
-    "datePosted": (NOW - timedelta(days=120)).strftime("%Y-%m-%d"),
-})}</script></head><body>Senior Backend Engineer</body></html>"""
+jsonld_html = f"""<html><head><script type="application/ld+json">{
+    json.dumps(
+        {
+            "@context": "https://schema.org/",
+            "@type": "JobPosting",
+            "title": "Senior Backend Engineer",
+            "datePosted": (NOW - timedelta(days=120)).strftime("%Y-%m-%d"),
+        }
+    )
+}</script></head><body>Senior Backend Engineer</body></html>"""
 
 app = create_app(db_path="ambiguous_demo_api.db", watch_store_path="ambiguous_demo_watches.json")
 
 with TestClient(app) as client, respx.mock:
     respx.get(f"https://boards-api.greenhouse.io/v1/boards/{TENANT}/jobs/{JOB_ID}").mock(
-        return_value=httpx.Response(200, json=gh_job))
+        return_value=httpx.Response(200, json=gh_job)
+    )
     respx.get(URL).mock(return_value=httpx.Response(200, text=jsonld_html))
     respx.get(f"https://boards-api.greenhouse.io/v1/boards/{TENANT}/jobs").mock(
-        return_value=httpx.Response(200, json={"jobs": [gh_job]}))
+        return_value=httpx.Response(200, json={"jobs": [gh_job]})
+    )
     resp = client.post("/investigate", json={"url": URL, "system": "B"})
 
 print(resp.status_code, json.dumps(resp.json(), indent=2))

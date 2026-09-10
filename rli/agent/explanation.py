@@ -399,9 +399,7 @@ class _CitationReport(BaseModel):
     dropped_reasons: int = 0
 
 
-def _validate_citations(
-    drafts: Sequence[ReasonDraft], evidence_ids: set[str]
-) -> _CitationReport:
+def _validate_citations(drafts: Sequence[ReasonDraft], evidence_ids: set[str]) -> _CitationReport:
     """Keep only reasons whose citations exist; count everything discarded.
 
     Per drafted reason: cited ids are filtered to those that actually exist
@@ -599,9 +597,7 @@ def explain(
         cfg=cfg,
         policy_branch=policy_branch,
     )
-    prompt = build_explanation_prompt(
-        structured_input=structured_input, untrusted=untrusted
-    )
+    prompt = build_explanation_prompt(structured_input=structured_input, untrusted=untrusted)
     prompt_hash = prompt.prompt_hash(ExplanationOutput)
     args_hash = prompt.structured_input_hash()
 

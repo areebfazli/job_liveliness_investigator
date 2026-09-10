@@ -95,12 +95,7 @@ def _matches_only(target_tenant: str, only: list[str] | None) -> bool:
     tenant_lower = target_tenant.lower()
     # Each --only value may itself be a comma-separated list, so both
     # `--only a --only b` and `--only a,b` are accepted.
-    wanted = {
-        item.strip().lower()
-        for value in only
-        for item in value.split(",")
-        if item.strip()
-    }
+    wanted = {item.strip().lower() for value in only for item in value.split(",") if item.strip()}
     return tenant_lower in wanted
 
 

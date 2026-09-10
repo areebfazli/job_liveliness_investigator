@@ -341,9 +341,7 @@ def test_ats_without_an_adapter_is_not_a_failure_and_emits_no_claim(
 
 
 @respx.mock
-def test_job_removed_from_ats_is_ok_with_no_live_job(
-    conn: sqlite3.Connection, ctx_factory
-) -> None:
+def test_job_removed_from_ats_is_ok_with_no_live_job(conn: sqlite3.Connection, ctx_factory) -> None:
     _company(conn)
     _posting(conn)
     _history(conn)
@@ -384,9 +382,7 @@ def test_transport_failure_sets_ok_false_and_emits_no_claim(
 
 
 @respx.mock
-def test_lever_board_listing_supplies_the_live_job(
-    conn: sqlite3.Connection, ctx_factory
-) -> None:
+def test_lever_board_listing_supplies_the_live_job(conn: sqlite3.Connection, ctx_factory) -> None:
     _company(conn)
     _posting(conn, ats="lever", title="Backend Engineer", team="Engineering", location="Remote")
     _history(conn, description_hash=content_hash("plain text description"))

@@ -489,9 +489,7 @@ def test_holdout_surfaces_in_gate_notes_and_limitations(
 def test_allow_test_false_excludes_the_holdout_and_writes_no_marker(
     populated: sqlite3.Connection, cfg: Config
 ) -> None:
-    report = evaluate(
-        populated, cfg, dataset_id=DATASET, allow_test=False, include_survival=False
-    )
+    report = evaluate(populated, cfg, dataset_id=DATASET, allow_test=False, include_survival=False)
 
     assert report.allowed_splits == ("dev", "validation")
     assert report.case_set.excluded_holdout >= 1
@@ -506,17 +504,14 @@ def test_allow_test_false_excludes_the_holdout_and_writes_no_marker(
 def test_with_c_without_a_usable_endpoint_is_skipped_and_never_attempted(
     populated: sqlite3.Connection, cfg: Config
 ) -> None:
-    report = evaluate(
-        populated, cfg, dataset_id=DATASET, with_c=True, include_survival=False
-    )
+    report = evaluate(populated, cfg, dataset_id=DATASET, with_c=True, include_survival=False)
 
     assert report.systems_run["C"] == f"skipped: {C_NOT_RUN_REASON}"
     assert "C" not in report.efficiency
     assert report.agent_gate.status == "not_run"
     # No System C run was created, so nothing tried to reach a model.
     assert (
-        populated.execute("SELECT COUNT(*) AS n FROM runs WHERE system = 'C'").fetchone()["n"]
-        == 0
+        populated.execute("SELECT COUNT(*) AS n FROM runs WHERE system = 'C'").fetchone()["n"] == 0
     )
 
 
@@ -531,8 +526,7 @@ def test_c_status_does_not_blame_the_endpoint_when_it_is_usable(
     assert report.systems_run["C"] == "skipped: not requested (pass with_c=True / --with-c)"
     assert C_NOT_RUN_REASON not in report.systems_run["C"]
     assert (
-        populated.execute("SELECT COUNT(*) AS n FROM runs WHERE system = 'C'").fetchone()["n"]
-        == 0
+        populated.execute("SELECT COUNT(*) AS n FROM runs WHERE system = 'C'").fetchone()["n"] == 0
     )
 
 
@@ -561,9 +555,7 @@ def test_survival_path_degrades_gracefully_on_a_tiny_corpus(
         assert hasattr(report.survival, "total_intervals")
     assert report.agent_gate.status == "not_run"
 
-    text = write_evaluation_report(tmp_path / "survival.md", report).read_text(
-        encoding="utf-8"
-    )
+    text = write_evaluation_report(tmp_path / "survival.md", report).read_text(encoding="utf-8")
     survival_section = text.split("## Posting behaviour (survival summary)", 1)[1].split(
         "## Agent gate", 1
     )[0]
@@ -602,9 +594,7 @@ def test_report_names_the_c_not_run_state_everywhere_it_matters(
     populated: sqlite3.Connection, cfg: Config, tmp_path: Path
 ) -> None:
     report = evaluate(populated, cfg, dataset_id=DATASET, include_survival=False)
-    text = write_evaluation_report(tmp_path / "evaluation.md", report).read_text(
-        encoding="utf-8"
-    )
+    text = write_evaluation_report(tmp_path / "evaluation.md", report).read_text(encoding="utf-8")
 
     assert C_NOT_RUN_REASON in text
     # Next to the gate verdict, not only in a footnote.
@@ -620,9 +610,7 @@ def test_report_separates_probe_points_from_model_dollars(
     populated: sqlite3.Connection, cfg: Config, tmp_path: Path
 ) -> None:
     report = evaluate(populated, cfg, dataset_id=DATASET, include_survival=False)
-    text = write_evaluation_report(tmp_path / "evaluation.md", report).read_text(
-        encoding="utf-8"
-    )
+    text = write_evaluation_report(tmp_path / "evaluation.md", report).read_text(encoding="utf-8")
 
     cost_section = text.split(
         "## Cost and latency (probe cost points and model dollars reported SEPARATELY)", 1
@@ -638,9 +626,7 @@ def test_report_limitations_cover_the_required_caveats(
     populated: sqlite3.Connection, cfg: Config, tmp_path: Path
 ) -> None:
     report = evaluate(populated, cfg, dataset_id=DATASET, include_survival=False)
-    text = write_evaluation_report(tmp_path / "evaluation.md", report).read_text(
-        encoding="utf-8"
-    )
+    text = write_evaluation_report(tmp_path / "evaluation.md", report).read_text(encoding="utf-8")
 
     limitations = text.split("## Limitations", 1)[1]
     assert "Archive-era" in limitations
@@ -657,9 +643,7 @@ def test_report_headline_gate_shows_dataset_and_corpus_side_by_side(
     populated: sqlite3.Connection, cfg: Config, tmp_path: Path
 ) -> None:
     report = evaluate(populated, cfg, dataset_id=DATASET, include_survival=False)
-    text = write_evaluation_report(tmp_path / "evaluation.md", report).read_text(
-        encoding="utf-8"
-    )
+    text = write_evaluation_report(tmp_path / "evaluation.md", report).read_text(encoding="utf-8")
 
     headline = text.split("## Headline gate (sample sizes)", 1)[1].split("## Systems run", 1)[0]
     assert "evaluated dataset" in headline
@@ -738,9 +722,7 @@ def test_cli_eval_run_writes_the_report(tmp_path: Path) -> None:
 def test_cli_eval_gates_prints_both_verdicts(tmp_path: Path) -> None:
     db_path = _cli_db(tmp_path, "gates.db")
 
-    result = runner.invoke(
-        app, ["eval", "gates", "--dataset", DATASET, "--db", str(db_path)]
-    )
+    result = runner.invoke(app, ["eval", "gates", "--dataset", DATASET, "--db", str(db_path)])
 
     assert result.exit_code == 0, result.output
     assert "agent gate: NOT_RUN" in result.stdout

@@ -211,8 +211,12 @@ def test_runs_and_evidence_are_not_shadowed(conn: sqlite3.Connection) -> None:
 def test_a_naive_t_is_rejected(conn: sqlite3.Connection) -> None:
     from datetime import datetime
 
-    with pytest.raises(ValueError, match="timezone-aware"), point_in_time(
-        conn, datetime(2026, 1, 1)  # noqa: DTZ001
+    with (
+        pytest.raises(ValueError, match="timezone-aware"),
+        point_in_time(
+            conn,
+            datetime(2026, 1, 1),  # noqa: DTZ001
+        ),
     ):
         pass
 

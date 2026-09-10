@@ -430,7 +430,7 @@ from rli.models.decision import Decision
 from rli.models.policy_inputs import UNKNOWN
 from rli.net.client import hash_args
 from rli.policy.action import decide as policy_decide
-from rli.policy.inputs import could_change_action
+from rli.policy.inputs import could_change_action, last_publish_or_refresh
 from rli.policy.quality import evidence_quality_detail
 from rli.probes.base import Probe
 from rli.probes.registry import DYNAMIC_PROBES, build_args
@@ -557,9 +557,7 @@ def _resolve_llm(
     return factory(conn, cfg)
 
 
-def _resolve_replay(
-    replay: ReplayHook | None, replay_ctx: ReplayHook | None
-) -> ReplayHook | None:
+def _resolve_replay(replay: ReplayHook | None, replay_ctx: ReplayHook | None) -> ReplayHook | None:
     """Accept `replay=` and `replay_ctx=` as synonyms; reject a conflicting pair.
 
     `rli.eval.runner.ReplayHook` documents itself as "passed as the single
@@ -742,9 +740,7 @@ def _call_investigator(
 
     run.step(
         component="model",
-        decision_type=with_tokens(
-            STEP_INVESTIGATOR, response.input_tokens, response.output_tokens
-        ),
+        decision_type=with_tokens(STEP_INVESTIGATOR, response.input_tokens, response.output_tokens),
         prompt_hash=prompt_hash,
         args_hash=args_hash,
         model_id=response.model_id,
@@ -1048,6 +1044,10 @@ def run_system_c(
             moment,
             cfg,
             long_lived=case.features.long_lived if case.features is not None else UNKNOWN,
+            # Derived from the evidence at each call site rather than cached
+            # on `CaseState`; the choice is argued in `rli.policy.action`'s
+            # "two keyword inputs" section.
+            last_refreshed_at=last_publish_or_refresh(case.evidence),
         )
         # The explanation is a model call, and spec.md §4's caps bound the
         # RUN. Same gate, same estimator, as the loop's own — see the module
@@ -1157,15 +1157,28 @@ def _run_loop(
         quality = evidence_quality_detail(case.evidence, case.inputs, case.failures, cfg)
         case.quality = quality
         long_lived = case.features.long_lived if case.features is not None else UNKNOWN
+        # Cheap linear scan over evidence already in hand, recomputed each
+        # iteration rather than cached on `CaseState` (see
+        # `rli.policy.action`'s "two keyword inputs" section). It is also
+        # invariant across the loop in practice — no dynamic probe emits
+        # publish or refresh evidence — which is why `could_change_action`
+        # holds it FIXED instead of enumerating it.
+        last_refreshed_at = last_publish_or_refresh(case.evidence)
 
         outcome = policy_decide(
-            case.inputs, quality.quality, moment, cfg, long_lived=long_lived
+            case.inputs,
+            quality.quality,
+            moment,
+            cfg,
+            long_lived=long_lived,
+            last_refreshed_at=last_refreshed_at,
         )
         could_change = could_change_action(
             case.inputs,
             outcome.recommended_action,
             quality=quality.quality,
             long_lived=long_lived,
+            last_refreshed_at=last_refreshed_at,
             now=moment,
             cfg=cfg,
         )
@@ -1214,9 +1227,7 @@ def _run_loop(
                 ledger.budget.remaining_latency_s() + llm_latency_s, _REPORTED_PRECISION
             ),
         )
-        prompt = build_investigator_prompt(
-            structured_input=structured_input, untrusted=untrusted
-        )
+        prompt = build_investigator_prompt(structured_input=structured_input, untrusted=untrusted)
         output, investigator_error, cost_usd, latency_s = _call_investigator(
             llm=llm, run=run, prompt=prompt, moment=moment
         )

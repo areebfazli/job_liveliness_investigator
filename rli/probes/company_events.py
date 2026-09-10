@@ -55,6 +55,18 @@ GUESSED / judgment calls made in this module
   requires probes to return facts, not verdicts, and the event type is a
   fact printed on the source; folding it into the `value` string would make
   it unqueryable in the `evidence` table.
+* **`data["last_material_event_at"]` is an ISO-Z STRING, never a bare
+  `datetime`.** `derive_policy_signals` returns
+  `datetime | None | Unknown`; this probe passes UNKNOWN and `None` through
+  unchanged (they are the two answers the Unknown-vs-False discipline above
+  exists to keep apart) but renders a real datetime with `to_utc_z`, the
+  same way `data["as_of"]` is rendered. The consumer
+  (`rli.eval.case.extend_case_state`) parses it back with `parse_utc`. The
+  reason is that `ProbeResult.data` is a JSON blob in the replay dataset:
+  `rli.replay.mode` does carry a datetime envelope, but a probe payload that
+  reads identically as JSON and as live Python is one less thing for a
+  future reader of `replay_probe_results.data` to decode by hand, and the
+  three-way UNKNOWN / null / timestamp distinction survives either way.
 * **`collection_status_csv` defaults to the real repo path**
   (`REPO_ROOT/data/events/collection_status.csv`, matching
   `scripts/collect_events.py`'s `DEFAULT_OUT_STATUS_CSV`). The argument
@@ -75,6 +87,7 @@ from rli.events.policy_signals import derive_policy_signals
 from rli.events.store import CollectionStatus, events_for, read_collection_status_csv
 from rli.models.probe import ProbeResult
 from rli.models.time import ensure_aware, to_utc_z
+from rli.policy.action import PolicyThresholds
 from rli.probes.base import Probe, ProbeClaim, ProbeContext
 
 __all__ = ["CompanyEventsArgs", "CompanyEventsProbe", "company_events"]
@@ -127,12 +140,21 @@ def company_events(args: CompanyEventsArgs, ctx: ProbeContext) -> ProbeResult:
     now = ctx.now()
     collection_status = _load_collection_status(args)
 
-    material_negative_event, freeze_or_pause = derive_policy_signals(
+    # The window is resolved through `PolicyThresholds`, not read straight
+    # off `[thresholds]`, because it is a POLICY threshold: it decides
+    # whether an event still populates `material_negative_event`, and it is
+    # part of `policy_version()`. Reading `cfg.thresholds` directly would
+    # make a `[policy] negative_event_window_days` override change the
+    # recorded policy version while changing no behaviour — a footgun. By
+    # default the override is `None` and this resolves to the very same
+    # `[thresholds]` value, so this is behaviourally identical today.
+    thresholds = PolicyThresholds.coerce(ctx.config)
+    material_negative_event, freeze_or_pause, last_material_event_at = derive_policy_signals(
         ctx.conn,
         args.company_id,
         args.as_of,
         collection_status,
-        window_days=ctx.config.thresholds.negative_event_window_days,
+        window_days=thresholds.negative_event_window_days,
     )
 
     status = collection_status.get(args.company_id)
@@ -164,6 +186,12 @@ def company_events(args: CompanyEventsArgs, ctx: ProbeContext) -> ProbeResult:
             "events": [event.model_dump(mode="json") for event in events],
             "material_negative_event": material_negative_event,
             "freeze_or_pause": freeze_or_pause,
+            # UNKNOWN / None / ISO-Z string — see the module docstring.
+            "last_material_event_at": (
+                to_utc_z(last_material_event_at)
+                if isinstance(last_material_event_at, datetime)
+                else last_material_event_at
+            ),
             "evidence": claims,
         },
     )
@@ -175,8 +203,13 @@ class CompanyEventsProbe(Probe):
     name: ClassVar[str] = "company_events"
     cost_tier: ClassVar[str] = "medium"
     history_required: ClassVar[bool] = False
+    # `last_material_event_at` is populated by the same read of the same
+    # store as `material_negative_event` — same probe, same question — so it
+    # belongs here: the controller's eligibility rule ("can this probe
+    # populate an unresolved input?") would otherwise call this probe
+    # ineligible for a case whose ONLY open question is the event date.
     populates: ClassVar[frozenset[str]] = frozenset(
-        {"material_negative_event", "freeze_or_pause"}
+        {"material_negative_event", "freeze_or_pause", "last_material_event_at"}
     )
     ArgsModel: ClassVar[type[BaseModel]] = CompanyEventsArgs
 

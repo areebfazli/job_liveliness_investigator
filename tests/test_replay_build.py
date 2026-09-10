@@ -111,9 +111,7 @@ def test_plan_bounds_a_closed_posting_at_its_first_observed_absence(
     conn: sqlite3.Connection,
 ) -> None:
     seed_corpus(conn)
-    splits = dict.fromkeys(
-        [OPEN_POSTING, CLOSED_POSTING], "dev"
-    )
+    splits = dict.fromkeys([OPEN_POSTING, CLOSED_POSTING], "dev")
     plans = {p.posting_id: p for p in plan_cases(conn, splits=splits, split="dev", now=NOW)}
 
     assert plans[OPEN_POSTING].end == NOW
@@ -132,10 +130,7 @@ def test_plan_spreads_a_limit_round_robin_across_companies(
     add_posting(conn, job_id="6003", tenant=TENANT, first_observed=NOW - timedelta(days=60))
     add_capture(conn, NOW - timedelta(days=5), [job("6003")], company_id=COMPANY)
 
-    splits = {
-        row["posting_id"]: "dev"
-        for row in conn.execute("SELECT posting_id FROM postings")
-    }
+    splits = {row["posting_id"]: "dev" for row in conn.execute("SELECT posting_id FROM postings")}
     plans = plan_cases(conn, splits=splits, split="dev", now=NOW, limit_postings=2)
     assert {plan.company_id for plan in plans} == {COMPANY, OTHER_COMPANY}
 
@@ -150,10 +145,7 @@ def test_plan_skips_a_posting_with_no_fetchable_url(conn: sqlite3.Connection) ->
         canonical_url="archive-only:acme.com/9999",
         first_observed=NOW - timedelta(days=60),
     )
-    splits = {
-        row["posting_id"]: "dev"
-        for row in conn.execute("SELECT posting_id FROM postings")
-    }
+    splits = {row["posting_id"]: "dev" for row in conn.execute("SELECT posting_id FROM postings")}
     plans = plan_cases(conn, splits=splits, split="dev", now=NOW)
     assert "archive:acme.com:9999" not in {plan.posting_id for plan in plans}
 

@@ -36,7 +36,11 @@ def test_config_hash_is_stable_and_changes_with_a_threshold(cfg: Config) -> None
 
 def test_run_open_inserts_running_row(conn: sqlite3.Connection, cfg: Config) -> None:
     run = Run(
-        conn, cfg, input_url="https://example.com/1", system="A", config_hash="cfg:x",
+        conn,
+        cfg,
+        input_url="https://example.com/1",
+        system="A",
+        config_hash="cfg:x",
         started_at=NOW,
     )
     with run:
@@ -55,7 +59,11 @@ def test_run_step_indices_are_contiguous_and_one_based(
     conn: sqlite3.Connection, cfg: Config
 ) -> None:
     run = Run(
-        conn, cfg, input_url="https://example.com/1", system="A", config_hash="cfg:x",
+        conn,
+        cfg,
+        input_url="https://example.com/1",
+        system="A",
+        config_hash="cfg:x",
         started_at=NOW,
     )
     with run:
@@ -85,7 +93,11 @@ def test_run_save_evidence_numbers_continuously_across_calls(
         )
 
     run = Run(
-        conn, cfg, input_url="https://example.com/1", system="A", config_hash="cfg:x",
+        conn,
+        cfg,
+        input_url="https://example.com/1",
+        system="A",
+        config_hash="cfg:x",
         started_at=NOW,
     )
     with run:
@@ -110,7 +122,11 @@ def test_run_exit_with_exception_marks_failed_and_reraises(
     conn: sqlite3.Connection, cfg: Config
 ) -> None:
     run = Run(
-        conn, cfg, input_url="https://example.com/1", system="A", config_hash="cfg:x",
+        conn,
+        cfg,
+        input_url="https://example.com/1",
+        system="A",
+        config_hash="cfg:x",
         started_at=NOW,
     )
     with pytest.raises(RuntimeError, match="boom"):
@@ -139,7 +155,11 @@ def test_run_set_posting_id_requires_an_existing_postings_row(
     conn: sqlite3.Connection, cfg: Config
 ) -> None:
     run = Run(
-        conn, cfg, input_url="https://example.com/1", system="A", config_hash="cfg:x",
+        conn,
+        cfg,
+        input_url="https://example.com/1",
+        system="A",
+        config_hash="cfg:x",
         started_at=NOW,
     )
     with run:
@@ -153,13 +173,15 @@ def test_run_set_posting_id_requires_an_existing_postings_row(
     assert row["posting_id"] is None
 
 
-def test_run_finish_stores_decision_json_and_totals(
-    conn: sqlite3.Connection, cfg: Config
-) -> None:
+def test_run_finish_stores_decision_json_and_totals(conn: sqlite3.Connection, cfg: Config) -> None:
     from rli.models.decision import Decision
 
     run = Run(
-        conn, cfg, input_url="https://example.com/1", system="A", config_hash="cfg:x",
+        conn,
+        cfg,
+        input_url="https://example.com/1",
+        system="A",
+        config_hash="cfg:x",
         started_at=NOW,
     )
     with run:

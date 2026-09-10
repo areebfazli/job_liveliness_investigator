@@ -193,9 +193,7 @@ def test_system_a_and_b_agree_on_action_and_posting_state_for_identical_inputs(
 
 
 @respx.mock
-def test_system_b_terminal_route_on_resolver_failure(
-    conn: sqlite3.Connection, cfg: Config
-) -> None:
+def test_system_b_terminal_route_on_resolver_failure(conn: sqlite3.Connection, cfg: Config) -> None:
     respx.get("https://boards-api.greenhouse.io/v1/boards/acme/jobs/9999").mock(
         side_effect=httpx.ConnectError("boom")
     )
@@ -275,8 +273,10 @@ def test_b_rules_hash_is_stable_and_depends_on_max_dynamic_steps(cfg: Config) ->
 
 
 def test_b_rules_hash_depends_on_team_signal_enabled(cfg: Config) -> None:
+    # `[team_signal].enabled` now defaults to `True`, so the contrasting
+    # config is built by flipping it to `False` instead.
     changed = cfg.model_copy(
-        update={"team_signal": cfg.team_signal.model_copy(update={"enabled": True})}
+        update={"team_signal": cfg.team_signal.model_copy(update={"enabled": False})}
     )
     assert b_rules_hash(cfg) != b_rules_hash(changed)
 

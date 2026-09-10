@@ -686,7 +686,7 @@ def _limitations(
             f"System C was {C_NOT_RUN_REASON} — the endpoint configured in "
             "`[llm].base_url` did not answer a liveness probe and no `llm`/`llm_factory` "
             "was supplied, so no model call was attempted. The spec.md §6 agent gate is "
-            "therefore `not_run`, not "  
+            "therefore `not_run`, not "
             "`fail`: an ungraded candidate has not failed. Every System C figure "
             f"elsewhere in this report reads `{C_NOT_RUN_REASON}`."
         )
@@ -1092,11 +1092,7 @@ def _case_set_section(report: EvaluationReport) -> list[str]:
 def _action_distribution_section(report: EvaluationReport) -> list[str]:
     systems = _ordered_systems(report.efficiency)
     actions = sorted(
-        {
-            action
-            for name in systems
-            for action in report.efficiency[name].action_distribution
-        }
+        {action for name in systems for action in report.efficiency[name].action_distribution}
     )
     rows = [
         [action]
@@ -1167,13 +1163,9 @@ def _agreement_section(report: EvaluationReport) -> list[str]:
         lines.append("(no systems evaluated)")
     for name in systems:
         matrix = report.efficiency[name].confusion_matrix
-        columns = sorted(
-            set(matrix)
-            | {other for row in matrix.values() for other in row}
-        )
+        columns = sorted(set(matrix) | {other for row in matrix.values() for other in row})
         rows = [
-            [ref] + [str(matrix.get(ref, {}).get(other, 0)) for other in columns]
-            for ref in columns
+            [ref] + [str(matrix.get(ref, {}).get(other, 0)) for other in columns] for ref in columns
         ]
         lines.append(f"**A action (row) -> {name} action (column)**")
         lines.append("")
@@ -1433,9 +1425,7 @@ def _survival_section(report: EvaluationReport) -> list[str]:
             ]
         )
     lines.append(
-        _markdown_table(
-            ["curve", "n", "events", "censored", "median days", "note"], curve_rows
-        )
+        _markdown_table(["curve", "n", "events", "censored", "median days", "note"], curve_rows)
     )
     lines.append("")
     lines.append(
@@ -1657,8 +1647,8 @@ def _ranker_section(report: EvaluationReport) -> list[str]:
         "",
         "spec.md §6's C2 is System C with a learned probe ranking substituted for the "
         "deterministic one. The label here is a PROXY built from the traces "
-        "(\"did running this probe move the partial action toward the reference "
-        "action?\"), not a ground-truth utility; the deterministic comparison score is "
+        '("did running this probe move the partial action toward the reference '
+        'action?"), not a ground-truth utility; the deterministic comparison score is '
         "`-probe_cost_points`, which is exactly what "
         "`rli.agent.controller.rank_candidates` falls back to once value is tied.",
         "",

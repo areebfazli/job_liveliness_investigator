@@ -389,9 +389,7 @@ def test_backfill_limit_captures_caps_processing_most_recent_first(
 
 
 @respx.mock
-def test_backfill_never_writes_postings_or_posting_snapshots(
-    cfg, conn, net_client_factory
-) -> None:
+def test_backfill_never_writes_postings_or_posting_snapshots(cfg, conn, net_client_factory) -> None:
     net = net_client_factory("archive_backfill")
     api_url = "https://boards-api.greenhouse.io/v1/boards/acme/jobs"
 
@@ -591,9 +589,7 @@ def test_parse_html_board_lever_recovers_team_location_and_url(cfg) -> None:
     assert first.team == "Implementation Services"
     # Only `.sort-by-location`, never the workplaceTypes/commitment chips.
     assert first.location == "Mexico"
-    assert first.url == (
-        "https://jobs.lever.co/gohighlevel/ff2ad979-17a1-42d7-b206-96b9025b753d"
-    )
+    assert first.url == ("https://jobs.lever.co/gohighlevel/ff2ad979-17a1-42d7-b206-96b9025b753d")
     # A listing page carries no description.
     assert first.description_hash is None
 
@@ -645,9 +641,7 @@ def test_parse_html_board_ashby_reads_window_app_data(cfg) -> None:
     assert _titles(jobs) == ["Account Executive, Enterprise", "Account Executive, Growth"]
     assert [job.team for job in jobs] == ["Sales", "Sales"]
     assert [job.location for job in jobs] == ["North America", "North America"]
-    assert jobs[0].url == (
-        "https://jobs.ashbyhq.com/linear/1bfdcabe-aa5f-4999-9a6d-b8a824dd779b"
-    )
+    assert jobs[0].url == ("https://jobs.ashbyhq.com/linear/1bfdcabe-aa5f-4999-9a6d-b8a824dd779b")
 
 
 def test_parse_html_board_ashby_without_app_data_is_zero_jobs_and_partial(cfg) -> None:
@@ -702,10 +696,14 @@ def test_parse_html_board_keeps_real_titles_alongside_junk_ones(cfg) -> None:
 
 def test_parse_html_board_shared_title_page_guard_drops_every_job(cfg) -> None:
     """Nine syntactically fine but identical titles are an extraction failure."""
-    html = "<html><body>" + "".join(
-        f'<a href="https://boards.greenhouse.io/acme/jobs/{i}">Software Engineer</a>'
-        for i in range(9)
-    ) + "</body></html>"
+    html = (
+        "<html><body>"
+        + "".join(
+            f'<a href="https://boards.greenhouse.io/acme/jobs/{i}">Software Engineer</a>'
+            for i in range(9)
+        )
+        + "</body></html>"
+    )
 
     jobs, reason = _parse_html_board(cfg, "greenhouse", "acme", html)
 
@@ -716,10 +714,14 @@ def test_parse_html_board_shared_title_page_guard_drops_every_job(cfg) -> None:
 
 def test_parse_html_board_page_guard_respects_config_knobs(cfg) -> None:
     """The ceiling and the floor come from `[matching]`, not from constants."""
-    html = "<html><body>" + "".join(
-        f'<a href="https://boards.greenhouse.io/acme/jobs/{i}">Software Engineer</a>'
-        for i in range(9)
-    ) + "</body></html>"
+    html = (
+        "<html><body>"
+        + "".join(
+            f'<a href="https://boards.greenhouse.io/acme/jobs/{i}">Software Engineer</a>'
+            for i in range(9)
+        )
+        + "</body></html>"
+    )
     loosened = cfg.model_copy(
         update={"matching": cfg.matching.model_copy(update={"page_shared_title_max_fraction": 1.0})}
     )
@@ -902,7 +904,7 @@ def test_parse_html_board_keeps_short_real_department_names(cfg) -> None:
 
 
 def test_parse_html_board_keeps_remote_as_a_location(cfg) -> None:
-    """"Remote" is a non-TITLE but a perfectly good location."""
+    """ "Remote" is a non-TITLE but a perfectly good location."""
     html = LEVER_HTML.replace(
         '<span class="sort-by-location posting-category location">India</span>',
         '<span class="sort-by-location posting-category location">Remote</span>',

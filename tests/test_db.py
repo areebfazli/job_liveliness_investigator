@@ -35,8 +35,13 @@ EXPECTED_TABLES = {
 KEY_COLUMNS = [
     (
         "postings",
-        {"first_observed", "last_seen_open", "first_seen_absent", "reappeared_at",
-         "replacement_job_id"},
+        {
+            "first_observed",
+            "last_seen_open",
+            "first_seen_absent",
+            "reappeared_at",
+            "replacement_job_id",
+        },
         set(),
     ),
     (
@@ -51,8 +56,7 @@ KEY_COLUMNS = [
     ),
     (
         "board_snapshot_jobs",
-        {"board_snapshot_id", "job_id", "title", "team", "location",
-         "description_hash", "url"},
+        {"board_snapshot_id", "job_id", "title", "team", "location", "description_hash", "url"},
         set(),
     ),
     (
@@ -67,8 +71,16 @@ KEY_COLUMNS = [
     ),
     (
         "runs",
-        {"input_url", "system", "mode", "replay_at", "policy_version", "config_hash",
-         "total_cost_usd", "total_latency_ms"},
+        {
+            "input_url",
+            "system",
+            "mode",
+            "replay_at",
+            "policy_version",
+            "config_hash",
+            "total_cost_usd",
+            "total_latency_ms",
+        },
         set(),
     ),
     (
@@ -98,8 +110,7 @@ def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
 
 def _insert_company(conn: sqlite3.Connection, company_id: str = "acme.com") -> None:
     conn.execute(
-        "INSERT INTO companies (company_id, name, website_domain, created_at) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO companies (company_id, name, website_domain, created_at) VALUES (?, ?, ?, ?)",
         (company_id, "Acme", company_id, "2026-01-01T00:00:00Z"),
     )
 
@@ -110,8 +121,15 @@ def _insert_run(
     conn.execute(
         "INSERT INTO runs (id, posting_id, input_url, system, mode, started_at, status) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (run_id, posting_id, "https://example.com/job/1", "A", "live",
-         "2026-01-01T00:00:00Z", "running"),
+        (
+            run_id,
+            posting_id,
+            "https://example.com/job/1",
+            "A",
+            "live",
+            "2026-01-01T00:00:00Z",
+            "running",
+        ),
     )
 
 
@@ -144,9 +162,7 @@ def test_init_db_creates_parent_dirs(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("table,required,forbidden", KEY_COLUMNS)
-def test_key_columns(
-    tmp_path: Path, table: str, required: set[str], forbidden: set[str]
-) -> None:
+def test_key_columns(tmp_path: Path, table: str, required: set[str], forbidden: set[str]) -> None:
     db_path = tmp_path / "rli.db"
     init_db(db_path)
     conn = connect(db_path)
@@ -260,8 +276,15 @@ def test_capture_attempts_failed_row_insertable(tmp_path: Path) -> None:
             "INSERT INTO capture_attempts "
             "(company_id, target, attempted_at, source, ok, error, retryable) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("acme.com", "https://boards.greenhouse.io/acme", "2026-08-20T10:00:00Z",
-             "own", 0, "HTTP 429", 1),
+            (
+                "acme.com",
+                "https://boards.greenhouse.io/acme",
+                "2026-08-20T10:00:00Z",
+                "own",
+                0,
+                "HTTP 429",
+                1,
+            ),
         )
         conn.commit()
         row = conn.execute(
@@ -302,8 +325,13 @@ def test_foreign_keys_enforced_on_postings(tmp_path: Path) -> None:
                 "INSERT INTO postings "
                 "(posting_id, company_id, ats, canonical_url, created_at) "
                 "VALUES (?, ?, ?, ?, ?)",
-                ("p1", "unknown-company.com", "greenhouse",
-                 "https://boards.greenhouse.io/acme/jobs/1", "2026-08-20T10:00:00Z"),
+                (
+                    "p1",
+                    "unknown-company.com",
+                    "greenhouse",
+                    "https://boards.greenhouse.io/acme/jobs/1",
+                    "2026-08-20T10:00:00Z",
+                ),
             )
             conn.commit()
     finally:

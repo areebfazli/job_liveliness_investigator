@@ -35,9 +35,7 @@ def _normalized_ddl(text: str) -> str:
 
 
 def _table_names(conn: sqlite3.Connection) -> set[str]:
-    return {
-        row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
-    }
+    return {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
 
 
 def _build_v2_database(path: Path) -> None:
@@ -180,10 +178,7 @@ def test_version_2_database_upgrades_cleanly_to_version_3(tmp_path: Path) -> Non
         assert schema_version(conn) == SCHEMA_VERSION
         assert REPLAY_TABLES <= _table_names(conn)
         assert conn.execute("SELECT COUNT(*) FROM companies").fetchone()[0] == 1
-        assert (
-            conn.execute("SELECT posting_id FROM postings").fetchone()[0]
-            == "greenhouse:acme:j1"
-        )
+        assert conn.execute("SELECT posting_id FROM postings").fetchone()[0] == "greenhouse:acme:j1"
     finally:
         conn.close()
 

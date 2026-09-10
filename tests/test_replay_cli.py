@@ -152,9 +152,7 @@ def test_replay_check_exits_nonzero_on_a_planted_violation(tmp_path: Path) -> No
 
     conn = connect(db_path)
     try:
-        run_id = conn.execute(
-            "SELECT id FROM runs WHERE mode = 'replay' LIMIT 1"
-        ).fetchone()[0]
+        run_id = conn.execute("SELECT id FROM runs WHERE mode = 'replay' LIMIT 1").fetchone()[0]
         leaked = to_utc_z(NOW.replace(year=NOW.year + 1))
         conn.execute(
             """

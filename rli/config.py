@@ -94,6 +94,13 @@ class Thresholds(BaseModel):
     # fixtures in tests) keep validating unchanged.
     negative_event_window_days: int = Field(180, ge=1)
 
+    # spec.md §5 Amendment 2026-09-10: an ATS `updated_at` timestamp counts
+    # as a real refresh only when it "coincides with an observed
+    # content-hash change". This is how close "coincides" is, in days, on
+    # either side of the capture interval that brackets the change. Defaults
+    # to 3 for the same reason the field above does.
+    refresh_match_days: int = Field(3, ge=0)
+
 
 class Matching(BaseModel):
     """`[matching]` — repost/version matching knobs (spec.md §4).
@@ -301,18 +308,56 @@ class ProbeCosts(BaseModel):
 
 
 class TeamSignal(BaseModel):
-    """`team_signal` probe feature flag (spec.md §4; PLAN.md M3).
+    """`[team_signal]` — the corroborating-hiring-signal probe (spec.md §5).
 
-    No licensed enrichment source exists yet (`rli.probes.team_signal.
-    NullTeamSignalSource`), so this defaults to `False`: an unlicensed
-    deployment never attempts the probe, and `corroborating_hiring_signal`
-    (spec.md §5) stays the `UNKNOWN` sentinel. Flip to `True` only once a
-    real `TeamSignalSource` is wired in.
+    spec.md §5's "Amendment 2026-09-10" re-sourced this probe: the policy
+    input `corroborating_hiring_signal` no longer comes from a licensed
+    enrichment feed (none was ever available) but from FIRST-PARTY board
+    history — "new roles on the same team in the last 30 days, or closures
+    on the same team in the last 60 days; unknown when team history <
+    `min_history_days`". `rli.probes.team_signal.BoardHistoryTeamSignalSource`
+    implements that over `rli.history.features.team_activity`.
+
+    Because the data is already in our own database, `enabled` now defaults
+    to `True`: there is no licence to acquire and no network call to make.
+    The flag survives as a deployment kill switch (spec.md §4 keeps the probe
+    at the `high` cost tier, so an operator may still want it off), read by
+    `TeamSignalProbe.eligible` and therefore by
+    `rli.probes.registry.eligible_probes`.
+
+    Judgment call — **there is deliberately no `min_history_days` here.**
+    The amendment's "unknown when team history < `min_history_days`" is the
+    same bar every other history-derived feature already uses
+    (`thresholds.min_history_days`, read by
+    `rli.probes.lookups.has_usable_history`, `rli.probes.repost_history` and
+    `rli.history.features._classify_repost_pattern`). Adding a second knob
+    would let two "have we watched long enough" answers drift apart for the
+    same company in the same run; one knob cannot. `min_coverage` IS local,
+    because it is a different question (how dense the watching was) that no
+    other probe currently gates on.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    enabled: bool = False
+    enabled: bool = True
+
+    # Windows from spec.md §5's amendment table. Named `*_window_days` rather
+    # than hard-coded so a replay can widen them without a code change; the
+    # 30/60 defaults are the frozen policy values.
+    new_roles_window_days: int = Field(30, ge=1)
+    closures_window_days: int = Field(60, ge=1)
+
+    # How much activity counts as a signal. `1` reads the amendment
+    # literally ("new roles ... or closures ..."), i.e. any at all.
+    min_new_roles: int = Field(1, ge=1)
+    min_closures: int = Field(1, ge=1)
+
+    # Minimum `history_coverage` before a count of ZERO may be reported as a
+    # negative (`corroborating_hiring_signal = false`) rather than UNKNOWN.
+    # Sparse captures can miss a role that opened and closed between them, so
+    # "we saw nothing" is only an observation when we were actually looking.
+    # PLACEHOLDER — not yet tuned.
+    min_coverage: float = Field(0.5, ge=0.0, le=1.0)
 
 
 class Policy(BaseModel):
@@ -323,7 +368,7 @@ class Policy(BaseModel):
     is where those get frozen.
 
     Only ONE knob here is genuinely new — `contradiction_days`, which no
-    other layer needs. The remaining four are `None`-by-default **overrides**
+    other layer needs. The remaining six are `None`-by-default **overrides**
     of the identically named `[thresholds]` keys, not copies of them:
     `rli.policy.action.PolicyThresholds.from_config` reads `[thresholds]`
     unless `[policy]` names a value. Duplicating the numbers outright would
@@ -350,6 +395,15 @@ class Policy(BaseModel):
     long_lived_days: int | None = Field(None, ge=0)
     recheck_default_days: int | None = Field(None, ge=1)
     recheck_cap_days: int | None = Field(None, ge=1)
+    # The last two overrides are applied one layer UPSTREAM of the policy
+    # function — `refresh_match_days` in `rli.eval.case` (building the
+    # `refreshed_at` claim) and `negative_event_window_days` in
+    # `rli.events.policy_signals` — but both are resolved through
+    # `rli.policy.action.PolicyThresholds` at those sites, precisely so that
+    # setting one here actually changes behaviour and not just
+    # `policy_version()`. Both are part of that fingerprint.
+    refresh_match_days: int | None = Field(None, ge=0)
+    negative_event_window_days: int | None = Field(None, ge=1)
 
     @field_validator("frozen_at")
     @classmethod

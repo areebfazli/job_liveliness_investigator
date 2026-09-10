@@ -74,8 +74,9 @@ def test_save_board_snapshot_writes_header_and_job_rows(conn: sqlite3.Connection
             url="https://boards.greenhouse.io/acme/jobs/1",
             description_hash="abc123",
         ),
-        BoardJob(job_id="2", title="Recruiter", team=None, location=None, url=None,
-                  description_hash=None),
+        BoardJob(
+            job_id="2", title="Recruiter", team=None, location=None, url=None, description_hash=None
+        ),
     ]
 
     snapshot_id = save_board_snapshot(
@@ -86,9 +87,7 @@ def test_save_board_snapshot_writes_header_and_job_rows(conn: sqlite3.Connection
         jobs=jobs,
     )
 
-    header = conn.execute(
-        "SELECT * FROM board_snapshots WHERE id = ?", (snapshot_id,)
-    ).fetchone()
+    header = conn.execute("SELECT * FROM board_snapshots WHERE id = ?", (snapshot_id,)).fetchone()
     assert header["company_id"] == "acme.com"
     assert header["coverage_status"] == "complete"
     assert header["source"] == "own"

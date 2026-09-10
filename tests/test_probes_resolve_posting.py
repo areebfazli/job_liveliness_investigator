@@ -74,9 +74,7 @@ def test_greenhouse_open_emits_ats_native_evidence(ctx_factory) -> None:
         return_value=httpx.Response(200, text=JSONLD_PAGE)
     )
 
-    result = resolve_posting(
-        "https://boards.greenhouse.io/acme/jobs/5762900002", _ctx(ctx_factory)
-    )
+    result = resolve_posting("https://boards.greenhouse.io/acme/jobs/5762900002", _ctx(ctx_factory))
 
     assert result.ok is True
     assert result.data["posting_state"] == "open"
@@ -134,9 +132,9 @@ def test_ashby_job_found_is_open_with_ats_native_evidence(ctx_factory) -> None:
     respx.get("https://api.ashbyhq.com/posting-api/job-board/acme").mock(
         return_value=httpx.Response(200, json=ASHBY_BOARD)
     )
-    respx.get(
-        "https://jobs.ashbyhq.com/acme/b6a6d1c0-1234-4abc-8def-0123456789ab"
-    ).mock(return_value=httpx.Response(200, text=NO_JSONLD_PAGE))
+    respx.get("https://jobs.ashbyhq.com/acme/b6a6d1c0-1234-4abc-8def-0123456789ab").mock(
+        return_value=httpx.Response(200, text=NO_JSONLD_PAGE)
+    )
 
     result = resolve_posting(
         "https://jobs.ashbyhq.com/acme/b6a6d1c0-1234-4abc-8def-0123456789ab", _ctx(ctx_factory)
@@ -173,9 +171,9 @@ def test_lever_job_found_emits_board_listing_not_a_publish_date(ctx_factory) -> 
     respx.get("https://api.lever.co/v0/postings/acme").mock(
         return_value=httpx.Response(200, json=LEVER_BOARD)
     )
-    respx.get(
-        "https://jobs.lever.co/acme/c7b7e2d1-4321-4cba-9fed-fedcba987654"
-    ).mock(return_value=httpx.Response(200, text=NO_JSONLD_PAGE))
+    respx.get("https://jobs.lever.co/acme/c7b7e2d1-4321-4cba-9fed-fedcba987654").mock(
+        return_value=httpx.Response(200, text=NO_JSONLD_PAGE)
+    )
 
     result = resolve_posting(
         "https://jobs.lever.co/acme/c7b7e2d1-4321-4cba-9fed-fedcba987654", _ctx(ctx_factory)

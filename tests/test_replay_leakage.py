@@ -71,9 +71,7 @@ def _a_replay_run(conn: sqlite3.Connection) -> sqlite3.Row:
 # ---------------------------------------------------------------------------
 
 
-def test_a_clean_replay_reports_zero_violations(
-    conn: sqlite3.Connection, cfg: Config
-) -> None:
+def test_a_clean_replay_reports_zero_violations(conn: sqlite3.Connection, cfg: Config) -> None:
     _build(conn, cfg)
     _replay_both(conn, cfg)
 
@@ -138,9 +136,7 @@ def test_evidence_dated_after_t_is_caught(conn: sqlite3.Connection, cfg: Config)
     assert "e999" in report.violations[0].detail
 
 
-def test_a_cache_miss_in_a_replay_run_is_caught(
-    conn: sqlite3.Connection, cfg: Config
-) -> None:
+def test_a_cache_miss_in_a_replay_run_is_caught(conn: sqlite3.Connection, cfg: Config) -> None:
     """`'miss'` means "at least one call reached the network" (rli.eval.runner)."""
     _build(conn, cfg)
     _replay_both(conn, cfg)
@@ -160,9 +156,7 @@ def test_a_cache_miss_in_a_replay_run_is_caught(
     assert not report.clean
 
 
-def test_a_recorded_net_call_attempt_is_caught(
-    conn: sqlite3.Connection, cfg: Config
-) -> None:
+def test_a_recorded_net_call_attempt_is_caught(conn: sqlite3.Connection, cfg: Config) -> None:
     _build(conn, cfg)
     _replay_both(conn, cfg)
     run = _a_replay_run(conn)

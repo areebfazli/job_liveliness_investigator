@@ -71,9 +71,7 @@ def test_load_config_from_repo_root_with_no_argument(
     assert cfg.thresholds.recheck_default_days == 14
 
 
-def test_load_config_honours_env_var(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_load_config_honours_env_var(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config_path = tmp_path / "custom.toml"
     config_path.write_text(MINIMAL_CONFIG_TOML)
     monkeypatch.setenv("RLI_CONFIG", str(config_path))
@@ -82,9 +80,7 @@ def test_load_config_honours_env_var(
     assert cfg.allowlists.resolve_posting == ["example.com"]
 
 
-def test_explicit_path_beats_env_var(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_explicit_path_beats_env_var(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     env_path = tmp_path / "env.toml"
     env_path.write_text(MINIMAL_CONFIG_TOML)
     monkeypatch.setenv("RLI_CONFIG", str(env_path))
@@ -187,11 +183,7 @@ def test_invalid_values_raise_validation_error(mutate) -> None:
 
 
 def test_unknown_key_in_allowlists_rejected() -> None:
-    data = _mutated(
-        lambda d: d["allowlists"].__setitem__(
-            "resolve_postings", ["typo.example"]
-        )
-    )
+    data = _mutated(lambda d: d["allowlists"].__setitem__("resolve_postings", ["typo.example"]))
     with pytest.raises(ValidationError):
         Config.model_validate(data)
 
@@ -215,9 +207,7 @@ def test_unknown_key_in_net_rejected() -> None:
 
 def test_policy_frozen_at_naive_rejected() -> None:
     data = _mutated(
-        lambda d: d.setdefault("policy", {}).__setitem__(
-            "frozen_at", datetime(2026, 1, 1)
-        )
+        lambda d: d.setdefault("policy", {}).__setitem__("frozen_at", datetime(2026, 1, 1))
     )
     with pytest.raises(ValidationError):
         Config.model_validate(data)

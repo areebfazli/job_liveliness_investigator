@@ -57,9 +57,7 @@ def _parse_job(raw: dict) -> GreenhouseJob | None:
     if not isinstance(raw, dict) or "id" not in raw:
         return None
     departments = [
-        d.get("name")
-        for d in raw.get("departments") or []
-        if isinstance(d, dict) and d.get("name")
+        d.get("name") for d in raw.get("departments") or [] if isinstance(d, dict) and d.get("name")
     ]
     location = None
     raw_location = raw.get("location")

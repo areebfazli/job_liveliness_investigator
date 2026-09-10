@@ -186,6 +186,7 @@ from rli.models.time import ensure_aware, now_utc, to_utc_z
 from rli.net import NetClient, NetResult, hash_args
 from rli.policy.action import decide, policy_version
 from rli.policy.explain_stub import reasons_from_inputs
+from rli.policy.inputs import last_publish_or_refresh
 from rli.policy.quality import evidence_quality_detail
 from rli.probes.base import Probe, ProbeClaim, ProbeContext
 from rli.probes.persist import save_evidence
@@ -526,9 +527,7 @@ class Run:
         ).fetchone()
         if row is None:
             return False
-        self.conn.execute(
-            "UPDATE runs SET posting_id = ? WHERE id = ?", (posting_id, self.id)
-        )
+        self.conn.execute("UPDATE runs SET posting_id = ? WHERE id = ?", (posting_id, self.id))
         self.conn.commit()
         self.posting_id = posting_id
         return True
@@ -889,7 +888,9 @@ def decide_and_finish(
     `rli.policy.action.decide` takes it as a keyword rather than a
     `PolicyInputs` field (see that module's docstring); `None` features means
     no history, which is UNKNOWN — never `False` (spec.md §4: "missing
-    history never means flat hiring").
+    history never means flat hiring"). `last_refreshed_at` is threaded for
+    the same reason and derived from the evidence right here; see that
+    module's "two keyword inputs" section for why it is not cached.
     """
     quality = evidence_quality_detail(evidence, inputs, list(failures), probes.cfg)
     outcome = decide(
@@ -898,6 +899,10 @@ def decide_and_finish(
         probes.now,
         probes.cfg,
         long_lived=features.long_lived if features is not None else UNKNOWN,
+        # Recomputed from the evidence at every call site rather than carried
+        # on `CaseState` — the choice is argued once, in
+        # `rli.policy.action`'s "two keyword inputs" section.
+        last_refreshed_at=last_publish_or_refresh(evidence),
     )
     reasons = reasons_from_inputs(inputs, evidence, now=probes.now)
 

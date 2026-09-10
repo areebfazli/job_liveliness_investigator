@@ -225,9 +225,7 @@ def test_survival_at_horizon_within_support_is_a_probability(
 @pytest.mark.parametrize(
     "build", [lambda conn: None, _build_never_closing_cohort, _build_staggered_cohort]
 )
-def test_no_inf_or_nan_in_report_model_dump(
-    conn: sqlite3.Connection, cfg: Config, build
-) -> None:
+def test_no_inf_or_nan_in_report_model_dump(conn: sqlite3.Connection, cfg: Config, build) -> None:
     build(conn)
     report = behavior_report(conn, cfg, now=at(70))
 

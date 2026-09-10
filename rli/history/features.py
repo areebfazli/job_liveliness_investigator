@@ -40,15 +40,28 @@ because it is the kind of denominator that quietly flatters a dataset):
 
 Other GUESSED / judgment calls:
 
-* **`age_days` is a LOWER bound.** It runs from `first_observed`, which is
-  when WE first saw the posting, not when it was published; the true age is
-  left-censored. Consumers must not treat it as the posting's age.
-* **`long_lived` respects that censoring.** `True` as soon as the lower
-  bound `age_days >= thresholds.long_lived_days` (a lower bound above the
-  threshold is conclusive). `False` only when the company's history span
-  itself reaches back at least `long_lived_days` — i.e. we would have seen
-  the posting had it been older. Otherwise `UNKNOWN`: a young-looking
-  posting in a two-week-old dataset is not evidence of a young posting.
+* **`age_days` runs from the EARLIEST of three origins**, per spec.md §5's
+  Amendment 2026-09-10: the ATS `first_published` date (handed in by the
+  caller — see `posting_features`), the earliest ARCHIVE capture that
+  contained the job, and our own `first_observed`. It is `UNKNOWN` only when
+  all three are absent. It is still a LOWER bound whenever `first_observed`
+  is the only one available — that is when WE first saw the posting, not
+  when it was published, so the true age is left-censored — but with a
+  publish date or an archive capture the bound is much tighter, which is
+  exactly what the amendment set out to fix (`long-lived` was previously
+  "measured from our own first snapshot").
+* **`long_lived` is now the plain comparison** `age_days >=
+  thresholds.long_lived_days`, `UNKNOWN` only when `age_days` is. The old
+  hedge — `False` only when the company's own history span itself reached
+  back `long_lived_days` — is REMOVED by the amendment: with publish dates
+  and archive captures in the origin set, "not long-lived" no longer depends
+  on how long WE have been watching. The honest consequence, stated plainly:
+  a `False` from a thin dataset is now possible. It is safe because of where
+  the value is read — `long_lived` appears in exactly one policy branch
+  (P4, `rli.policy.action`), as the conjunct `long_lived is True`, so a
+  wrong `False` can only BLOCK the `skip` branch, never enable it. The
+  failure mode is a `quick_apply` where a `skip` was warranted, not a `skip`
+  on a role we simply had not been watching long enough.
 * **`open_count` trend** is an ordinary least-squares slope in jobs/day over
   the `'complete'` captures in the window, reported alongside the point
   count and the first/last open counts so it can be checked by hand rather
@@ -77,13 +90,38 @@ Other GUESSED / judgment calls:
   component is unknown on either side -> `UNKNOWN`, because "repeated
   UNCHANGED" is a positive claim about content that a missing hash cannot
   support.
+* **`team_activity` reuses the COMPANY-WIDE `coverage_window` even for a
+  team-scoped question.** Board captures are taken per company, not per
+  team: `board_snapshots` has a `company_id` and no team column, and a
+  capture either listed the whole board or it did not. So "how long have we
+  been watching, and how densely" is inherently a company-wide fact, and
+  this schema offers no way to compute a narrower one — a team that happens
+  to have posted nothing all year is indistinguishable from a team we
+  stopped watching. Reporting the company number is the honest available
+  answer; inventing a per-team span (e.g. first-to-last posting of that
+  team) would read as an observation window while actually measuring the
+  team's own hiring, which is the very thing being asked about.
+* **`team_activity` scope falls back to the whole company when the posting
+  carries no team.** `postings.team` is frequently NULL (an ATS that does
+  not publish a department, or an archive-only row whose capture stored no
+  team). Treating "no team" as a team would pool every team-less posting of
+  every department into one pseudo-team and then report its activity as if
+  it were the posting's colleagues. Pooling the whole company instead is
+  wider than asked for and is labelled as such (`scope='company'`), so a
+  consumer can discount it rather than be misled by it.
+* **`team_activity` counts new roles from `first_observed`**, the same
+  left-censored proxy `age_days` uses. It is the only "this role appeared"
+  signal this schema carries, so it doubles as both; a role that existed
+  before our first capture counts as "new" on the day we first saw it, which
+  can overstate recent hiring on a young dataset. That is what
+  `history_days`/`history_coverage` are reported alongside the counts for.
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from statistics import median
 from typing import Literal
 
@@ -98,9 +136,12 @@ __all__ = [
     "CompanyHistoryFeatures",
     "CoverageWindow",
     "PostingHistoryFeatures",
+    "TeamActivity",
+    "TeamActivityEvent",
     "company_features",
     "coverage_window",
     "posting_features",
+    "team_activity",
 ]
 
 TrendDirection = Literal["up", "down", "flat"]
@@ -185,8 +226,10 @@ class PostingHistoryFeatures(BaseModel):
     replacement_job_id: str | None = None
     censoring: Literal["right", "interval"] | Unknown = UNKNOWN
 
-    # LOWER bound on the posting's age: measured from when we first saw it,
-    # not from when it was published (left-censored).
+    # Days since the EARLIEST of: ATS first_published, the earliest archive
+    # capture containing the job, and our own first_observed. Still a LOWER
+    # bound when first_observed is the only one of the three we have (the
+    # posting may predate our first capture). See the module docstring.
     age_days: float | Unknown = UNKNOWN
     long_lived: bool | Unknown = UNKNOWN
     repost_pattern: RepostPattern | Unknown = UNKNOWN
@@ -229,9 +272,7 @@ def coverage_window(conn: sqlite3.Connection, company_id: str) -> CoverageWindow
 
     capture_days = {_day(value) for value in captured}
     complete_days = {
-        _day(parse_utc(row["captured_at"]))
-        for row in rows
-        if row["coverage_status"] == "complete"
+        _day(parse_utc(row["captured_at"])) for row in rows if row["coverage_status"] == "complete"
     }
 
     # Own-source attempts only: archive attempts are stamped with the
@@ -256,9 +297,7 @@ def coverage_window(conn: sqlite3.Connection, company_id: str) -> CoverageWindow
         first_capture_at=first_capture_at,
         last_capture_at=last_capture_at,
         history_days=(last_capture_at - first_capture_at).total_seconds() / 86400.0,
-        history_coverage=(
-            complete_capture_days / attempted_days if attempted_days else 0.0
-        ),
+        history_coverage=(complete_capture_days / attempted_days if attempted_days else 0.0),
         calendar_coverage=complete_capture_days / calendar_days,
         calendar_days=calendar_days,
         attempted_days=attempted_days,
@@ -466,17 +505,29 @@ def posting_features(
     posting_id: str,
     *,
     now: datetime | None = None,
+    first_published: datetime | None = None,
 ) -> PostingHistoryFeatures:
     """History features for one posting (see module docstring).
 
     Raises `KeyError` if `posting_id` does not exist — a missing posting is a
     caller bug, not a thin-history case, and must not be silently reported as
     an all-UNKNOWN feature row.
+
+    `first_published` is the ATS/page publish date, and it must be HANDED IN
+    rather than re-derived here: it lives in the evidence list, and
+    `rli.policy.inputs` owns the rule for picking the right one (spec.md §3's
+    source ranking, plus the "primary quality only" filter and the
+    earliest-within-a-tier tiebreak). This module holds no evidence at all,
+    so re-deriving it here would mean duplicating that ranking in a place
+    that cannot apply it — two implementations of one spec rule, drifting.
+    `None` means "no publish date established", not "published recently";
+    `rli.eval.case` passes `rli.policy.inputs.best_publish_claim`'s
+    `source_event_at`.
     """
     as_of = now or now_utc()
     row = conn.execute(
         """
-        SELECT posting_id, company_id, first_observed, last_seen_open,
+        SELECT posting_id, company_id, ats_job_id, first_observed, last_seen_open,
                first_seen_absent, reappeared_at, replacement_job_id
         FROM postings
         WHERE posting_id = ?
@@ -502,21 +553,53 @@ def posting_features(
     else:
         censoring = UNKNOWN
 
+    # `age_days` runs from the EARLIEST of three independent origins (spec.md
+    # §5, Amendment 2026-09-10): the ATS publish date, the earliest ARCHIVE
+    # capture that contained the job, and our own `first_observed`. Each is
+    # optional; the earliest available one wins, because each is an upper
+    # bound on "the posting already existed by then" and the earliest such
+    # bound is the strongest.
+    #
+    # The archive side is read from BOTH capture tables, for the same reason
+    # `rli.eval.case` matches refreshes against both: a posting may appear as
+    # its own `posting_snapshots` rows, inside a company-wide board capture,
+    # or both. `source='archive'` only — an 'own' capture cannot predate
+    # `first_observed`, which is derived from exactly those captures.
+    archive_origins: list[datetime] = []
+    open_archive = conn.execute(
+        """
+        SELECT MIN(captured_at) AS earliest FROM posting_snapshots
+        WHERE posting_id = ? AND source = 'archive' AND status = 'open'
+        """,
+        (posting_id,),
+    ).fetchone()
+    if open_archive is not None and open_archive["earliest"]:
+        archive_origins.append(parse_utc(open_archive["earliest"]))
+
+    ats_job_id = row["ats_job_id"]
+    if ats_job_id is not None:
+        board_archive = conn.execute(
+            """
+            SELECT MIN(s.captured_at) AS earliest
+            FROM board_snapshot_jobs AS j
+            JOIN board_snapshots AS s ON s.id = j.board_snapshot_id
+            WHERE s.company_id = ? AND s.source = 'archive' AND j.job_id = ?
+            """,
+            (company_id, str(ats_job_id)),
+        ).fetchone()
+        if board_archive is not None and board_archive["earliest"]:
+            archive_origins.append(parse_utc(board_archive["earliest"]))
+
+    origins = [
+        origin
+        for origin in (first_published, min(archive_origins, default=None), first_observed)
+        if origin is not None
+    ]
     age_days: float | Unknown = UNKNOWN
     long_lived: bool | Unknown = UNKNOWN
-    if first_observed is not None:
-        age_days = (as_of - first_observed).total_seconds() / 86400.0
-        long_lived_days = cfg.thresholds.long_lived_days
-        if age_days >= long_lived_days:
-            # A LOWER bound above the threshold is conclusive.
-            long_lived = True
-        elif coverage.history_days >= long_lived_days:
-            # Our history reaches back far enough that we would have seen an
-            # older posting, so "not long-lived" is a real observation.
-            long_lived = False
-        else:
-            # Thin history: the posting may predate our first capture.
-            long_lived = UNKNOWN
+    if origins:
+        age_days = (as_of - min(origins)).total_seconds() / 86400.0
+        long_lived = age_days >= cfg.thresholds.long_lived_days
 
     pattern, reason = _classify_repost_pattern(
         conn, cfg, posting_id, first_seen_absent, coverage.history_days
@@ -538,4 +621,204 @@ def posting_features(
         long_lived=long_lived,
         repost_pattern=pattern,
         repost_pattern_reason=reason,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Team activity (spec.md §5 "Amendment 2026-09-10")
+# ---------------------------------------------------------------------------
+
+# `rli.history.closures.apply_to_postings` mints archive-only postings as
+# `"archive:{company_id}:{job_id}"`, a scheme it guarantees cannot collide
+# with a real `"{ats}:{tenant}:{job_id}"`. The prefix test is therefore an
+# exact provenance answer and needs no interval re-derivation.
+_ARCHIVE_ONLY_POSTING_PREFIX = "archive:"
+
+
+def _normalize_team(team: str | None) -> str | None:
+    """`.strip().casefold()` a team label; empty/whitespace/None all collapse to None.
+
+    Case- and whitespace-insensitive because `postings.team` is populated
+    from whatever the board capture or ATS happened to print
+    (`rli.history.closures` takes job facts from the most recent capture),
+    so `"Platform"`, `"platform "` and `"platform"` are one team.
+    """
+    if team is None:
+        return None
+    normalized = team.strip().casefold()
+    return normalized or None
+
+
+class TeamActivityEvent(BaseModel):
+    """One posting that counted toward a `team_activity()` window.
+
+    Carried so a consumer can quote WHICH roles produced a count (e.g. a
+    `ProbeClaim.raw_excerpt`) instead of asserting a bare number.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    posting_id: str
+    title: str | None
+    # `first_observed` for a new role, `first_seen_absent` for a closure.
+    at: datetime
+    # True when this posting exists only because archive captures implied it
+    # (`posting_id` carries the `"archive:"` prefix): no 'own' capture ever
+    # saw it, so evidence resting on it is `archive`-quality at best.
+    archive_only: bool
+
+
+class TeamActivity(BaseModel):
+    """Team- (or company-wide fallback) hiring activity derived from board history.
+
+    `history_days` / `history_coverage` are present unconditionally, even
+    when every count is 0 (spec.md §4: "Derived history features always
+    carry `history_days`/`history_coverage`; missing history never means
+    flat hiring"), so a consumer can always tell "no activity" apart from
+    "no observation window".
+
+    `in_scope_postings` / `archive_only_postings` describe the provenance of
+    the WHOLE in-scope posting set, not just the windowed events. They exist
+    because the honest reading of "we watched this team and nothing
+    happened" depends on how the team was watched, and with zero windowed
+    activity there is no event whose provenance could answer that. Computing
+    them here rather than in the consumer keeps one definition of "in scope"
+    (the team-normalization rule above); re-deriving the scope filter in a
+    probe would be a second source of truth that could silently disagree.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    company_id: str
+    # Normalized (casefold+strip) team, or None when scope == 'company'.
+    team: str | None
+    # 'company' means the posting carried no team, so activity is pooled
+    # over every posting of the company rather than fabricating a team.
+    scope: Literal["team", "company"]
+    as_of: datetime
+
+    # Company-wide, for BOTH scopes — see the module docstring.
+    history_days: float
+    history_coverage: float
+
+    new_roles_30d: int
+    # Newest first (ties by posting_id ascending), for raw_excerpt building.
+    new_roles: tuple[TeamActivityEvent, ...]
+    closures_60d: int
+    closures: tuple[TeamActivityEvent, ...]
+
+    # In-scope postings with first_seen_absent IS NULL.
+    open_roles_now: int
+
+    # Provenance of the whole in-scope set (see the class docstring).
+    in_scope_postings: int = 0
+    archive_only_postings: int = 0
+
+
+def team_activity(
+    conn: sqlite3.Connection,
+    company_id: str,
+    team: str | None,
+    now: datetime,
+    cfg: Config,
+) -> TeamActivity:
+    """Recent hiring activity for one team of one company (spec.md §5 amendment).
+
+    "New roles on the same team in the last 30 days, or closures on the same
+    team in the last 60 days" — both windows configurable under
+    `[team_signal]`, both closed intervals ending at `now`. A posting whose
+    `team` is NULL or blank has no team to compare against, so the scope
+    widens to the whole company (`scope='company'`) rather than silently
+    matching every other team-less posting as if "no team" were a team.
+
+    This function returns COUNTS AND EVENTS ONLY — never a verdict. Whether
+    the counts amount to a corroborating hiring signal is
+    `rli.probes.team_signal`'s decision, against its own configured minimums.
+
+    `now` is required (not defaulted): every caller is either a probe with an
+    injected clock or a replay, and a hidden `now_utc()` here would make the
+    windows non-reproducible (spec.md §6).
+    """
+    target = _normalize_team(team)
+    scope: Literal["team", "company"] = "company" if target is None else "team"
+
+    # Company-wide coverage, reused verbatim for a team-scoped question:
+    # board captures have no per-team cadence (module docstring).
+    coverage = coverage_window(conn, company_id)
+
+    new_roles_from = now - timedelta(days=cfg.team_signal.new_roles_window_days)
+    closures_from = now - timedelta(days=cfg.team_signal.closures_window_days)
+
+    # ORDER BY posting_id makes the pre-sort order total, so the stable
+    # newest-first sorts below break `at` ties by posting_id ascending.
+    rows = conn.execute(
+        """
+        SELECT posting_id, title, team, first_observed, first_seen_absent
+        FROM postings
+        WHERE company_id = ?
+        ORDER BY posting_id
+        """,
+        (company_id,),
+    ).fetchall()
+
+    new_roles: list[TeamActivityEvent] = []
+    closures: list[TeamActivityEvent] = []
+    open_roles_now = 0
+    in_scope_postings = 0
+    archive_only_postings = 0
+
+    for row in rows:
+        if target is not None and _normalize_team(row["team"]) != target:
+            continue
+
+        in_scope_postings += 1
+        archive_only = row["posting_id"].startswith(_ARCHIVE_ONLY_POSTING_PREFIX)
+        if archive_only:
+            archive_only_postings += 1
+        if row["first_seen_absent"] is None:
+            open_roles_now += 1
+
+        if row["first_observed"] is not None:
+            first_observed = parse_utc(row["first_observed"])
+            if new_roles_from <= first_observed <= now:
+                new_roles.append(
+                    TeamActivityEvent(
+                        posting_id=row["posting_id"],
+                        title=row["title"],
+                        at=first_observed,
+                        archive_only=archive_only,
+                    )
+                )
+
+        if row["first_seen_absent"] is not None:
+            first_seen_absent = parse_utc(row["first_seen_absent"])
+            if closures_from <= first_seen_absent <= now:
+                closures.append(
+                    TeamActivityEvent(
+                        posting_id=row["posting_id"],
+                        title=row["title"],
+                        at=first_seen_absent,
+                        archive_only=archive_only,
+                    )
+                )
+
+    # Stable sort over a posting_id-ordered list: newest first, ties by
+    # posting_id ascending. Deterministic, which is what replay requires.
+    new_roles.sort(key=lambda event: event.at, reverse=True)
+    closures.sort(key=lambda event: event.at, reverse=True)
+
+    return TeamActivity(
+        company_id=company_id,
+        team=target,
+        scope=scope,
+        as_of=now,
+        history_days=coverage.history_days,
+        history_coverage=coverage.history_coverage,
+        new_roles_30d=len(new_roles),
+        new_roles=tuple(new_roles),
+        closures_60d=len(closures),
+        closures=tuple(closures),
+        open_roles_now=open_roles_now,
+        in_scope_postings=in_scope_postings,
+        archive_only_postings=archive_only_postings,
     )

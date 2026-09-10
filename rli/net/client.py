@@ -420,9 +420,7 @@ class RateLimiter:
             bucket = self._buckets.get(key)
             if bucket is None:
                 rps, burst = self._overrides.get(key, (self._default_rps, self._default_burst))
-                bucket = TokenBucket(
-                    rps, burst, monotonic=self._monotonic, sleep=self._sleep
-                )
+                bucket = TokenBucket(rps, burst, monotonic=self._monotonic, sleep=self._sleep)
                 self._buckets[key] = bucket
         # Released before blocking: one throttled host must not stall others.
         bucket.acquire()
@@ -731,9 +729,7 @@ class NetClient:
             retryable=retryable,
         )
 
-    def _fetch_one_hop(
-        self, url: str, params: dict[str, str] | None
-    ) -> httpx.Response | NetResult:
+    def _fetch_one_hop(self, url: str, params: dict[str, str] | None) -> httpx.Response | NetResult:
         """Fetch one URL with bounded retries; never raise for network errors.
 
         Returns the `httpx.Response` on any terminal outcome (including 4xx,
@@ -771,9 +767,7 @@ class NetClient:
             if response.status_code in RETRYABLE_STATUS_CODES:
                 last_error = f"HTTP {response.status_code}"
                 if attempt < self._max_retries:
-                    self._sleep(
-                        self._backoff_delay(attempt, response.headers.get("retry-after"))
-                    )
+                    self._sleep(self._backoff_delay(attempt, response.headers.get("retry-after")))
                     continue
                 return self._failure(
                     url,
@@ -914,9 +908,7 @@ class NetClient:
             if result is not None:
                 return result
 
-        result = self._fetch_following_redirects(
-            url, allowlist=effective_allowlist, params=params
-        )
+        result = self._fetch_following_redirects(url, allowlist=effective_allowlist, params=params)
 
         if result.ok and use_cache and self._cache is not None:
             self._cache.set(

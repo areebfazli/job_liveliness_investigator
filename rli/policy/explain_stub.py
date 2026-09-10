@@ -24,9 +24,28 @@ Judgment calls:
   about employer intent (spec.md §5: "This policy is a user-effort heuristic,
   not a claim about employer intent"). No reason says "ghost job", "evergreen"
   or "filled" (spec.md §1/§5/§9).
-* **Order is fixed** (state, publication, expiry, events, history, hiring
-  signal) rather than ranked by importance, because a stable order is what
-  makes System A/B output diffable across runs.
+* **Order is fixed** (state, publication, refresh, expiry, events, history,
+  hiring signal, board absence) rather than ranked by importance, because a
+  stable order is what makes System A/B output diffable across runs.
+* **The publication reason never stands alone once a refresh exists.** A
+  `refreshed_at` claim can make `publish_recency` "recent" for a posting
+  first published long ago, and "The role was first published 340 days ago"
+  on its own would read as a contradiction of that verdict. The refresh
+  reason is emitted whenever a `refreshed_at` claim is present — not only
+  when it happens to be the later of the two dates — so the two ALWAYS
+  appear together, adjacently, and the pair reads correctly. That guarantee
+  is what makes it safe to leave the publication wording alone.
+* **Exactly ONE material-event reason is emitted**, whichever wording
+  applies. The specific "dated event, and nothing has changed since" wording
+  (the observation behind the policy's P3c `wait`) replaces the generic one
+  rather than joining it; two reasons about one event would double-count in
+  spec.md §6's citation-support metric and read as two findings.
+* **The P3c wording avoids the word "unchanged"** and says "has not changed
+  since" instead. `rli.eval.metrics.FAMILY_KEYWORDS` classifies reason text
+  by crude substring, and "unchanged" is a `requirements`-family keyword; a
+  refresh/event reason misfiled as a requirements-drift reason would be
+  counted as an unsupported citation. The classifier is documented as crude
+  and this module works around it rather than widening it.
 * **Some inputs are cited by probe, not by claim type.** `repost_pattern`,
   the company-event signals and `corroborating_hiring_signal` come from
   probes whose claim vocabulary is owned by `rli.probes`; citing "any
@@ -51,6 +70,8 @@ from rli.policy.inputs import (
     CLAIM_DECLARED_EXPIRY,
     CLAIM_POSTING_STATE,
     best_publish_claim,
+    last_publish_or_refresh,
+    newest_refresh_claim,
 )
 
 __all__ = ["reasons_from_inputs"]
@@ -104,9 +125,7 @@ def reasons_from_inputs(
     if not isinstance(state, Unknown):
         state_evidence = _by_claim(evidence, CLAIM_POSTING_STATE)
         if state_evidence:
-            reasons.append(
-                ReasonItem(text=_STATE_TEXT[state], evidence_ids=_ids(state_evidence))
-            )
+            reasons.append(ReasonItem(text=_STATE_TEXT[state], evidence_ids=_ids(state_evidence)))
 
     # 2. Publication date. Phrased in days-ago to match spec.md §1's example;
     #    the source tier is named because spec.md §3 ranks sources and the
@@ -125,7 +144,26 @@ def reasons_from_inputs(
             )
         )
 
-    # 3. Declared expiry (spec.md §3: publisher-declared, not proof of anything).
+    # 3. Corroborated refresh. Immediately after the publication reason, so
+    #    "first published N days ago" is never read alone (module docstring).
+    #    The claim only exists when an ATS `updated_at` coincided with a
+    #    content change we actually observed (`rli.eval.case`), so the text
+    #    states both halves — the date and the corroboration — and nothing
+    #    about why the employer touched the posting.
+    refresh = newest_refresh_claim(evidence)
+    if refresh is not None and refresh.source_event_at is not None:
+        reasons.append(
+            ReasonItem(
+                text=(
+                    "The posting was updated on "
+                    f"{refresh.source_event_at.date().isoformat()}, and our own or "
+                    "archived captures show its content changed around then."
+                ),
+                evidence_ids=_ids([refresh]),
+            )
+        )
+
+    # 4. Declared expiry (spec.md §3: publisher-declared, not proof of anything).
     if isinstance(inputs.declared_expiry, datetime):
         expiry_evidence = _by_claim(evidence, CLAIM_DECLARED_EXPIRY)
         if expiry_evidence:
@@ -141,20 +179,12 @@ def reasons_from_inputs(
                 )
             )
 
-    # 4. Company events. Only stated when TRUE: "we checked and found nothing"
+    # 5. Company events. Only stated when TRUE: "we checked and found nothing"
     #    is not a user-facing reason, and UNKNOWN certainly is not.
     event_evidence = _by_probe(evidence, _EVENTS_PROBE)
     if event_evidence:
         if inputs.material_negative_event is True:
-            reasons.append(
-                ReasonItem(
-                    text=(
-                        "A dated layoff or shutdown was recorded for this company inside "
-                        "the policy's lookback window."
-                    ),
-                    evidence_ids=_ids(event_evidence),
-                )
-            )
+            reasons.append(_material_event_reason(inputs, evidence, event_evidence))
         if inputs.freeze_or_pause is True:
             reasons.append(
                 ReasonItem(
@@ -166,7 +196,7 @@ def reasons_from_inputs(
                 )
             )
 
-    # 5. Repost history.
+    # 6. Repost history.
     repost_evidence = _by_probe(evidence, *_REPOST_PROBES)
     pattern = inputs.repost_pattern
     if repost_evidence and not isinstance(pattern, Unknown) and pattern != "none":
@@ -177,7 +207,7 @@ def reasons_from_inputs(
         )
         reasons.append(ReasonItem(text=text, evidence_ids=_ids(repost_evidence)))
 
-    # 6. Corroborating hiring signal.
+    # 7. Corroborating hiring signal.
     team_evidence = _by_probe(evidence, _TEAM_SIGNAL_PROBE)
     signal = inputs.corroborating_hiring_signal
     if team_evidence and not isinstance(signal, Unknown):
@@ -192,7 +222,7 @@ def reasons_from_inputs(
             )
         )
 
-    # 7. Board absence (a fact the user should see even when it contradicts
+    # 8. Board absence (a fact the user should see even when it contradicts
     #    the resolver — spec.md §1 shows contradictions as `mixed`, and hiding
     #    the conflicting observation would leave that unexplained).
     absence_evidence = _by_claim(evidence, CLAIM_BOARD_ABSENT)
@@ -205,6 +235,71 @@ def reasons_from_inputs(
         )
 
     return _enforce_citations(reasons, evidence)
+
+
+def _material_event_reason(
+    inputs: PolicyInputs,
+    evidence: Sequence[EvidenceItem],
+    event_evidence: Sequence[EvidenceItem],
+) -> ReasonItem:
+    """The one reason emitted when `material_negative_event is True`.
+
+    Two wordings, one reason (module docstring). The specific wording states
+    the observation behind the policy's P3c `wait` branch — a dated event,
+    and no sign the posting's content has moved since — and it cites BOTH
+    halves of that observation in a single `ReasonItem`: the `company_events`
+    evidence for the date, and the refresh/publish claim for the "since".
+    Citing only the event would leave the second half of the sentence
+    unsupported, which is exactly what spec.md §9 forbids.
+
+    The "since" is recomputed here from the evidence, via the same
+    `last_publish_or_refresh` the policy uses, rather than being handed in:
+    this module's contract is `(inputs, evidence)` and a derived date that
+    can be recomputed from the evidence does not justify widening it.
+
+    It falls back to the generic wording whenever the specific one cannot be
+    supported — no event DATE (an older `PolicyInputs`, or the "checked, none
+    found" case that cannot reach here), a refresh/publish date LATER than
+    the event (the posting did move afterwards, so the sentence would be
+    false), or no publish/refresh evidence to cite at all. Note the third
+    case is a citation problem, not a factual one: "not refreshed since" is
+    still true, and the policy still fires P3c on it; there is simply no
+    evidence id for the absence, and an uncited half-sentence is worse than
+    a coarser true one.
+    """
+    generic = ReasonItem(
+        text=(
+            "A dated layoff or shutdown was recorded for this company inside "
+            "the policy's lookback window."
+        ),
+        evidence_ids=_ids(event_evidence),
+    )
+
+    event_at = inputs.last_material_event_at
+    if not isinstance(event_at, datetime):
+        return generic
+
+    refreshed_at = last_publish_or_refresh(evidence)
+    if refreshed_at is not None and refreshed_at > event_at:
+        return generic
+
+    # The refresh claim is the better citation when it exists; the publish
+    # claim is the fallback, since "first published, and never refreshed
+    # since" is the same observation with a coarser source.
+    cited = newest_refresh_claim(evidence) or best_publish_claim(evidence)
+    if cited is None:
+        return generic
+
+    return ReasonItem(
+        # "has not changed since", never "unchanged" — see the module
+        # docstring's note on `rli.eval.metrics`' keyword classifier.
+        text=(
+            "A dated layoff or shutdown was recorded for this company on "
+            f"{event_at.date().isoformat()}, and the posting's content has not "
+            "changed since then."
+        ),
+        evidence_ids=_ids([*event_evidence, cited]),
+    )
 
 
 def _enforce_citations(

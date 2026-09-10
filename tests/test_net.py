@@ -777,9 +777,7 @@ def test_net_client_follows_a_redirect_to_an_allowed_host_and_reports_the_final_
     first = respx.get(ALLOWED_URL).mock(
         return_value=httpx.Response(302, headers={"Location": SECOND_ALLOWED_URL})
     )
-    second = respx.get(SECOND_ALLOWED_URL).mock(
-        return_value=httpx.Response(200, text="final body")
-    )
+    second = respx.get(SECOND_ALLOWED_URL).mock(return_value=httpx.Response(200, text="final body"))
     client = make_client()
 
     result = client.get(ALLOWED_URL)

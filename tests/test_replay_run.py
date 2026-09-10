@@ -70,9 +70,7 @@ def _build(conn: sqlite3.Connection, cfg: Config) -> None:
 
 
 def _evidence(conn: sqlite3.Connection, run_id: str) -> list[sqlite3.Row]:
-    return conn.execute(
-        "SELECT * FROM evidence WHERE run_id = ? ORDER BY id", (run_id,)
-    ).fetchall()
+    return conn.execute("SELECT * FROM evidence WHERE run_id = ? ORDER BY id", (run_id,)).fetchall()
 
 
 # ---------------------------------------------------------------------------
@@ -269,9 +267,7 @@ def test_system_b_exposes_a_strict_subset_of_system_a(
     b_summary = run_replay(conn, cfg, dataset_id=DATASET, system="B")
     assert a_summary.errors == 0 and b_summary.errors == 0
 
-    a_exposed = {
-        (o.posting_id, o.replay_at): set(o.exposed_probes) for o in a_summary.outcomes
-    }
+    a_exposed = {(o.posting_id, o.replay_at): set(o.exposed_probes) for o in a_summary.outcomes}
     for outcome in b_summary.outcomes:
         key = (outcome.posting_id, outcome.replay_at)
         assert set(outcome.exposed_probes) <= a_exposed[key]
@@ -331,9 +327,7 @@ def test_replaying_twice_replaces_rather_than_duplicates(
     assert conn.execute("SELECT COUNT(*) FROM runs WHERE mode = 'live'").fetchone()[0] > 0
 
 
-def test_keeping_previous_runs_leaves_both_sets(
-    conn: sqlite3.Connection, cfg: Config
-) -> None:
+def test_keeping_previous_runs_leaves_both_sets(conn: sqlite3.Connection, cfg: Config) -> None:
     _build(conn, cfg)
     first = run_replay(conn, cfg, dataset_id=DATASET, system="A")
     run_replay(conn, cfg, dataset_id=DATASET, system="A", replace=False)
@@ -357,9 +351,7 @@ def test_a_pluggable_system_c_runner_replays_like_a_shipped_one(
         result = run_system_b(conn_, cfg_, url, **kwargs)
         return result.model_copy(update={"system": "C"})
 
-    summary = run_replay(
-        conn, cfg, dataset_id=DATASET, system="C", runner=system_c, limit_cases=2
-    )
+    summary = run_replay(conn, cfg, dataset_id=DATASET, system="C", runner=system_c, limit_cases=2)
     assert summary.cases == 2
     assert summary.errors == 0, summary.describe()
     assert len(seen) == 2
@@ -412,17 +404,13 @@ def test_an_archive_only_posting_resolves_to_its_collected_row(
 
     with respx.mock:
         mock_ats()
-        respx.get(
-            f"https://boards-api.greenhouse.io/v1/boards/{TENANT}/jobs/6100"
-        ).mock(return_value=httpx.Response(404, json={"error": "gone"}))
-        respx.get(url).mock(return_value=httpx.Response(200, text="<html></html>"))
-        result = run_system_a(
-            conn, cfg, url, now=NOW, sleep=lambda _s: None, use_tool_cache=False
+        respx.get(f"https://boards-api.greenhouse.io/v1/boards/{TENANT}/jobs/6100").mock(
+            return_value=httpx.Response(404, json={"error": "gone"})
         )
+        respx.get(url).mock(return_value=httpx.Response(200, text="<html></html>"))
+        result = run_system_a(conn, cfg, url, now=NOW, sleep=lambda _s: None, use_tool_cache=False)
 
-    run_row = conn.execute(
-        "SELECT posting_id FROM runs WHERE id = ?", (result.run_id,)
-    ).fetchone()
+    run_row = conn.execute("SELECT posting_id FROM runs WHERE id = ?", (result.run_id,)).fetchone()
     assert run_row["posting_id"] == archive_id
     # ... and the history probes are now eligible, which is the point.
     assert set(result.probes_run) & set(DYNAMIC_PROBES) >= {"repost_history"}

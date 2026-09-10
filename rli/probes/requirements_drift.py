@@ -132,9 +132,9 @@ class _LiveJob(BaseModel):
     url: str | None = None
 
 
-def _fetch_live(row: sqlite3.Row, ctx: ProbeContext) -> tuple[
-    _LiveJob | None, str, bool, str | None, bool
-]:
+def _fetch_live(
+    row: sqlite3.Row, ctx: ProbeContext
+) -> tuple[_LiveJob | None, str, bool, str | None, bool]:
     """Fetch the posting's CURRENT ATS content.
 
     Returns `(job, status, ok, error, retryable)` where `status` is one of
@@ -222,9 +222,7 @@ def _fetch_live(row: sqlite3.Row, ctx: ProbeContext) -> tuple[
     )
 
 
-def _earliest_archive_snapshot(
-    conn: sqlite3.Connection, posting_id: str
-) -> sqlite3.Row | None:
+def _earliest_archive_snapshot(conn: sqlite3.Connection, posting_id: str) -> sqlite3.Row | None:
     return conn.execute(
         """
         SELECT id, captured_at, capture_url, content_hash
@@ -237,9 +235,7 @@ def _earliest_archive_snapshot(
     ).fetchone()
 
 
-def _fetch_archive_body(
-    capture_url: str | None, ctx: ProbeContext
-) -> tuple[str | None, str]:
+def _fetch_archive_body(capture_url: str | None, ctx: ProbeContext) -> tuple[str | None, str]:
     """Fetch an archived capture body. Returns `(body, status)`.
 
     Never raises: a `capture_url` is stored data whose host this probe's
@@ -403,9 +399,7 @@ def requirements_drift(posting_id: str, ctx: ProbeContext) -> ProbeResult:
         claims.append(
             ProbeClaim(
                 claim_type="requirements_changed" if changed else "requirements_unchanged",
-                value=(
-                    json.dumps(known, sort_keys=True) if changed else "no changes detected"
-                ),
+                value=(json.dumps(known, sort_keys=True) if changed else "no changes detected"),
                 source_url=source_url,
                 raw_excerpt=json.dumps(comparisons, sort_keys=True),
                 source_quality=source_quality,

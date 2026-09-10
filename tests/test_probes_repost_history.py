@@ -160,21 +160,15 @@ def test_disappearance_emits_claim_with_per_event_source_quality(
     assert [c.claim_type for c in claims] == ["disappeared_interval"]
     claim = claims[0]
     assert claim.source_quality == "archive"
-    assert claim.value == (
-        f"last_seen_open={_z(_day(20))} first_seen_absent={_z(_day(40))}"
-    )
+    assert claim.value == (f"last_seen_open={_z(_day(20))} first_seen_absent={_z(_day(40))}")
     assert claim.available_at == _day(40)
     assert claim.source_event_at == _day(40)
     assert claim.fetched_at == NOW
     # No per-job url stored -> the documented self-describing placeholder.
-    assert claim.source_url == BOARD_HISTORY_URL_PLACEHOLDER.format(
-        company_id=COMPANY, job_id=JOB
-    )
+    assert claim.source_url == BOARD_HISTORY_URL_PLACEHOLDER.format(company_id=COMPANY, job_id=JOB)
 
 
-def test_own_capture_absence_is_graded_ats_native(
-    conn: sqlite3.Connection, ctx_factory
-) -> None:
+def test_own_capture_absence_is_graded_ats_native(conn: sqlite3.Connection, ctx_factory) -> None:
     _company(conn)
     _posting(conn)
     _capture(conn, _day(0), [JOB], source="archive")
@@ -371,13 +365,9 @@ def test_eligible_is_false_below_threshold_and_true_above(
     assert RepostHistoryProbe.eligible(ctx, args) is True
 
 
-def test_eligible_is_false_for_unknown_posting(
-    conn: sqlite3.Connection, ctx_factory
-) -> None:
+def test_eligible_is_false_for_unknown_posting(conn: sqlite3.Connection, ctx_factory) -> None:
     assert (
-        RepostHistoryProbe.eligible(
-            _ctx(ctx_factory), RepostHistoryArgs(posting_id="nope")
-        )
+        RepostHistoryProbe.eligible(_ctx(ctx_factory), RepostHistoryArgs(posting_id="nope"))
         is False
     )
 
@@ -393,9 +383,7 @@ def test_missing_posting_is_a_structured_non_retryable_failure(
     assert result.data == {"posting_id": "greenhouse:acme:missing", "evidence": []}
 
 
-def test_probe_run_delegates_to_the_pure_function(
-    conn: sqlite3.Connection, ctx_factory
-) -> None:
+def test_probe_run_delegates_to_the_pure_function(conn: sqlite3.Connection, ctx_factory) -> None:
     _company(conn)
     _posting(conn)
     _capture(conn, _day(0), [JOB])

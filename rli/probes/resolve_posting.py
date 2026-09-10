@@ -258,8 +258,8 @@ def resolve_posting(url: str, ctx: ProbeContext) -> ProbeResult:
     ok, retryable, error = True, False, None
 
     if ref.ats == "greenhouse":
-        posting_state, title, canonical_url, ats_claims, ok, retryable, error = (
-            _resolve_greenhouse(ref, ctx, now)
+        posting_state, title, canonical_url, ats_claims, ok, retryable, error = _resolve_greenhouse(
+            ref, ctx, now
         )
         claims.extend(ats_claims)
     elif ref.ats == "ashby":

@@ -118,9 +118,7 @@ def test_happy_path_keeps_only_reason_and_hypotheses_and_does_not_mutate_input(
     )
 
     assert result is not decision
-    assert result.reason == [
-        ReasonItem(text="The posting was still listed.", evidence_ids=["e1"])
-    ]
+    assert result.reason == [ReasonItem(text="The posting was still listed.", evidence_ids=["e1"])]
     assert result.hypotheses == ["Possibly evergreen."]
 
     # spec.md §2 hard invariant: nothing else moved.
@@ -245,9 +243,7 @@ def test_fallback_on_llm_error(conn: sqlite3.Connection, cfg: Config) -> None:
     assert result.hypotheses == []
 
     rows = _run_steps(conn, run.id)
-    assert any(
-        r["decision_type"] == f"{STEP_EXPLANATION_FALLBACK}:llm_error" for r in rows
-    )
+    assert any(r["decision_type"] == f"{STEP_EXPLANATION_FALLBACK}:llm_error" for r in rows)
 
 
 def test_fallback_on_schema_error(conn: sqlite3.Connection, cfg: Config) -> None:
@@ -273,9 +269,7 @@ def test_fallback_on_schema_error(conn: sqlite3.Connection, cfg: Config) -> None
     assert result.hypotheses == []
 
     rows = _run_steps(conn, run.id)
-    assert any(
-        r["decision_type"] == f"{STEP_EXPLANATION_FALLBACK}:schema_error" for r in rows
-    )
+    assert any(r["decision_type"] == f"{STEP_EXPLANATION_FALLBACK}:schema_error" for r in rows)
 
 
 def test_fallback_on_all_citations_invalid_keeps_hypotheses(
@@ -310,14 +304,11 @@ def test_fallback_on_all_citations_invalid_keeps_hypotheses(
 
     rows = _run_steps(conn, run.id)
     assert any(
-        r["decision_type"] == f"{STEP_EXPLANATION_FALLBACK}:all_citations_invalid"
-        for r in rows
+        r["decision_type"] == f"{STEP_EXPLANATION_FALLBACK}:all_citations_invalid" for r in rows
     )
 
 
-def test_fallback_on_no_reasons_keeps_hypotheses(
-    conn: sqlite3.Connection, cfg: Config
-) -> None:
+def test_fallback_on_no_reasons_keeps_hypotheses(conn: sqlite3.Connection, cfg: Config) -> None:
     """A schema-valid reply with an empty `reason` list still keeps its hypotheses."""
     evidence = [_evidence("e1")]
     decision = _decision(evidence)
@@ -342,9 +333,7 @@ def test_fallback_on_no_reasons_keeps_hypotheses(
     assert result.hypotheses == ["Possibly evergreen."]
 
     rows = _run_steps(conn, run.id)
-    assert any(
-        r["decision_type"] == f"{STEP_EXPLANATION_FALLBACK}:no_reasons" for r in rows
-    )
+    assert any(r["decision_type"] == f"{STEP_EXPLANATION_FALLBACK}:no_reasons" for r in rows)
 
 
 # ---------------------------------------------------------------------------
@@ -468,9 +457,7 @@ def test_model_row_records_prompt_hash_and_recoverable_tokens(
     assert parse_tokens(row["decision_type"]) == (321, 64)
 
 
-def test_model_row_has_non_null_error_on_llm_failure(
-    conn: sqlite3.Connection, cfg: Config
-) -> None:
+def test_model_row_has_non_null_error_on_llm_failure(conn: sqlite3.Connection, cfg: Config) -> None:
     evidence = [_evidence("e1")]
     decision = _decision(evidence)
     client = ScriptedClient([LLMError("network blew up")])

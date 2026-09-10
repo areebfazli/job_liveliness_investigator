@@ -594,15 +594,12 @@ def fit_interval_censored(sample: SurvivalSample) -> SurvivalCurve:
     finite_times = [float(t) for t in kmf.timeline if math.isfinite(t)]
     max_support = max(finite_times) if finite_times else 0.0
     min_support = min(finite_times) if finite_times else 0.0
-    survival_at = {
-        h: _predict_interval(kmf, h, max_support, min_support) for h in HORIZON_DAYS
-    }
+    survival_at = {h: _predict_interval(kmf, h, max_support, min_support) for h in HORIZON_DAYS}
 
     notes = [ci_note]
     if n_events == 0:
         notes.append(
-            "no closure events observed; curve reflects right-censored (still-open) "
-            "postings only"
+            "no closure events observed; curve reflects right-censored (still-open) postings only"
         )
 
     return SurvivalCurve(
@@ -931,12 +928,15 @@ def write_behavior_report(path: str | Path, report: BehaviorReport) -> Path:
         ["metric", "value"],
         [
             ["companies in scope", str(coverage.company_count)],
-            ["history_days (min/median/max)", (
-                "n/a"
-                if coverage.company_count == 0
-                else f"{_days(coverage.history_days_min)} / "
-                f"{_days(coverage.history_days_median)} / {_days(coverage.history_days_max)}"
-            )],
+            [
+                "history_days (min/median/max)",
+                (
+                    "n/a"
+                    if coverage.company_count == 0
+                    else f"{_days(coverage.history_days_min)} / "
+                    f"{_days(coverage.history_days_median)} / {_days(coverage.history_days_max)}"
+                ),
+            ],
             ["mean history_coverage", _pct(coverage.mean_history_coverage)],
             ["mean calendar_coverage", _pct(coverage.mean_calendar_coverage)],
             [
@@ -959,8 +959,7 @@ def write_behavior_report(path: str | Path, report: BehaviorReport) -> Path:
                     "n/a"
                     if reposts.median_days_to_repost is None
                     else (
-                        f"{reposts.median_days_to_repost:.1f} "
-                        f"(n={reposts.median_days_to_repost_n})"
+                        f"{reposts.median_days_to_repost:.1f} (n={reposts.median_days_to_repost_n})"
                     )
                 ),
             ],
@@ -1012,7 +1011,7 @@ def write_behavior_report(path: str | Path, report: BehaviorReport) -> Path:
         "arm, the bracket's upper bound) rather than from any fabricated point estimate.",
         "- **The right-censored arm's median is biased UPWARD.** Its event time for a "
         "closed posting is the interval's upper bound (`closure_absent_at`), i.e. "
-        "\"known closed by this point\" — the least-informative end of the bracket. "
+        '"known closed by this point" — the least-informative end of the bracket. '
         "Prefer the interval-censored (Turnbull) curve for any real claim about "
         "typical posting lifetime; the right-censored arm exists because spec.md §5 "
         "separately describes own-snapshot closures as right-censored on their own.",

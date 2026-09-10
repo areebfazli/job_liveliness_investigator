@@ -334,9 +334,7 @@ def _interval_for_job(
     else:
         censoring = "interval"
         closure_absent_at = captures[closure_absent_index].captured_at
-        gap_days = (
-            closure_absent_at - captures[last_index].captured_at
-        ).total_seconds() / 86400.0
+        gap_days = (closure_absent_at - captures[last_index].captured_at).total_seconds() / 86400.0
 
     return PostingInterval(
         company_id=company_id,

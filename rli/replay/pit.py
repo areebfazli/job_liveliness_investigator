@@ -11,7 +11,7 @@ looks like a tool call:
 
 The evidence gate alone does not achieve that. Evidence is only one of the
 two things a system reads; the other is the collection corpus itself, and
-`rli.eval.case` reads it in four decision-affecting places:
+`rli.eval.case` reads it in five decision-affecting places:
 
 * `rli.history.features.posting_features` — `first_seen_absent`,
   `reappeared_at`, `long_lived`, `repost_pattern`. Every one of these is a
@@ -19,7 +19,15 @@ two things a system reads; the other is the collection corpus itself, and
   captures taken after `T`. Replaying 2026-01 against a `postings` row whose
   `first_seen_absent` is 2026-06 hands the policy the future.
 * `rli.history.features.coverage_window` — `history_days`, which gates
-  `long_lived is False` and `repost_pattern`.
+  `repost_pattern`. (It no longer gates `long_lived`: spec.md §5's Amendment
+  2026-09-10 replaced that hedge with `age_days`, which `posting_features`
+  now measures from the earliest of the publish date, the earliest ARCHIVE
+  capture in `posting_snapshots` / `board_snapshot_jobs`, and
+  `first_observed` — all three of which this module already shadows.)
+* `rli.eval.case`'s refresh match — the `content_hash` /`description_hash`
+  series in `posting_snapshots` and `board_snapshot_jobs`. A capture taken
+  after `T` must not be allowed to corroborate a refresh at `T`; both tables
+  are shadowed, so it cannot.
 * `rli.probes.lookups.has_usable_history` and each probe's `eligible()` —
   which decide WHICH probes a system may run, i.e. spec.md §6's
   medium/high-cost probe count. A company that had six days of history at
@@ -261,9 +269,7 @@ def _install_postings(
     """Copy `postings`, blank its lifecycle, and re-derive it from surviving captures."""
     conn.execute("CREATE TEMP TABLE postings AS SELECT * FROM main.postings")
     conn.execute("CREATE INDEX temp.idx_pit_postings_id ON postings (posting_id)")
-    conn.execute(
-        "CREATE INDEX temp.idx_pit_postings_company ON postings (company_id, ats_job_id)"
-    )
+    conn.execute("CREATE INDEX temp.idx_pit_postings_company ON postings (company_id, ats_job_id)")
     conn.execute(
         "UPDATE postings SET " + ", ".join(f"{column} = NULL" for column in _LIFECYCLE_COLUMNS)
     )
@@ -271,10 +277,7 @@ def _install_postings(
     targets = (
         list(company_ids)
         if company_ids is not None
-        else [
-            row[0]
-            for row in conn.execute("SELECT DISTINCT company_id FROM board_snapshots")
-        ]
+        else [row[0] for row in conn.execute("SELECT DISTINCT company_id FROM board_snapshots")]
     )
     for company_id in targets:
         # The live derivation, verbatim, against the filtered captures. It

@@ -526,8 +526,7 @@ def _json_object_from_text(text: str) -> Any:
         except ValueError:
             continue
     raise LLMSchemaError(
-        f"model output is not JSON (first {_ERROR_BODY_CHARS} chars): "
-        f"{text[:_ERROR_BODY_CHARS]!r}"
+        f"model output is not JSON (first {_ERROR_BODY_CHARS} chars): {text[:_ERROR_BODY_CHARS]!r}"
     )
 
 
@@ -832,9 +831,7 @@ class OpenAICompatibleClient:
                         status_code=status,
                     )
                 retry_after = _retry_after_seconds(response.headers.get("Retry-After"))
-                self._sleep(
-                    retry_after if retry_after is not None else self._backoff_s(attempt)
-                )
+                self._sleep(retry_after if retry_after is not None else self._backoff_s(attempt))
                 attempt += 1
                 continue
 
@@ -1041,8 +1038,7 @@ class ScriptedClient:
 
     def __init__(
         self,
-        responses: Sequence[BaseModel | Exception]
-        | Callable[[Prompt, type[BaseModel]], BaseModel],
+        responses: Sequence[BaseModel | Exception] | Callable[[Prompt, type[BaseModel]], BaseModel],
         *,
         model_id: str = "scripted-model",
         input_tokens: int = 100,
@@ -1066,9 +1062,7 @@ class ScriptedClient:
 
         cost = 0.0
         if self.cfg is not None:
-            cost = compute_cost_usd(
-                self.cfg, self.model_id, self.input_tokens, self.output_tokens
-            )
+            cost = compute_cost_usd(self.cfg, self.model_id, self.input_tokens, self.output_tokens)
 
         return LLMResponse(
             parsed=parsed,

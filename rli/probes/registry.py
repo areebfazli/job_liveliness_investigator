@@ -109,9 +109,7 @@ def build_args(probe_cls: type[Probe], case_state: CaseFile, ctx: ProbeContext) 
     if probe_cls is CompanyEventsProbe:
         return CompanyEventsArgs(company_id=case_state.company_id, as_of=ctx.now())
     if probe_cls is TeamSignalProbe:
-        return TeamSignalArgs(
-            posting_id=case_state.posting_id, company_id=case_state.company_id
-        )
+        return TeamSignalArgs(posting_id=case_state.posting_id, company_id=case_state.company_id)
     # Defensive: unreachable for anything in DYNAMIC_PROBES. Raising beats
     # returning a plausible-looking default, which would run a probe with
     # arguments nobody chose.

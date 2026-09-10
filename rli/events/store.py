@@ -266,8 +266,7 @@ def events_for(conn: sqlite3.Connection, company_id: str, as_of: datetime) -> li
     """
     as_of = ensure_aware(as_of, "as_of")
     rows = conn.execute(
-        "SELECT * FROM company_events WHERE company_id = ? AND available_at <= ? "
-        "ORDER BY event_at",
+        "SELECT * FROM company_events WHERE company_id = ? AND available_at <= ? ORDER BY event_at",
         (company_id, to_utc_z(as_of)),
     ).fetchall()
     return [_row_to_event(row) for row in rows]

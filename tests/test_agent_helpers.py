@@ -189,17 +189,26 @@ def seed_reposted_history(conn: sqlite3.Connection, job_id: str, *, now: datetim
     "repeated unchanged" is a positive claim about content that a missing hash
     cannot support. `has_usable_history` is unaffected (it reads the company's
     capture window), so the probes stay eligible while the question stays open.
+
+    `first_observed` is deliberately older than `thresholds.long_lived_days`.
+    The §5 policy branch these probes feed (P4, "repeated unchanged repost +
+    long-lived history") requires `long_lived is True`, and since spec.md §5's
+    Amendment 2026-09-10 that is the plain comparison `age_days >=
+    long_lived_days` — the old "UNKNOWN while our own history is short" hedge
+    is gone (see `rli.history.features`). A 60-day-old posting would now
+    report `long_lived=False`, which makes P4 unreachable, which makes
+    `repost_pattern` irrelevant to the action, which makes `repost_history`
+    and `requirements_drift` INELIGIBLE — and this corpus exists precisely so
+    that they are eligible.
     """
     old_posting_id = add_posting(
         conn,
         job_id=job_id,
-        first_observed=now - timedelta(days=60),
+        first_observed=now - timedelta(days=400),
         last_seen_open=now - timedelta(days=20),
         first_seen_absent=now - timedelta(days=15),
     )
-    new_posting_id = add_posting(
-        conn, job_id=f"{job_id}9", first_observed=now - timedelta(days=14)
-    )
+    new_posting_id = add_posting(conn, job_id=f"{job_id}9", first_observed=now - timedelta(days=14))
     for offset in (60, 45, 30, 10):
         add_capture(
             conn,

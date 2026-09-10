@@ -34,9 +34,7 @@ def test_fetch_capture_success(net_client_factory) -> None:
 def test_fetch_capture_429_then_success(net_client_factory) -> None:
     net = net_client_factory("archive_backfill")
     url = capture_url("20250115120000", "https://example.com/jobs")
-    route = respx.get(url).mock(
-        side_effect=[httpx.Response(429), httpx.Response(200, text="body")]
-    )
+    route = respx.get(url).mock(side_effect=[httpx.Response(429), httpx.Response(200, text="body")])
 
     result = fetch_capture(net, "20250115120000", "https://example.com/jobs")
 

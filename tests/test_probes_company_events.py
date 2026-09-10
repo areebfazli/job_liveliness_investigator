@@ -258,14 +258,12 @@ def test_probe_run_delegates_and_declares_its_spec_metadata(
     _company(conn)
     csv_path = _status_csv(tmp_path, _status(events_found=0))
 
-    result = CompanyEventsProbe().run(
-        _args(collection_status_csv=csv_path), _ctx(ctx_factory)
-    )
+    result = CompanyEventsProbe().run(_args(collection_status_csv=csv_path), _ctx(ctx_factory))
     assert result.ok is True
     assert result.data is not None
     assert result.data["as_of"] == "2026-09-07T00:00:00.000000Z"
     assert CompanyEventsProbe.cost_tier == "medium"
     assert CompanyEventsProbe.history_required is False
     assert CompanyEventsProbe.populates == frozenset(
-        {"material_negative_event", "freeze_or_pause"}
+        {"material_negative_event", "freeze_or_pause", "last_material_event_at"}
     )

@@ -83,9 +83,7 @@ def _make_run_result(run_id: str = "run-stub-0001") -> RunResult:
     )
 
 
-def _recording_run_system_c(
-    calls: list[dict[str, Any]], result: RunResult
-) -> Any:
+def _recording_run_system_c(calls: list[dict[str, Any]], result: RunResult) -> Any:
     """A `run_system_c` stub matching the call shape `cli.run_command` uses.
 
     `run_command` calls it as `run_system_c(conn, cfg, url, llm,
@@ -201,9 +199,7 @@ def _model_step_row(
     }
 
 
-def _run_system_c_seeding_model_steps(
-    run_id: str, steps: list[dict[str, Any]]
-) -> Any:
+def _run_system_c_seeding_model_steps(run_id: str, steps: list[dict[str, Any]]) -> Any:
     """A `run_system_c` stub that seeds `run_steps` rows into the CLI's own conn.
 
     Unlike `_recording_run_system_c`, this writes directly through the
@@ -357,9 +353,7 @@ def test_run_command_success_prints_only_decision_json_on_stdout(
 
     calls: list[dict[str, Any]] = []
     run_result = _make_run_result(run_id="run-cli-success-0001")
-    monkeypatch.setattr(
-        agent_cli, "run_system_c", _recording_run_system_c(calls, run_result)
-    )
+    monkeypatch.setattr(agent_cli, "run_system_c", _recording_run_system_c(calls, run_result))
 
     baseline_model_id = load_config().llm.model_id
     override_model_id = "test-override-model-xyz"
@@ -534,9 +528,7 @@ def test_trace_command_json_emits_only_parseable_json(tmp_path: Path) -> None:
         ],
     )
 
-    result = runner.invoke(
-        app, ["trace", "--run-id", run_id, "--db", str(db_path), "--json"]
-    )
+    result = runner.invoke(app, ["trace", "--run-id", run_id, "--db", str(db_path), "--json"])
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
@@ -554,9 +546,7 @@ def test_trace_command_unknown_run_id_exits_nonzero_without_traceback(
     db_path = tmp_path / "rli.db"
     init_db(db_path)
 
-    result = runner.invoke(
-        app, ["trace", "--run-id", "does-not-exist", "--db", str(db_path)]
-    )
+    result = runner.invoke(app, ["trace", "--run-id", "does-not-exist", "--db", str(db_path)])
 
     assert result.exit_code != 0
     assert "does-not-exist" in result.output
@@ -694,9 +684,7 @@ def test_run_command_no_warning_when_zero_model_rows(
     monkeypatch.setattr(agent_cli, "OpenAICompatibleClient", _StubLLMClient)
 
     run_id = "run-cli-zero-model-rows-0001"
-    monkeypatch.setattr(
-        agent_cli, "run_system_c", _run_system_c_seeding_model_steps(run_id, [])
-    )
+    monkeypatch.setattr(agent_cli, "run_system_c", _run_system_c_seeding_model_steps(run_id, []))
 
     db_path = tmp_path / "rli.db"
     result = runner.invoke(

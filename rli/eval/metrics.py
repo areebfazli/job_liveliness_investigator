@@ -731,17 +731,15 @@ def _case_set_for(
 #: "was it reposted", and a version change supports both "was it reposted"
 #: and "did the requirements move".
 CLAIM_FAMILIES: dict[str, frozenset[str]] = {
-    "posting_state": frozenset(
-        {"posting_state", "board_present", "board_absent", "board_listing"}
-    ),
-    "publish": frozenset({"first_published", "updated_at"}),
+    "posting_state": frozenset({"posting_state", "board_present", "board_absent", "board_listing"}),
+    # `refreshed_at` is `rli.eval.case`'s synthesized claim (an ATS
+    # `updated_at` corroborated by an observed content-hash change); it is a
+    # publish-family claim because it is what spec.md §5's amended `recent`
+    # rule reads alongside `first_published`.
+    "publish": frozenset({"first_published", "updated_at", "refreshed_at"}),
     "expiry": frozenset({"declared_expiry"}),
-    "repost": frozenset(
-        {"disappeared_interval", "reappeared", "version_change", "board_listing"}
-    ),
-    "requirements": frozenset(
-        {"requirements_changed", "requirements_unchanged", "version_change"}
-    ),
+    "repost": frozenset({"disappeared_interval", "reappeared", "version_change", "board_listing"}),
+    "requirements": frozenset({"requirements_changed", "requirements_unchanged", "version_change"}),
     "company_event": frozenset(
         {
             "layoff",
@@ -775,7 +773,10 @@ FAMILY_KEYWORDS: dict[str, tuple[str, ...]] = {
         "open",
         "listed",
     ),
-    "publish": ("published", "posted", "days ago", "first published"),
+    # "updated" / "refreshed" classify `rli.policy.explain_stub`'s refresh
+    # reason ("The posting was updated on ..."), which would otherwise land
+    # in `reasons_unclassified` as a lexicon gap rather than a finding.
+    "publish": ("published", "posted", "days ago", "first published", "updated", "refreshed"),
     "expiry": ("expire", "expiry", "valid through", "closing"),
     "repost": ("repost", "reappear", "relisted", "disappeared", "previously"),
     "requirements": ("requirement", "description chang", "unchanged", "drift"),
@@ -1383,9 +1384,7 @@ class EfficiencyMetrics(BaseModel):
             ]
         )
         if self.decisions_missing:
-            lines.append(
-                f"  NOTE: {self.decisions_missing} run(s) have no parsable final_decision"
-            )
+            lines.append(f"  NOTE: {self.decisions_missing} run(s) have no parsable final_decision")
         lines.append(f"  {self.structural_caveat}")
         return "\n".join(lines)
 

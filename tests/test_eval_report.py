@@ -100,9 +100,7 @@ def test_summarize_runs_over_a_and_b_reports_counts_and_distributions(
     assert summary_a.failed == 1
     assert summary_a.decisions_missing == 1
     assert summary_a.action_distribution.get(result_a.decision.recommended_action, 0) >= 1
-    assert (
-        summary_a.evidence_quality_distribution.get(result_a.decision.evidence_quality, 0) >= 1
-    )
+    assert summary_a.evidence_quality_distribution.get(result_a.decision.evidence_quality, 0) >= 1
     # The bare run's resolve_posting step is a genuine probe execution with
     # an error: it counts as both a probe step and a failure.
     assert summary_a.probe_counts.get("resolve_posting", 0) >= 2  # real run + bare run
@@ -120,8 +118,13 @@ def test_summarize_runs_over_a_and_b_reports_counts_and_distributions(
     # Probe-count-by-tier includes the always-run pair (both 'low') and
     # whatever dynamic probes each system actually ran.
     assert summary_a.probe_counts_by_tier.get("low", 0) >= 1
+    # `[team_signal].enabled` now defaults to `True` (spec.md §5's Amendment
+    # 2026-09-10), and this corpus's 50 days of history clears
+    # `min_history_days`, so System A's full-probe run also executes the
+    # `high`-tier `team_signal` probe alongside the two `medium`-tier probes.
     assert summary_a.medium_high_probe_steps == sum(
-        summary_a.probe_counts.get(name, 0) for name in ("company_events", "requirements_drift")
+        summary_a.probe_counts.get(name, 0)
+        for name in ("company_events", "requirements_drift", "team_signal")
     )
 
 

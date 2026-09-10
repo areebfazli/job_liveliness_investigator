@@ -16,9 +16,7 @@ from rli.snapshots.targets import Target, upsert_companies
 
 GH_URL = "https://boards-api.greenhouse.io/v1/boards/acme/jobs"
 
-TARGET = Target(
-    company_name="Acme", website_domain="acme.com", ats="greenhouse", tenant="acme"
-)
+TARGET = Target(company_name="Acme", website_domain="acme.com", ats="greenhouse", tenant="acme")
 
 DAY1 = datetime(2026, 1, 1, tzinfo=UTC)
 DAY2 = datetime(2026, 1, 2, tzinfo=UTC)
@@ -178,9 +176,9 @@ def test_same_day_rerun_is_idempotent_by_skip(db_conn, cfg) -> None:
         first = run_daily_snapshot(conn, cfg, [TARGET], DAY1, sleep=_no_sleep)
 
     assert first.companies_ok == 1
-    board_count_after_first = conn.execute(
-        "SELECT COUNT(*) AS n FROM board_snapshots"
-    ).fetchone()["n"]
+    board_count_after_first = conn.execute("SELECT COUNT(*) AS n FROM board_snapshots").fetchone()[
+        "n"
+    ]
     postings_count_after_first = conn.execute("SELECT COUNT(*) AS n FROM postings").fetchone()["n"]
     snaps_count_after_first = conn.execute(
         "SELECT COUNT(*) AS n FROM posting_snapshots"

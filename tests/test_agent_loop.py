@@ -131,9 +131,7 @@ def _run_c(
 def _dynamic_probe_runs(steps: list[sqlite3.Row], name: str) -> list[sqlite3.Row]:
     """Every `probe_run` row for one probe — one per EXECUTION, retries included."""
     return [
-        row
-        for row in steps
-        if row["decision_type"] == STEP_PROBE_RUN and row["probe_name"] == name
+        row for row in steps if row["decision_type"] == STEP_PROBE_RUN and row["probe_name"] == name
     ]
 
 
@@ -205,9 +203,9 @@ def test_step_cap_of_zero_stops_before_paying_for_an_investigator_call(
     assert result.probes_run == ()
     steps = run_steps(conn, result.run_id)
     assert _stop_reasons(steps) == [f"{STEP_CONTROLLER_DECISION}:stop:step_cap"]
-    assert [row for row in _model_rows(steps) if row["decision_type"].startswith(
-        STEP_INVESTIGATOR
-    )] == []
+    assert [
+        row for row in _model_rows(steps) if row["decision_type"].startswith(STEP_INVESTIGATOR)
+    ] == []
     assert template_calls(llm, TEMPLATE_INVESTIGATOR) == []
     # The run still explains itself: the cap bounds investigation, not output.
     assert steps_matching(steps, STEP_EXPLANATION)
@@ -247,9 +245,7 @@ def test_cost_cap_stops_the_loop_and_bounds_what_the_loop_spends(
     to the deterministic reasons when it will not fit — leaving an
     `explanation_fallback:cost_cap` row instead of a third billed call.
     """
-    capped = cfg.model_copy(
-        update={"agent": cfg.agent.model_copy(update={"max_cost_usd": 0.05})}
-    )
+    capped = cfg.model_copy(update={"agent": cfg.agent.model_copy(update={"max_cost_usd": 0.05})})
     job_id = "9103"
     posting_id = seed_reposted_history(conn, job_id, now=NOW)
     mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
@@ -289,9 +285,7 @@ def test_cost_cap_stops_the_loop_and_bounds_what_the_loop_spends(
     assert steps_matching(steps, f"{STEP_EXPLANATION_FALLBACK}:cost_cap")
     # Skipped, not merely failed: no explanation model row was ever written.
     assert not [
-        row
-        for row in _model_rows(steps)
-        if str(row["decision_type"]).startswith(STEP_EXPLANATION)
+        row for row in _model_rows(steps) if str(row["decision_type"]).startswith(STEP_EXPLANATION)
     ]
     # The user-facing shape is the ordinary fallback: deterministic reasons,
     # no hypotheses.
@@ -321,9 +315,7 @@ def test_the_loop_refuses_an_investigator_call_it_cannot_afford(
     is what tells the two stops apart: they share a `decision_type`, so
     asserting the reason alone would not distinguish them.
     """
-    capped = cfg.model_copy(
-        update={"agent": cfg.agent.model_copy(update={"max_cost_usd": 0.04})}
-    )
+    capped = cfg.model_copy(update={"agent": cfg.agent.model_copy(update={"max_cost_usd": 0.04})})
     job_id = "9116"
     posting_id = seed_reposted_history(conn, job_id, now=NOW)
     mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
@@ -410,9 +402,7 @@ def test_proposing_the_same_probe_and_arguments_twice_is_rejected_as_duplicate(
     assert len(_dynamic_probe_runs(steps, "repost_history")) == 1
     duplicates = steps_matching(steps, f"{STEP_CANDIDATE_REJECTED}:duplicate")
     assert [row["probe_name"] for row in duplicates] == ["repost_history"]
-    assert _stop_reasons(steps) == [
-        f"{STEP_CONTROLLER_DECISION}:stop:no_eligible_candidate"
-    ]
+    assert _stop_reasons(steps) == [f"{STEP_CONTROLLER_DECISION}:stop:no_eligible_candidate"]
 
 
 @respx.mock
@@ -421,28 +411,31 @@ def test_an_ineligible_probe_is_rejected_even_with_valid_arguments(
 ) -> None:
     """`team_signal` is the cleanest ineligibility: it is off by configuration.
 
-    `[team_signal].enabled = false` (spec.md §4: "no licensed enrichment
-    source" yet), and `TeamSignalProbe.eligible` reads exactly that flag, so
-    the rejection is unconditional — it does not depend on the corpus, on how
-    much history was seeded, or on which policy inputs happen to be open. The
-    history-gated alternative (`repost_history` against a company with no
-    captures) would also work, but it couples the assertion to
-    `[thresholds].min_history_days` and would start passing for the wrong
-    reason if that threshold moved.
+    `[team_signal].enabled` now defaults to `True` (spec.md §5's Amendment
+    2026-09-10 re-sourced the probe from first-party board history), so this
+    test builds an explicitly disabled config instead. With `enabled = false`,
+    `TeamSignalProbe.eligible` reads exactly that flag, so the rejection is
+    unconditional — it does not depend on the corpus, on how much history was
+    seeded, or on which policy inputs happen to be open. The history-gated
+    alternative (`repost_history` against a company with no captures) would
+    also work, but it couples the assertion to `[thresholds].min_history_days`
+    and would start passing for the wrong reason if that threshold moved.
 
     The arguments are deliberately VALID: the controller checks
     `invalid_args` before `ineligible`, so an under-specified proposal would
     be rejected one gate too early and never reach the gate under test.
     """
-    assert cfg.team_signal.enabled is False
+    disabled_cfg = cfg.model_copy(
+        update={"team_signal": cfg.team_signal.model_copy(update={"enabled": False})}
+    )
     job_id = "9106"
     posting_id = seed_reposted_history(conn, job_id, now=NOW)
     mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
     llm = scripted_llm(
-        [propose("team_signal", posting_id=posting_id, company_id=COMPANY)], cfg=cfg
+        [propose("team_signal", posting_id=posting_id, company_id=COMPANY)], cfg=disabled_cfg
     )
 
-    result = _run_c(conn, cfg, job_id, llm)
+    result = _run_c(conn, disabled_cfg, job_id, llm)
 
     steps = run_steps(conn, result.run_id)
     rejected = steps_matching(steps, f"{STEP_CANDIDATE_REJECTED}:ineligible")
@@ -484,12 +477,10 @@ def test_a_closed_posting_stops_before_the_first_model_call(
     assert result.decision.posting_state == "closed"
     assert result.probes_run == ()
     steps = run_steps(conn, result.run_id)
-    assert _stop_reasons(steps) == [
-        f"{STEP_CONTROLLER_DECISION}:stop:no_unresolved_question"
-    ]
-    assert [row for row in _model_rows(steps) if str(row["decision_type"]).startswith(
-        STEP_INVESTIGATOR
-    )] == []
+    assert _stop_reasons(steps) == [f"{STEP_CONTROLLER_DECISION}:stop:no_unresolved_question"]
+    assert [
+        row for row in _model_rows(steps) if str(row["decision_type"]).startswith(STEP_INVESTIGATOR)
+    ] == []
     assert template_calls(llm, TEMPLATE_INVESTIGATOR) == []
 
 
@@ -509,7 +500,7 @@ def test_a_closed_posting_stops_before_the_first_model_call(
 def test_an_investigator_failure_still_yields_the_frozen_policy_decision(
     conn: sqlite3.Connection, cfg: Config, failure: LLMError
 ) -> None:
-    """"The model broke" and "the model answered nonsense" both stop, neither crashes.
+    """ "The model broke" and "the model answered nonsense" both stop, neither crashes.
 
     Both cases are parametrized through one body because
     `rli.agent.controller` gives them one consequence by design — its
@@ -534,9 +525,7 @@ def test_an_investigator_failure_still_yields_the_frozen_policy_decision(
 
     steps = run_steps(conn, result.run_id)
     failed = [
-        row
-        for row in _model_rows(steps)
-        if str(row["decision_type"]).startswith(STEP_INVESTIGATOR)
+        row for row in _model_rows(steps) if str(row["decision_type"]).startswith(STEP_INVESTIGATOR)
     ]
     assert len(failed) == 1
     # No `:tokens=` suffix: there was no usage to report, and `0/0` would read
@@ -546,9 +535,7 @@ def test_an_investigator_failure_still_yields_the_frozen_policy_decision(
     assert type(failure).__name__ in str(failed[0]["error"])
     assert parse_tokens(str(failed[0]["decision_type"])) is None
 
-    assert _stop_reasons(steps) == [
-        f"{STEP_CONTROLLER_DECISION}:stop:investigator_error"
-    ]
+    assert _stop_reasons(steps) == [f"{STEP_CONTROLLER_DECISION}:stop:investigator_error"]
     assert result.probes_run == ()
 
     row = conn.execute("SELECT status FROM runs WHERE id = ?", (result.run_id,)).fetchone()
@@ -628,9 +615,7 @@ def test_a_second_identical_run_is_served_entirely_from_llm_cache(
 
 
 @respx.mock
-def test_a_healthy_run_writes_the_full_ordered_trace(
-    conn: sqlite3.Connection, cfg: Config
-) -> None:
+def test_a_healthy_run_writes_the_full_ordered_trace(conn: sqlite3.Connection, cfg: Config) -> None:
     """`run_steps` is the canonical trace (spec.md §7), so its ORDER is the contract.
 
     A reader auditing "did the LLM choose the action?" walks `step_index` and
@@ -690,8 +675,7 @@ def test_a_healthy_run_writes_the_full_ordered_trace(
     ]
 
     assert [
-        str(row["decision_type"])
-        for row in steps_matching(steps, f"{STEP_CONTROLLER_DECISION}:")
+        str(row["decision_type"]) for row in steps_matching(steps, f"{STEP_CONTROLLER_DECISION}:")
     ] == [
         f"{STEP_CONTROLLER_DECISION}:run:ranked_best",
         f"{STEP_CONTROLLER_DECISION}:stop:investigator_stop",
@@ -750,11 +734,20 @@ def test_c_agrees_with_a_when_it_chooses_the_same_probes(
     divergence in the shared policy path rather than a difference of
     investigation.
 
-    Three dynamic steps fit inside the default `[thresholds].max_dynamic_steps`
-    of 4, so no cap override is needed. Both systems run against the same
-    `conn`: `rli.eval.runner`'s write invariant limits them to `runs`,
-    `run_steps` and `evidence`, all scoped by `run_id`, so neither can
-    contaminate the other's corpus.
+    `[team_signal].enabled` now defaults to `True` (spec.md §5's Amendment
+    2026-09-10), and this corpus's usable history plus the still-open
+    `corroborating_hiring_signal` question make `team_signal` genuinely
+    eligible on this corpus too, so System A's full-probe run now executes
+    four dynamic probes, not three — `repost_history` (`low`), then
+    `company_events` and `requirements_drift` (tied at `medium`, alphabetical
+    tiebreak), then `team_signal` (`high`). The script below matches that
+    exactly so C reaches the same probe set.
+
+    Four dynamic steps still fit inside the default
+    `[thresholds].max_dynamic_steps` of 4, so no cap override is needed. Both
+    systems run against the same `conn`: `rli.eval.runner`'s write invariant
+    limits them to `runs`, `run_steps` and `evidence`, all scoped by `run_id`,
+    so neither can contaminate the other's corpus.
     """
     job_id = "9111"
     posting_id = seed_reposted_history(conn, job_id, now=NOW)
@@ -764,6 +757,7 @@ def test_c_agrees_with_a_when_it_chooses_the_same_probes(
             propose("repost_history", posting_id=posting_id),
             propose("company_events", company_id=COMPANY, as_of=NOW.isoformat()),
             propose("requirements_drift", posting_id=posting_id),
+            propose("team_signal", posting_id=posting_id, company_id=COMPANY),
         ],
         cfg=cfg,
     )
@@ -1043,11 +1037,9 @@ def test_an_unresolved_identity_stops_the_loop_without_a_model_call(
     assert result.probes_run == ()
     steps = run_steps(conn, result.run_id)
     assert steps_matching(steps, f"{STEP_PROBE_SKIPPED}:identity_unresolved")
-    assert _stop_reasons(steps) == [
-        f"{STEP_CONTROLLER_DECISION}:stop:no_eligible_candidate"
-    ]
+    assert _stop_reasons(steps) == [f"{STEP_CONTROLLER_DECISION}:stop:no_eligible_candidate"]
     assert template_calls(llm, TEMPLATE_INVESTIGATOR) == []
-    assert [row for row in _model_rows(steps) if str(row["decision_type"]).startswith(
-        STEP_INVESTIGATOR
-    )] == []
+    assert [
+        row for row in _model_rows(steps) if str(row["decision_type"]).startswith(STEP_INVESTIGATOR)
+    ] == []
     assert Decision.model_validate(result.decision.model_dump()) == result.decision

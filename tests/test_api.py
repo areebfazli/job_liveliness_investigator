@@ -237,9 +237,7 @@ def test_get_run_404_for_nonexistent_run_id_even_with_header(client: TestClient)
 
 
 @respx.mock
-def test_outcomes_valid_insert_via_posting_id(
-    client: TestClient, conn: sqlite3.Connection
-) -> None:
+def test_outcomes_valid_insert_via_posting_id(client: TestClient, conn: sqlite3.Connection) -> None:
     job_id = "7004"
     url = f"https://boards.greenhouse.io/acme/jobs/{job_id}"
     _seed_history(conn, job_id)
@@ -261,9 +259,7 @@ def test_outcomes_valid_insert_via_posting_id(
     assert body["posting_id"] == posting_id
     assert body["outcome"] == "applied"
 
-    row = conn.execute(
-        "SELECT * FROM outcomes WHERE id = ?", (body["id"],)
-    ).fetchone()
+    row = conn.execute("SELECT * FROM outcomes WHERE id = ?", (body["id"],)).fetchone()
     assert row is not None
     assert row["outcome_type"] == "applied"
     assert row["notes"] == "via referral"
@@ -298,9 +294,7 @@ def test_outcomes_missing_both_ids_is_400(client: TestClient) -> None:
 
 
 def test_outcomes_unknown_posting_id_is_400(client: TestClient) -> None:
-    resp = client.post(
-        "/outcomes", json={"posting_id": "no-such-posting", "outcome": "applied"}
-    )
+    resp = client.post("/outcomes", json={"posting_id": "no-such-posting", "outcome": "applied"})
     assert resp.status_code == 400
 
 
@@ -434,9 +428,7 @@ def test_health_reports_the_configured_llm_without_probing_it(
     monkeypatch.setattr(
         app_module,
         "load_config",
-        lambda: cfg.model_copy(
-            update={"llm": cfg.llm.model_copy(update={"base_url": remote})}
-        ),
+        lambda: cfg.model_copy(update={"llm": cfg.llm.model_copy(update={"base_url": remote})}),
     )
     monkeypatch.delenv(cfg.llm.api_key_env, raising=False)
     assert client.get("/health").json()["llm_configured"] is False

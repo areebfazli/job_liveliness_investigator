@@ -147,6 +147,4 @@ def run_steps(conn: sqlite3.Connection, run_id: str) -> list[sqlite3.Row]:
 
 
 def evidence_rows(conn: sqlite3.Connection, run_id: str) -> list[sqlite3.Row]:
-    return conn.execute(
-        "SELECT * FROM evidence WHERE run_id = ? ORDER BY id", (run_id,)
-    ).fetchall()
+    return conn.execute("SELECT * FROM evidence WHERE run_id = ? ORDER BY id", (run_id,)).fetchall()

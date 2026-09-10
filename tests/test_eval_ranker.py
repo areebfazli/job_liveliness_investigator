@@ -166,8 +166,14 @@ def _add_evidence(
     )
 
 
-def _row(*, replay_at: str, label: int, features: dict[str, float], probe: str = "repost_history",
-         posting_id: str = "p") -> TrainingRow:
+def _row(
+    *,
+    replay_at: str,
+    label: int,
+    features: dict[str, float],
+    probe: str = "repost_history",
+    posting_id: str = "p",
+) -> TrainingRow:
     return TrainingRow(
         posting_id=posting_id, replay_at=replay_at, probe=probe, features=features, label=label
     )
@@ -416,18 +422,33 @@ def _build_small_replay_db(conn: sqlite3.Connection) -> dict[str, str]:
     _add_probe_run_step(conn, "a-p1", step_index=2, probe_name="board_snapshot")
     _add_probe_run_step(conn, "a-p1", step_index=3, probe_name="repost_history")
     _add_evidence(
-        conn, "a-p1", evidence_id="e1", posting_id="p1", probe="resolve_posting",
-        claim_type="first_published", source_quality="ats_native",
+        conn,
+        "a-p1",
+        evidence_id="e1",
+        posting_id="p1",
+        probe="resolve_posting",
+        claim_type="first_published",
+        source_quality="ats_native",
     )
     _add_evidence(
-        conn, "a-p1", evidence_id="e2", posting_id="p1", probe="board_snapshot",
-        claim_type="board_present", source_quality="page_structured",
+        conn,
+        "a-p1",
+        evidence_id="e2",
+        posting_id="p1",
+        probe="board_snapshot",
+        claim_type="board_present",
+        source_quality="page_structured",
     )
     # Evidence produced BY repost_history itself must NOT count toward its
     # own row's "before" features.
     _add_evidence(
-        conn, "a-p1", evidence_id="e3", posting_id="p1", probe="repost_history",
-        claim_type="disappeared_interval", source_quality="archive",
+        conn,
+        "a-p1",
+        evidence_id="e3",
+        posting_id="p1",
+        probe="repost_history",
+        claim_type="disappeared_interval",
+        source_quality="archive",
     )
 
     # B runs the same case, does NOT run repost_history, disagrees with A.
@@ -443,12 +464,22 @@ def _build_small_replay_db(conn: sqlite3.Connection) -> dict[str, str]:
     _add_probe_run_step(conn, "a-p2", step_index=3, probe_name="requirements_drift")
     _add_probe_run_step(conn, "a-p2", step_index=4, probe_name="company_events")
     _add_evidence(
-        conn, "a-p2", evidence_id="e1", posting_id="p2", probe="resolve_posting",
-        claim_type="updated_at", source_quality="ats_native",
+        conn,
+        "a-p2",
+        evidence_id="e1",
+        posting_id="p2",
+        probe="resolve_posting",
+        claim_type="updated_at",
+        source_quality="ats_native",
     )
     _add_evidence(
-        conn, "a-p2", evidence_id="e2", posting_id="p2", probe="requirements_drift",
-        claim_type="requirements_changed", source_quality="page_structured",
+        conn,
+        "a-p2",
+        evidence_id="e2",
+        posting_id="p2",
+        probe="requirements_drift",
+        claim_type="requirements_changed",
+        source_quality="page_structured",
     )
 
     conn.commit()

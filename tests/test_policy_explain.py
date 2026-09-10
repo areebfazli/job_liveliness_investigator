@@ -19,6 +19,7 @@ from rli.policy.inputs import (
     CLAIM_DECLARED_EXPIRY,
     CLAIM_FIRST_PUBLISHED,
     CLAIM_POSTING_STATE,
+    CLAIM_REFRESHED_AT,
     CLAIM_TEAM_SIGNAL,
 )
 
@@ -126,9 +127,12 @@ def test_event_reasons_are_only_stated_when_true():
     assert_every_reason_is_cited(stated, evidence)
 
     # "checked, none found" is not a user-facing reason.
-    assert reasons_from_inputs(
-        PolicyInputs(material_negative_event=False, freeze_or_pause=False), evidence, now=NOW
-    ) == []
+    assert (
+        reasons_from_inputs(
+            PolicyInputs(material_negative_event=False, freeze_or_pause=False), evidence, now=NOW
+        )
+        == []
+    )
 
 
 @pytest.mark.parametrize(
@@ -146,14 +150,103 @@ def test_repost_reason(pattern, expected_count):
     [(True, "Recent hiring activity"), (False, "No recent hiring activity")],
 )
 def test_team_signal_reason(signal, fragment):
-    evidence = [
-        ev("e1", CLAIM_TEAM_SIGNAL, probe="team_signal", source_quality="enrichment")
-    ]
+    evidence = [ev("e1", CLAIM_TEAM_SIGNAL, probe="team_signal", source_quality="enrichment")]
     reasons = reasons_from_inputs(
         PolicyInputs(corroborating_hiring_signal=signal), evidence, now=NOW
     )
     assert fragment in reasons[0].text
     assert_every_reason_is_cited(reasons, evidence)
+
+
+# ---------------------------------------------------------------------------
+# P3c: the material-event reason's two wordings (Amendment 2026-09-10)
+# ---------------------------------------------------------------------------
+
+_MATERIAL_EVENT_FRAGMENT = "layoff or shutdown"
+
+
+def test_material_event_reason_cites_both_event_and_refresh_when_unanswered():
+    """The P3c wording cites BOTH halves of the observation — the dated
+    event and the "since" claim — in ONE `ReasonItem` (module docstring:
+    two wordings, one reason, and both evidence ids on it)."""
+    event_at = NOW - timedelta(days=10)
+    refreshed_before_event = NOW - timedelta(days=30)
+    evidence = [
+        ev("e1", "layoff", probe="company_events", source_quality="news"),
+        ev("e2", CLAIM_REFRESHED_AT, source_event_at=refreshed_before_event),
+    ]
+    inputs = PolicyInputs(material_negative_event=True, last_material_event_at=event_at)
+    reasons = reasons_from_inputs(inputs, evidence, now=NOW)
+    assert_every_reason_is_cited(reasons, evidence)
+
+    material_event_reasons = [r for r in reasons if _MATERIAL_EVENT_FRAGMENT in r.text]
+    assert len(material_event_reasons) == 1
+    reason = material_event_reasons[0]
+    assert "has not changed since" in reason.text
+    assert set(reason.evidence_ids) == {"e1", "e2"}
+
+
+def test_material_event_reason_falls_back_to_generic_without_refresh_or_publish_evidence():
+    """No refresh/publish evidence to cite at all: still true that the
+    posting was "not refreshed since", but there is no id for the absence —
+    the generic wording (citing only the event) is emitted instead of an
+    uncited half-sentence (module docstring's third fallback case)."""
+    evidence = [ev("e1", "layoff", probe="company_events", source_quality="news")]
+    inputs = PolicyInputs(
+        material_negative_event=True, last_material_event_at=NOW - timedelta(days=10)
+    )
+    reasons = reasons_from_inputs(inputs, evidence, now=NOW)
+    assert_every_reason_is_cited(reasons, evidence)
+
+    material_event_reasons = [r for r in reasons if _MATERIAL_EVENT_FRAGMENT in r.text]
+    assert len(material_event_reasons) == 1
+    reason = material_event_reasons[0]
+    assert "has not changed since" not in reason.text
+    assert reason.evidence_ids == ["e1"]
+
+
+def test_material_event_reason_uses_generic_wording_when_refreshed_after_the_event():
+    """The posting WAS refreshed after the event: the specific wording would
+    be false, so the generic wording is used — exactly one reason either way."""
+    event_at = NOW - timedelta(days=10)
+    refreshed_after_event = NOW - timedelta(days=2)
+    evidence = [
+        ev("e1", "layoff", probe="company_events", source_quality="news"),
+        ev("e2", CLAIM_REFRESHED_AT, source_event_at=refreshed_after_event),
+    ]
+    inputs = PolicyInputs(material_negative_event=True, last_material_event_at=event_at)
+    reasons = reasons_from_inputs(inputs, evidence, now=NOW)
+    assert_every_reason_is_cited(reasons, evidence)
+
+    material_event_reasons = [r for r in reasons if _MATERIAL_EVENT_FRAGMENT in r.text]
+    assert len(material_event_reasons) == 1
+    reason = material_event_reasons[0]
+    assert "has not changed since" not in reason.text
+    # The refresh claim proved the posting DID move since the event, so it
+    # has nothing to do with the generic sentence — only the event is cited.
+    assert reason.evidence_ids == ["e1"]
+
+
+def test_refresh_reason_cites_the_refresh_claim_and_sits_beside_publication():
+    """A `refreshed_at` claim produces its own reason citing that claim's
+    id, and it appears ALONGSIDE the "first published N days ago" reason
+    (module docstring's anti-misleading guarantee) — in the module
+    docstring's fixed order (state, publication, refresh, expiry, ...)."""
+    evidence = [
+        ev("e1", CLAIM_POSTING_STATE, value="open"),
+        ev("e2", CLAIM_FIRST_PUBLISHED, source_event_at=NOW - timedelta(days=340)),
+        ev("e3", CLAIM_REFRESHED_AT, source_event_at=NOW - timedelta(days=2)),
+    ]
+    inputs = PolicyInputs(posting_state="open", publish_recency="recent")
+    reasons = reasons_from_inputs(inputs, evidence, now=NOW)
+    assert_every_reason_is_cited(reasons, evidence)
+
+    # Fixed order: state (e1), publication (e2), refresh (e3) — adjacently,
+    # so "first published 340 days ago" is never read without the refresh
+    # that explains why the posting still counts as recent.
+    assert [r.evidence_ids for r in reasons] == [["e1"], ["e2"], ["e3"]]
+    assert any("first published 340 days ago" in r.text for r in reasons)
+    assert any("updated on" in r.text for r in reasons)
 
 
 def test_board_absence_is_surfaced_even_when_it_conflicts():

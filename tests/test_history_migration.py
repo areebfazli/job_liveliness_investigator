@@ -35,9 +35,7 @@ def _normalized_ddl(text: str) -> str:
 
 
 def _table_names(conn: sqlite3.Connection) -> set[str]:
-    return {
-        row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
-    }
+    return {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
 
 
 def _build_v1_database(path: Path) -> None:
@@ -85,9 +83,7 @@ def test_fresh_database_is_version_2_with_repost_links(tmp_path: Path) -> None:
         assert SCHEMA_VERSION >= 2
         assert schema_version(conn) == SCHEMA_VERSION
         assert "repost_links" in _table_names(conn)
-        columns = {
-            row["name"] for row in conn.execute("PRAGMA table_info(repost_links)")
-        }
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(repost_links)")}
         assert columns == {
             "id",
             "company_id",
@@ -157,10 +153,7 @@ def test_version_1_database_upgrades_cleanly_to_version_2(tmp_path: Path) -> Non
         assert "repost_links" in _table_names(conn)
         # Pre-existing data survives the upgrade untouched.
         assert conn.execute("SELECT COUNT(*) FROM companies").fetchone()[0] == 1
-        assert (
-            conn.execute("SELECT posting_id FROM postings").fetchone()[0]
-            == "greenhouse:acme:j1"
-        )
+        assert conn.execute("SELECT posting_id FROM postings").fetchone()[0] == "greenhouse:acme:j1"
     finally:
         conn.close()
 

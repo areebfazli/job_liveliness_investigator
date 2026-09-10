@@ -1,16 +1,19 @@
 """The fixed v1 action policy (spec.md §5) and its frozen thresholds.
 
-spec.md §5 states the policy as a six-line table plus an "otherwise":
+spec.md §5, as amended on 2026-09-10 (policy tuning, before freeze), states
+the policy as a seven-line table plus an "otherwise":
 
 ```text
 closed                                             -> skip
-open + recent primary publish evidence
-     + no material negative event                  -> apply_now
-open + mixed/weak evidence                         -> quick_apply
+open + unresolved posting state                    -> wait
 open + explicit freeze/pause or declared expiry
      + unresolved current status                   -> wait
+open + material negative event after last refresh  -> wait      (new)
 repeated unchanged repost + long-lived history
-     + corroborating weak hiring signals           -> skip
+     + corroborating hiring signal = false         -> skip
+open + recent (see table) + strong evidence
+     + no material negative event                  -> apply_now
+open + mixed/weak evidence                         -> quick_apply
 otherwise                                          -> quick_apply
 ```
 
@@ -34,6 +37,10 @@ Read as a chain of `if ... return`, in this order:
   -> `wait`, with a recheck
 * **P3b `declared_expiry_unresolved`** — active AND `declared_expiry` is a
   datetime AND the current status is NOT resolved
+  -> `wait`, with a recheck
+* **P3c `material_event_unrefreshed`** — active AND
+  `material_negative_event is True` AND `last_material_event_at` is a
+  datetime AND the posting has NOT been refreshed since that date
   -> `wait`, with a recheck
 * **P4 `repeated_repost`** — `repost_pattern == "repeated_unchanged"` AND
   `long_lived is True` AND `corroborating_hiring_signal is False`
@@ -80,6 +87,25 @@ Why that order, and what each overlap costs
       explicit that `validThrough` is "publisher-declared expiry ... not
       proof of a ghost job", so it forces a `wait` only when the current
       status is otherwise unresolved (anything but `open` + `strong`).
+* **Why P3c exists, and why it is a `wait`.** It is the amendment's new
+  row: "open + material negative event inside the window + posting not
+  refreshed since that event -> `wait`". Replay on real data showed the
+  original table left `material_negative_event` with almost nothing to do —
+  it appears only as P5's `is not True` conjunct, which merely withholds
+  `apply_now` and drops the case into `quick_apply`, i.e. it still spends
+  the user's effort. A layoff dated AFTER the last time the posting's
+  content moved is the sharpest available observation that the listing may
+  no longer reflect a live requisition, and `wait` is the action that says
+  so without asserting employer intent (spec.md §5).
+* **P3c before P5, for the same reason P3a/P3b are.** P5's
+  `material_negative_event is not True` conjunct is too COARSE to catch
+  this case in the right direction: it treats every material event
+  identically regardless of date, so it cannot distinguish "bad news, then
+  the posting was refreshed" (which P5 should be allowed to reach through
+  `quick_apply`/`apply_now`) from "bad news, and nothing has moved since"
+  (which should wait). P3c makes that distinction explicit and, being a
+  `wait`, is recoverable: the user rechecks, whereas an `apply_now` has
+  already spent the effort P5 exists to allocate.
 * **P3 before P4 (wait beats skip).** A hiring freeze plus an unchanged
   long-lived repost satisfies both. `wait` is the recoverable error: the user
   rechecks and can still skip later, whereas `skip` is terminal and would
@@ -121,6 +147,25 @@ Unknown handling (the sentinel is not a value)
   parametrized over `material_negative_event` will show the effect.
 * `freeze_or_pause` UNKNOWN is NOT a freeze (P3a requires `is True`). A
   freeze is a positive claim; not having looked is not a reason to wait.
+* `last_material_event_at` UNKNOWN or `None` blocks P3c: the branch needs a
+  real date to compare a refresh against. By the invariant documented on
+  `PolicyInputs.last_material_event_at`, that can only happen alongside a
+  `material_negative_event` that is not `True`, so the conjunction is not
+  actually redundant — it is the type-level statement of the invariant.
+* **A MISSING refresh/publish date (`last_refreshed_at` UNKNOWN or `None`)
+  counts as "not refreshed since the event", so P3c FIRES.** Judgment call.
+  The alternative — requiring a known refresh date before the branch can
+  fire — would silently demand evidence a posting may never have had: an
+  ATS with no `updated_at`, or a posting we hold no captures for, would be
+  exempt from the row precisely when we know least about it. And the
+  outcome of firing is `wait`, the recoverable answer (the same argument
+  that puts P3 before P4), not a terminal `skip`.
+* **Event dates are DAY-granular.** `last_material_event_at` is midnight UTC
+  on a calendar date (`rli.events.store`'s convention), so a refresh later
+  the same day is strictly greater and counts as "after the event". That is
+  the intended reading: a same-day refresh after a layoff announcement is
+  exactly the corroboration the branch is looking for, and the alternative
+  (comparing dates) would discard the only ordering information we have.
 * `declared_expiry` UNKNOWN is not an expiry (P3b requires a real datetime),
   and it makes `recheck_after_days` fall back to the default.
 * `corroborating_hiring_signal` UNKNOWN blocks P4, which requires `is False`
@@ -146,6 +191,18 @@ Two details spec.md leaves open:
   never lands *after* the declared expiry. `ceil` would schedule the user to
   look on a day the posting may already be gone. An expiry exactly 3 days
   out gives `3` (the stated example).
+* **P3c does NOT get a special `recheck_after_days`.** The amendment's
+  table says "`recheck_after_days` = default" for the new row; that is read
+  as "the DEFAULT RULE", not as "always `recheck_default_days`". spec.md §1
+  states the rule globally and normatively (`min(cap,
+  days_until_validThrough)` when a declared expiry exists, else
+  `recheck_default_days`), and carving out one branch would give two
+  postings with the same declared expiry two different recheck dates for a
+  reason unrelated to the expiry. In the ordinary P3c case there is no
+  declared expiry and the rule yields `recheck_default_days` anyway, so the
+  two readings agree. Note when they can disagree: P3c is only reachable
+  WITH a declared expiry when the status IS resolved (`open` + `strong`) —
+  otherwise P3b, which sits above it, would already have fired.
 * **A passed expiry gives `0`, not the default.** `min(cap, negative)` is
   negative, and "recheck in -2 days" is not a thing; the value is clamped to
   `0`, read as "recheck now". Falling back to the 14-day default would be
@@ -155,17 +212,36 @@ Two details spec.md leaves open:
   not as "never".
 
 --------------------------------------------------------------------------
-`long_lived`
+The two keyword inputs (`long_lived`, `last_refreshed_at`)
 --------------------------------------------------------------------------
 
-`PolicyInputs` has exactly the seven fields spec.md §5 names, and
-`long_lived` is not one of them — it is a history *feature*
-(`rli.history.features.PostingHistoryFeatures.long_lived`), which is why it
-is threaded through `decide(..., long_lived=...)` as a keyword rather than
-smuggled into the inputs model or folded into `repost_pattern`. Folding it in
-would have made `repost_pattern` mean two different things at once and would
-have corrupted `rli.policy.inputs.could_change_action`, which enumerates that
-field's domain.
+`PolicyInputs` holds the questions a PROBE can answer — that is what makes
+`unpopulated()` mean "unresolved question" (spec.md §4) and what makes
+`rli.policy.inputs.could_change_action` a statement about which probe to run
+next. Two values the policy reads are not of that kind, and both are
+threaded through `decide(...)` as keywords instead:
+
+* **`long_lived`** is a history *feature*
+  (`rli.history.features.PostingHistoryFeatures.long_lived`). Smuggling it
+  into the inputs model, or folding it into `repost_pattern`, would have
+  made `repost_pattern` mean two different things at once and would have
+  corrupted `could_change_action`, which enumerates that field's domain.
+* **`last_refreshed_at`** (added with P3c) is the latest of the posting's
+  best primary publish date and any corroborated ATS refresh —
+  `rli.policy.inputs.last_publish_or_refresh(evidence)`. It is derived from
+  evidence already in hand, and no dynamic probe emits publish or refresh
+  evidence (`first_published` / `updated_at` come only from the always-run
+  `resolve_posting`; `refreshed_at` is synthesized by `rli.eval.case` from
+  captures we already hold). So it is not an unresolved question and cannot
+  move during the agent loop — exactly the `long_lived` precedent.
+
+**Where callers get `last_refreshed_at` from — decided once, here.** Every
+call site recomputes it with `last_publish_or_refresh(evidence)` rather than
+carrying it on `rli.eval.case.CaseState`. It is a linear scan over evidence
+the caller already holds, it cannot go stale between the evidence and the
+decision, and one derivation rule in one function beats a cached field that
+three call sites must remember to refresh. `rli.eval.runner.decide_and_finish`
+and `rli.agent.loop` both reference this paragraph rather than restating it.
 """
 
 from __future__ import annotations
@@ -197,6 +273,7 @@ PolicyBranch = Literal[
     "P2_state_unresolved",
     "P3a_freeze_or_pause",
     "P3b_declared_expiry_unresolved",
+    "P3c_material_event_unrefreshed",
     "P4_repeated_repost",
     "P5_open_recent_strong",
     "P6_active_mixed_or_weak",
@@ -211,6 +288,7 @@ PRECEDENCE: tuple[tuple[PolicyBranch, RecommendedAction], ...] = (
     ("P2_state_unresolved", "wait"),
     ("P3a_freeze_or_pause", "wait"),
     ("P3b_declared_expiry_unresolved", "wait"),
+    ("P3c_material_event_unrefreshed", "wait"),
     ("P4_repeated_repost", "skip"),
     ("P5_open_recent_strong", "apply_now"),
     ("P6_active_mixed_or_weak", "quick_apply"),
@@ -241,6 +319,29 @@ class PolicyThresholds(BaseModel):
     contradiction_days: int = Field(ge=0)
     recheck_default_days: int = Field(ge=1)
     recheck_cap_days: int = Field(ge=1)
+
+    # Two thresholds the policy depends on but does NOT apply itself; both
+    # default so a caller that constructs this model with the five original
+    # numbers keeps working.
+    #
+    # `refresh_match_days` — how close an ATS `updated_at` timestamp must be
+    # to an OBSERVED content-hash change before the two count as the same
+    # event (spec.md §5 Amendment 2026-09-10: "an ATS `updated_at` that
+    # coincides with an observed content-hash change"). It is consumed
+    # UPSTREAM, in `rli.eval.case`, which is what turns the pair into the
+    # `refreshed_at` claim the policy then reads.
+    # `negative_event_window_days` — the lookback applied by
+    # `rli.events.policy_signals.derive_policy_signals` before
+    # `material_negative_event` / `last_material_event_at` are ever set.
+    #
+    # Both are nevertheless part of `fingerprint()`: they CHANGE DECISIONS.
+    # `policy_version()` answers "would this system decide differently?", and
+    # a threshold applied one layer upstream moves the answer just as surely
+    # as one applied inside `_branch`. Where a value is applied is an
+    # implementation detail; whether it changes the action is not.
+    refresh_match_days: int = Field(3, ge=0)
+    negative_event_window_days: int = Field(180, ge=1)
+
     frozen_at: datetime | None = None
 
     @classmethod
@@ -267,6 +368,16 @@ class PolicyThresholds(BaseModel):
                 policy.recheck_cap_days
                 if policy.recheck_cap_days is not None
                 else thresholds.recheck_cap_days
+            ),
+            refresh_match_days=(
+                policy.refresh_match_days
+                if policy.refresh_match_days is not None
+                else thresholds.refresh_match_days
+            ),
+            negative_event_window_days=(
+                policy.negative_event_window_days
+                if policy.negative_event_window_days is not None
+                else thresholds.negative_event_window_days
             ),
             frozen_at=policy.frozen_at,
         )
@@ -302,6 +413,8 @@ class PolicyThresholds(BaseModel):
                 "contradiction_days",
                 "recheck_default_days",
                 "recheck_cap_days",
+                "refresh_match_days",
+                "negative_event_window_days",
             )
         )
 
@@ -328,12 +441,17 @@ def _branch(
     inputs: PolicyInputs,
     quality: EvidenceQuality,
     long_lived: bool | Unknown,
+    last_refreshed_at: datetime | None | Unknown = UNKNOWN,
 ) -> tuple[PolicyBranch, RecommendedAction]:
     """Pure branch selection — the precedence table in the module docstring.
 
     Kept separate from `decide` so `policy_version()` hashes exactly the
     logic that determines the action, and so the table can be tested without
-    a clock.
+    a clock. Deliberately CLOCK-FREE: every comparison here is between two
+    values it was handed, never against `now`. That is why the negative-event
+    lookback window is applied upstream (see
+    `PolicyInputs.last_material_event_at`) and why P3c compares the event
+    date against a refresh date rather than against the present.
     """
     state = inputs.posting_state
     resolved_state = None if isinstance(state, Unknown) else state
@@ -356,6 +474,20 @@ def _branch(
     status_resolved = resolved_state == "open" and quality == "strong"
     if active and has_declared_expiry and not status_resolved:
         return "P3b_declared_expiry_unresolved", "wait"
+
+    # P3c — a material negative event that the posting has not answered.
+    # No refresh date at all counts as "not refreshed since" (module
+    # docstring): `wait` is the recoverable answer, and demanding a date the
+    # posting may never have had would exempt exactly the cases we know
+    # least about.
+    event_at = inputs.last_material_event_at
+    if (
+        active
+        and inputs.material_negative_event is True
+        and isinstance(event_at, datetime)
+        and not (isinstance(last_refreshed_at, datetime) and last_refreshed_at > event_at)
+    ):
+        return "P3c_material_event_unrefreshed", "wait"
 
     # P4 — repeated unchanged repost + long-lived history + weak hiring signal.
     if (
@@ -401,11 +533,13 @@ def decide(
     cfg: Config | PolicyThresholds | None = None,
     *,
     long_lived: bool | Unknown = UNKNOWN,
+    last_refreshed_at: datetime | None | Unknown = UNKNOWN,
 ) -> PolicyOutcome:
     """Apply the frozen v1 action policy (spec.md §5).
 
     Deterministic and side-effect free: the same `(inputs, quality, now,
-    thresholds, long_lived)` always yields the same `PolicyOutcome`, which is
+    thresholds, long_lived, last_refreshed_at)` always yields the same
+    `PolicyOutcome`, which is
     what lets System A, System B and System C share one frozen policy
     (spec.md §6) and what makes replay reproducible.
 
@@ -418,21 +552,25 @@ def decide(
         now: decision clock, timezone-aware; used only for
             `recheck_after_days`.
         cfg: `Config`, `PolicyThresholds`, or `None` for the project config.
-        long_lived: `PostingHistoryFeatures.long_lived` (see module docstring).
+        long_lived: `PostingHistoryFeatures.long_lived` (see module
+            docstring's "two keyword inputs" section).
+        last_refreshed_at: the latest of the posting's best primary publish
+            date and any corroborated ATS refresh —
+            `rli.policy.inputs.last_publish_or_refresh(evidence)`. Same
+            section; `UNKNOWN`/`None` mean "no such date", which P3c reads
+            as "not refreshed since the event".
     """
     from rli.models.time import ensure_aware
 
     if quality not in _EVIDENCE_QUALITIES:
         # An unrecognized quality would silently behave as "not strong" and
         # quietly suppress every apply_now, so it fails loudly instead.
-        raise ValueError(
-            f"evidence_quality must be one of {_EVIDENCE_QUALITIES}, got {quality!r}"
-        )
+        raise ValueError(f"evidence_quality must be one of {_EVIDENCE_QUALITIES}, got {quality!r}")
 
     thresholds = PolicyThresholds.coerce(cfg)
     now = ensure_aware(now, "now")
 
-    branch, action = _branch(inputs, quality, long_lived)
+    branch, action = _branch(inputs, quality, long_lived, last_refreshed_at)
     state = inputs.posting_state
     posting_state: PostingState = "unknown" if isinstance(state, Unknown) else state
 

@@ -168,13 +168,9 @@ def test_stops_when_no_unresolved_question_could_change_the_action(
     assert decision.considered == ()
 
 
-def test_stops_at_the_step_cap(
-    conn: sqlite3.Connection, cfg: Config, ctx: ProbeContext
-) -> None:
+def test_stops_at_the_step_cap(conn: sqlite3.Connection, cfg: Config, ctx: ProbeContext) -> None:
     _seed_history(conn)
-    spent = Budget(
-        max_cost_usd=100.0, max_latency_s=1000.0, max_dynamic_steps=2, dynamic_steps=2
-    )
+    spent = Budget(max_cost_usd=100.0, max_latency_s=1000.0, max_dynamic_steps=2, dynamic_steps=2)
     decision = _decide(
         _output(_candidate("repost_history", posting_id=POSTING_ID)),
         case=_case(),
@@ -258,9 +254,7 @@ def test_stops_at_the_cost_cap_and_names_the_best_candidate(
     assert decision.ranking[0][0] == "repost_history"
 
 
-def test_stops_at_the_latency_cap(
-    conn: sqlite3.Connection, cfg: Config, ctx: ProbeContext
-) -> None:
+def test_stops_at_the_latency_cap(conn: sqlite3.Connection, cfg: Config, ctx: ProbeContext) -> None:
     _seed_history(conn)
     tight = Budget(max_cost_usd=100.0, max_latency_s=0.5, max_dynamic_steps=4)
     decision = _decide(
@@ -379,9 +373,7 @@ def test_the_executed_arguments_are_canonical_not_the_models(
 
     assert decision.decision == "run"
     assert decision.chosen_args_hash == expected
-    assert decision.chosen_args_hash != hash_args(
-        "repost_history", posting_id="greenhouse:evil:1"
-    )
+    assert decision.chosen_args_hash != hash_args("repost_history", posting_id="greenhouse:evil:1")
 
 
 def test_rejects_a_repeat_of_an_already_executed_probe_and_args(
@@ -492,12 +484,15 @@ def test_team_signal_is_ineligible_while_the_licence_flag_is_false(
     conn: sqlite3.Connection, cfg: Config, ctx: ProbeContext
 ) -> None:
     _seed_history(conn)
-    assert cfg.team_signal.enabled is False
+    disabled = cfg.model_copy(
+        update={"team_signal": cfg.team_signal.model_copy(update={"enabled": False})}
+    )
+    disabled_ctx = _with_config(ctx, disabled)
     decision = _decide(
         _output(_candidate("team_signal", posting_id=POSTING_ID, company_id=COMPANY)),
         case=_case(),
-        cfg=cfg,
-        ctx=ctx,
+        cfg=disabled,
+        ctx=disabled_ctx,
         could_change={"corroborating_hiring_signal"},
     )
     assert _reasons(decision)["team_signal"] == "ineligible"
@@ -621,9 +616,7 @@ def test_ranking_ties_break_on_the_probe_name(
     assert decision.chosen_probe == "repost_history"
 
 
-def test_decide_is_deterministic(
-    conn: sqlite3.Connection, cfg: Config, ctx: ProbeContext
-) -> None:
+def test_decide_is_deterministic(conn: sqlite3.Connection, cfg: Config, ctx: ProbeContext) -> None:
     _seed_history(conn)
     output = _output(
         _candidate("requirements_drift", posting_id=POSTING_ID),
@@ -683,9 +676,7 @@ def test_budget_is_an_immutable_single_unit_ledger(cfg: Config) -> None:
 
 
 def test_budget_remaining_steps_never_goes_negative() -> None:
-    budget = Budget(
-        max_cost_usd=1.0, max_latency_s=1.0, max_dynamic_steps=1, dynamic_steps=3
-    )
+    budget = Budget(max_cost_usd=1.0, max_latency_s=1.0, max_dynamic_steps=1, dynamic_steps=3)
     assert budget.remaining_steps() == 0
 
 

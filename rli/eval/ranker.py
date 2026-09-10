@@ -439,9 +439,7 @@ class RankerResult(BaseModel):
                 f"  deterministic: auc={_fmt(self.deterministic_auc)} "
                 f"accuracy={_fmt(self.deterministic_accuracy)}"
             )
-            lines.append(
-                f"  gain: auc={_fmt(self.auc_gain)} accuracy={_fmt(self.accuracy_gain)}"
-            )
+            lines.append(f"  gain: auc={_fmt(self.auc_gain)} accuracy={_fmt(self.accuracy_gain)}")
         lines.append(f"  keep={self.keep}" + (f" — {self.note}" if self.note else ""))
         return "\n".join(lines)
 
@@ -485,9 +483,7 @@ def _features_for(
 
     features: dict[str, float] = {
         "n_evidence": float(len(evidence_rows)),
-        **{
-            f"n_evidence_{quality}": float(count) for quality, count in quality_counts.items()
-        },
+        **{f"n_evidence_{quality}": float(count) for quality, count in quality_counts.items()},
         "has_publish_evidence": 1.0 if claim_types & _PUBLISH_CLAIM_TYPES else 0.0,
         "has_board_present": 1.0 if _CLAIM_BOARD_PRESENT in claim_types else 0.0,
         "has_board_absent": 1.0 if _CLAIM_BOARD_ABSENT in claim_types else 0.0,
@@ -604,8 +600,7 @@ def should_keep(result: RankerResult, config: RankerConfig | None = None) -> boo
     if result.auc_gain is None or result.accuracy_gain is None:
         return False
     return (
-        result.auc_gain >= config.min_auc_gain
-        and result.accuracy_gain >= config.min_accuracy_gain
+        result.auc_gain >= config.min_auc_gain and result.accuracy_gain >= config.min_accuracy_gain
     )
 
 
@@ -633,9 +628,7 @@ def _temporal_split(
     return rows_sorted[: n - holdout_n], rows_sorted[n - holdout_n :]
 
 
-def train_ranker(
-    rows: Sequence[TrainingRow], config: RankerConfig | None = None
-) -> RankerResult:
+def train_ranker(rows: Sequence[TrainingRow], config: RankerConfig | None = None) -> RankerResult:
     """Temporally split `rows`, train a logistic-regression ranker, and score it.
 
     Returns `status="insufficient_data"` (no scikit-learn import at all)

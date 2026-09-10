@@ -33,9 +33,11 @@ from rli.policy.inputs import (
     CLAIM_DECLARED_EXPIRY,
     CLAIM_FIRST_PUBLISHED,
     CLAIM_POSTING_STATE,
+    CLAIM_REFRESHED_AT,
     CLAIM_TEAM_SIGNAL,
     could_change_action,
     derive_policy_inputs,
+    last_publish_or_refresh,
     unpopulated,
 )
 from rli.policy.quality import (
@@ -61,6 +63,7 @@ __all__ = [
     "CLAIM_DECLARED_EXPIRY",
     "CLAIM_FIRST_PUBLISHED",
     "CLAIM_POSTING_STATE",
+    "CLAIM_REFRESHED_AT",
     "CLAIM_TEAM_SIGNAL",
     "PRECEDENCE",
     "SPLITS_COLUMNS",
@@ -78,6 +81,7 @@ __all__ = [
     "evidence_quality",
     "evidence_quality_detail",
     "find_contradictions",
+    "last_publish_or_refresh",
     "policy_version",
     "reasons_from_inputs",
     "temporal_split",
