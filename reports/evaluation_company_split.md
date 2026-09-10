@@ -1,6 +1,6 @@
 # Evaluation report (spec.md §6 / PLAN.md M6)
 
-Dataset: `company-dev-150` (`split_name=dev`, `split_kind=company`) · Splits read: `dev, validation, test` · `allow_test=True` · Policy version: `policy-v1:5ccbe192950455723f079c957b64965a` · Generated: `2026-09-08T00:24:41.133195Z`
+Dataset: `company-150-v2` (`split_name=dev`, `split_kind=company`) · Splits read: `dev, validation, test` · `allow_test=True` · Policy version: `policy-v1:8497bfa5fb715679dcc99f693a393b55` · Generated: `2026-09-10T18:26:50.303590Z`
 
 ## Headline gate (sample sizes)
 
@@ -9,7 +9,7 @@ Dataset: `company-dev-150` (`split_name=dev`, `split_kind=company`) · Splits re
 | postings | 150 | 14879 | >= 300 | NO |
 | companies | 33 | 78 | >= 40 | NO |
 | closure events | n/a (a replay case is a (posting, T) grid point, not a closure) | 7183 | >= 100 | yes (corpus-wide) |
-| replay cases scored | 689 | — | — | — |
+| replay cases scored | 692 | — | — | — |
 
 Headline gate: **NOT MET**.
 
@@ -19,9 +19,9 @@ The two size columns are NOT interchangeable. The collection corpus may clear sp
 
 | system | status | scoped runs |
 | --- | --- | --- |
-| A | reused | 248 |
-| B | reused | 265 |
-| C | skipped: not requested (pass with_c=True / --with-c); not run: no API key | 0 |
+| A | reused | 635 |
+| B | reused | 635 |
+| C | skipped: not requested (pass with_c=True / --with-c); not run: no LLM endpoint configured | 0 |
 
 `reused` means the dataset already carried that system's replay runs and they were scored as-is; `ran` means `rli.replay.run.run_replay` was invoked (offline by construction — the replay net client raises on any live call). No dataset was built and no network call was made by this evaluation.
 
@@ -29,11 +29,11 @@ The two size columns are NOT interchangeable. The collection corpus may clear sp
 
 | item | value |
 | --- | --- |
-| cases collected | 412 |
+| cases collected | 635 |
 | systems | A, B |
 | allowed splits (read-side) | dev, validation, test |
-| runs per system | A=248 B=265 |
-| unassigned (no posting / posting absent from the split map) | 30 |
+| runs per system | A=635 B=635 |
+| unassigned (no posting / posting absent from the split map) | 57 |
 | excluded holdout (split outside the read-side filter) | 0 |
 | duplicate re-runs collapsed to the latest | 0 |
 
@@ -43,24 +43,25 @@ A case is `(input_url, replay_at)`. An unassignable posting is EXCLUDED rather t
 
 | action | A | B |
 | --- | --- | --- |
-| apply_now | 6 | 0 |
-| quick_apply | 231 | 247 |
-| skip | 11 | 18 |
+| apply_now | 13 | 13 |
+| quick_apply | 548 | 548 |
+| skip | 69 | 69 |
+| wait | 5 | 5 |
 
 spec.md §6 requires agreement to be read WITH the action distribution: a default-heavy policy posts high overall agreement trivially.
 
-System C has no action distribution: skipped: not requested (pass with_c=True / --with-c); not run: no API key.
+System C has no action distribution: skipped: not requested (pass with_c=True / --with-c); not run: no LLM endpoint configured.
 
 ## Agreement with System A
 
 | system | paired cases (with A) | overall agreement | macro agreement |
 | --- | --- | --- | --- |
-| A | 248 | 100.0% | 100.0% |
-| B | 101 | 100.0% | 100.0% |
+| A | 635 | 100.0% | 100.0% |
+| B | 635 | 100.0% | 100.0% |
 
 `A` compared against itself is trivially 100% and is shown so that A's own probe, cost and latency figures have a row in every table below.
 
-System C: not run: no API key.
+System C: not run: no LLM endpoint configured.
 
 ### Per-class agreement
 
@@ -68,61 +69,67 @@ System C: not run: no API key.
 
 | A action | n (A count) | A agreement |
 | --- | --- | --- |
-| apply_now | 6 | 100.0% |
-| quick_apply | 231 | 100.0% |
-| skip | 11 | 100.0% |
+| apply_now | 13 | 100.0% |
+| quick_apply | 548 | 100.0% |
+| skip | 69 | 100.0% |
+| wait | 5 | 100.0% |
 
 **B vs A** (classes are System A's actions)
 
 | A action | n (A count) | B agreement |
 | --- | --- | --- |
-| quick_apply | 96 | 100.0% |
-| skip | 5 | 100.0% |
+| apply_now | 13 | 100.0% |
+| quick_apply | 548 | 100.0% |
+| skip | 69 | 100.0% |
+| wait | 5 | 100.0% |
 
 ### Confusion matrices
 
 **A action (row) -> A action (column)**
 
-| A \ A | apply_now | quick_apply | skip |
-| --- | --- | --- | --- |
-| apply_now | 6 | 0 | 0 |
-| quick_apply | 0 | 231 | 0 |
-| skip | 0 | 0 | 11 |
+| A \ A | apply_now | quick_apply | skip | wait |
+| --- | --- | --- | --- | --- |
+| apply_now | 13 | 0 | 0 | 0 |
+| quick_apply | 0 | 548 | 0 | 0 |
+| skip | 0 | 0 | 69 | 0 |
+| wait | 0 | 0 | 0 | 5 |
 
 **A action (row) -> B action (column)**
 
-| A \ B | quick_apply | skip |
-| --- | --- | --- |
-| quick_apply | 96 | 0 |
-| skip | 0 | 5 |
+| A \ B | apply_now | quick_apply | skip | wait |
+| --- | --- | --- | --- | --- |
+| apply_now | 13 | 0 | 0 | 0 |
+| quick_apply | 0 | 548 | 0 | 0 |
+| skip | 0 | 0 | 69 | 0 |
+| wait | 0 | 0 | 0 | 5 |
 
-System C has no confusion matrix: not run: no API key.
+System C has no confusion matrix: not run: no LLM endpoint configured.
 
 ## Cost and latency (probe cost points and model dollars reported SEPARATELY)
 
 | system | runs | probe steps | probe cost POINTS (total) | probe cost POINTS (mean/run) | model steps | model cost USD (total) | model cost USD (mean/run) | tokens in/out | latency ms (total) | latency ms (mean/run) |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| A | 248 | 1074 | 1900.00 | 7.66 | 0 | $0.0000 | $0.0000 | 0/0 | 316 | 1 |
-| B | 265 | 1073 | 1863.00 | 7.03 | 0 | $0.0000 | $0.0000 | 0/0 | 327 | 1 |
+| A | 635 | 3222 | 9321.00 | 14.68 | 0 | $0.0000 | $0.0000 | 0/0 | 1218 | 2 |
+| B | 635 | 2562 | 4420.00 | 6.96 | 0 | $0.0000 | $0.0000 | 0/0 | 783 | 1 |
 
 **These are two different units and are NEVER summed.** `run_steps.cost_usd` holds unitless placeholder cost POINTS on `component='probe'` rows (configured in `[probe_costs]`: low=1, medium=3, high=10) and REAL DOLLARS on `component='model'` rows. `runs.total_cost_usd` adds the two together, which is why it is not quoted anywhere in this report and why no combined 'total cost' column exists. A probe-heavy system and a model-heavy system are not comparable on one axis.
 
 Latency is SUMMED STEP LATENCY, a lower bound on wall-clock time: it excludes controller and scheduling overhead between steps.
 
-System C: not run: no API key — no probe points, dollars or tokens.
+System C: not run: no LLM endpoint configured — no probe points, dollars or tokens.
 
 ## Failure and efficiency metrics
 
 | system | probe steps by tier | medium/high probe steps | repeated calls | invalid arguments | recovered / runs with a failed probe | early-stop regret cases / opportunities | unnecessary probe steps | A's extra probes that changed no action | undecodable decisions |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| A | low=661 medium=413 | 413 (1.67/run) | 0 | 0 | 0/0 (n/a) | 0/0 (n/a) | 495 (85.6%) | 0 | 0 |
-| B | low=678 medium=395 | 395 (1.49/run) | 0 | 0 | 0/0 (n/a) | 0/5 (0.0%) | 526 (96.9%) | 15 | 0 |
+| A | high=439 low=1709 medium=1074 | 1513 (2.38/run) | 0 | 0 | 0/0 (n/a) | 0/0 (n/a) | 1264 (64.8%) | 0 | 0 |
+| B | low=1633 medium=929 | 929 (1.46/run) | 0 | 0 | 0/0 (n/a) | 0/440 (0.0%) | 786 (60.8%) | 660 | 0 |
 
 `repeated calls` and `invalid arguments` are controller-forbidden events: any nonzero value is a real finding, not noise.
 
 `unnecessary probe steps` is the LITERAL reading available in the trace — a dynamic probe execution that produced ZERO evidence rows for its own run. A probe whose evidence WAS recorded but did not move the action is not recoverable from the trace at all, so this number is a lower bound on wasted work, never an upper bound. The last column is the counterpart reading: dynamic probes the fuller reference system spent on cases where both systems ended up recommending the same action.
 
-System C: not run: no API key.
+System C: not run: no LLM endpoint configured.
 
 ## Data quality
 
@@ -130,11 +137,11 @@ Scoped to system(s) `A` over splits `dev, validation, test`. System A runs every
 
 | measure | value |
 | --- | --- |
-| runs checked | 248 |
-| postings checked | 118 |
-| ATS resolution rate | 248/248 (100.0%) |
-| ATS distribution (distinct postings) | ashby=46 greenhouse=27 lever=45 |
-| publish-date coverage | 63/248 (25.4%) |
+| runs checked | 635 |
+| postings checked | 125 |
+| ATS resolution rate | 635/635 (100.0%) |
+| ATS distribution (distinct postings) | ashby=47 greenhouse=30 lever=48 |
+| publish-date coverage | 63/635 (9.9%) |
 | publish evidence by source quality (distinct runs) | ats_native=40 page_structured=46 |
 | repost match precision | 85.7% (parsed 85.7% from data/match_precision.md) |
 
@@ -142,14 +149,14 @@ Scoped to system(s) `A` over splits `dev, validation, test`. System A runs every
 
 | measure | value |
 | --- | --- |
-| reasons total | 324 |
-| runs with reasons | 248/248 |
-| every cited evidence id exists | 324 (100.0%) |
+| reasons total | 829 |
+| runs with reasons | 635/635 |
+| every cited evidence id exists | 829 (100.0%) |
 | reasons citing a missing id | 0 |
 | reasons citing no id at all | 0 |
-| classified / unclassified reason text | 324 / 0 |
-| supported / unsupported (of classified) | 324 / 0 (100.0%) |
-| claim families seen | company_event=2 posting_state=259 publish=63 |
+| classified / unclassified reason text | 774 / 55 |
+| supported / unsupported (of classified) | 774 / 0 (100.0%) |
+| claim families seen | company_event=6 posting_state=704 publish=64 |
 
 An UNCLASSIFIED reason is one whose text matched no claim family: it is reported, never guessed at, and counts as neither supported nor unsupported. A reason citing no evidence id at all does not count as 'all ids exist'.
 
@@ -187,7 +194,7 @@ _corpus-wide (all companies): rli.eval.survival.behavior_report takes no dataset
 
 spec.md §6: System C must use <= 70% of System B's medium/high-cost probes while staying within 2% of B's agreement with System A, overall AND macro-averaged.
 
-Verdict: **NOT RUN** (candidate runs: 0, baseline runs: 265).
+Verdict: **NOT RUN** (candidate runs: 0, baseline runs: 635).
 
 > **System A structural caveat** — printed here, beside the verdict rather than in a footnote, because a probe-count comparison read without it is misleading.
 >
@@ -195,18 +202,18 @@ Verdict: **NOT RUN** (candidate runs: 0, baseline runs: 265).
 
 | leg | candidate (C) | baseline (B) | requirement | pass? |
 | --- | --- | --- | --- | --- |
-| medium/high probes per run | n/a | 1.49 | ratio n/a <= 0.70 | n/a |
+| medium/high probes per run | n/a | 1.46 | ratio n/a <= 0.70 | n/a |
 | overall agreement with A | n/a | 100.0% | >= n/a | n/a |
 | macro agreement with A | n/a | 100.0% | >= n/a | n/a |
 
-The gate is `not_run`, not `fail`: System C produced zero scoped runs (skipped: not requested (pass with_c=True / --with-c); not run: no API key). An ungraded candidate has not failed. All candidate columns above read `not run: no API key`.
+The gate is `not_run`, not `fail`: System C produced zero scoped runs (skipped: not requested (pass with_c=True / --with-c); not run: no LLM endpoint configured). An ungraded candidate has not failed. All candidate columns above read `not run: no LLM endpoint configured`.
 
 Notes:
 
 - STRUCTURAL CAVEAT: System A is not a neutral upper bound. `rli.eval.system_a` calls `eligible_probes(..., unpopulated_inputs=set(ALL_DYNAMIC_INPUTS))`, which makes spec.md §4's unresolved-question gate vacuous for A: A runs every dynamic probe that survives the history and licensing gates, whether or not that probe could change the action. System C is gated by `rli.policy.inputs.could_change_action` and therefore skips probes A always runs. Every probe-count comparison against A (medium/high probe use, cost points, latency, 'unnecessary probes', early-stop regret) is biased in the leaner system's favour BY CONSTRUCTION, not by measurement. This is why spec.md §6's agent gate measures probe use against System B rather than against A. Read agreement-with-A as an accuracy figure, and probe-count-vs-A as an upper bound on achievable savings — never as evidence that A wasted work.
 - the held-out 'test' split is IN SCOPE for this gate. spec.md §6 permits this once, for the final evaluation; any tuning decision made after reading it invalidates the holdout.
-- system C has no runs in scope for dataset 'company-dev-150' on splits ('dev', 'validation', 'test'), so the gate was not evaluated. On the current database this is expected for System C: there is no ANTHROPIC_API_KEY, so C was never run. `passed` is None (unknown), NOT False (failed).
-- System C: skipped: not requested (pass with_c=True / --with-c); not run: no API key
+- system C has no runs in scope for dataset 'company-150-v2' on splits ('dev', 'validation', 'test'), so the gate was not evaluated. On the current database this is expected for System C: no LLM endpoint was configured or reachable, so C was never run. `passed` is None (unknown), NOT False (failed).
+- System C: skipped: not requested (pass with_c=True / --with-c); not run: no LLM endpoint configured
 
 ## Product gate
 
@@ -243,8 +250,8 @@ spec.md §6's C2 is System C with a learned probe ranking substituted for the de
 | measure | value |
 | --- | --- |
 | status | degenerate |
-| rows (candidate probe decisions) | 578 |
-| train / holdout rows | 434 / 144 |
+| rows (candidate probe decisions) | 1952 |
+| train / holdout rows | 1464 / 488 |
 | positive rate (train / holdout) | 0.0% / 0.0% |
 | features | has_board_absent, has_board_present, has_publish_evidence, n_evidence, n_evidence_archive, n_evidence_ats_native, n_evidence_enrichment, n_evidence_news, n_evidence_page_structured, n_probes_before, probe_cost_points, probe_is_company_events, probe_is_repost_history, probe_is_requirements_drift, probe_is_team_signal |
 | learned AUC / accuracy | n/a / n/a |
@@ -260,11 +267,11 @@ Note: train or holdout labels are a single class; AUC is undefined for this spli
 
 - Archive-era cases are weak by construction. For any replay case whose T predates this project's own daily snapshots, the only observation available is a Wayback capture, so `board_snapshot` evidence is sparse, `source_quality='archive'`, and often absent entirely. Those cases are scored, but a decision made on an archive-only corpus is a decision made on much less evidence than a present-day one, and the agreement figures average the two together.
 - `team_signal` is unlicensed and disabled (`[team_signal].enabled = false`; spec.md §4 records that there is no licensed enrichment source). It is the only probe that populates the team-shrink input, so the action policy's P4 branch is UNREACHABLE in every number in this report. No system is penalised or credited for it, and the high-cost tier is effectively empty.
-- Company-event coverage is partial: 11/78 companies in this database carry any `company_events` row at all (the M6 collection reached 15/78 companies at its fullest). `company_events` is a medium-cost probe and a policy input, so for the uncovered majority the material-negative-event and hiring-freeze inputs are the UNKNOWN sentinel rather than a negative finding (spec.md §4: missing history never means flat hiring).
-- Sample sizes vs. spec.md §6 targets — evaluated dataset: 150 postings (target >=300), 33 companies (target >=40), 689 replay cases; collection corpus: 14879 postings, 78 companies, 7183 closure events (target >=100). The corpus may clear the targets while the evaluated replay dataset is a far smaller slice of it; the headline gate is judged on what was ACTUALLY evaluated, and it is NOT MET. The closure-event leg has no dataset-scoped equivalent (a replay dataset's unit is a (posting, T) grid point, not a closure) and is therefore corpus-wide.
+- Company-event coverage: 64/78 companies in this database carry any `company_events` row (all 78 targets were searched; the rest had no dated event in the window). `company_events` is a medium-cost probe and a policy input, so for uncovered companies the material-negative-event and hiring-freeze inputs are the UNKNOWN sentinel rather than a negative finding (spec.md §4: missing history never means flat hiring).
+- Sample sizes vs. spec.md §6 targets — evaluated dataset: 150 postings (target >=300), 33 companies (target >=40), 692 replay cases; collection corpus: 14879 postings, 78 companies, 7183 closure events (target >=100). The corpus may clear the targets while the evaluated replay dataset is a far smaller slice of it; the headline gate is judged on what was ACTUALLY evaluated, and it is NOT MET. The closure-event leg has no dataset-scoped equivalent (a replay dataset's unit is a (posting, T) grid point, not a closure) and is therefore corpus-wide.
 - Probe cost POINTS and model DOLLARS are different units and are never summed. `run_steps.cost_usd` holds placeholder cost points on `component='probe'` rows and real USD on `component='model'` rows; `runs.total_cost_usd` adds them, which is why no single 'total cost' figure appears anywhere in this report.
 - STRUCTURAL CAVEAT: System A is not a neutral upper bound. `rli.eval.system_a` calls `eligible_probes(..., unpopulated_inputs=set(ALL_DYNAMIC_INPUTS))`, which makes spec.md §4's unresolved-question gate vacuous for A: A runs every dynamic probe that survives the history and licensing gates, whether or not that probe could change the action. System C is gated by `rli.policy.inputs.could_change_action` and therefore skips probes A always runs. Every probe-count comparison against A (medium/high probe use, cost points, latency, 'unnecessary probes', early-stop regret) is biased in the leaner system's favour BY CONSTRUCTION, not by measurement. This is why spec.md §6's agent gate measures probe use against System B rather than against A. Read agreement-with-A as an accuracy figure, and probe-count-vs-A as an upper bound on achievable savings — never as evidence that A wasted work.
 - Latency is SUMMED STEP LATENCY (`runs.total_latency_ms`), a lower bound on wall-clock time: it excludes controller and scheduling overhead between steps.
-- System C was not run: no API key — there is no ANTHROPIC_API_KEY in this environment and no `llm`/`llm_factory` was supplied, so no live model call was attempted. The spec.md §6 agent gate is therefore `not_run`, not `fail`: an ungraded candidate has not failed. Every System C figure elsewhere in this report reads `not run: no API key`.
+- System C was not run: no LLM endpoint configured — the endpoint configured in `[llm].base_url` did not answer a liveness probe and no `llm`/`llm_factory` was supplied, so no model call was attempted. The spec.md §6 agent gate is therefore `not_run`, not `fail`: an ungraded candidate has not failed. Every System C figure elsewhere in this report reads `not run: no LLM endpoint configured`.
 - The read-side split filter PERMITTED the `test` holdout (`allow_test=True`), but no scoped case fell in it, so no holdout data was actually read and no `holdout_test_evaluated` marker was written. The evaluated dataset was drawn from a non-holdout split; the holdout remains untouched.
 - The posting-behaviour (survival) section is CORPUS-WIDE, not dataset-scoped: `rli.eval.survival.behavior_report` has no dataset or split argument, so its curves describe every posting the collector has ever seen, including postings outside the evaluated split.

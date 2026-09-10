@@ -280,22 +280,22 @@ steps; no report anywhere quotes one combined "total cost" figure.
 
 ## Agent go/no-go
 
-**Status (2026-09-08): NOT DECIDED.** See `reports/evaluation.md` (temporal dev split, 300 postings / 78 companies / 1,278 replay cases) and `reports/evaluation_company_split.md` (150 postings / 33 companies).
+**Status (2026-09-10): NOT DECIDED.** See `reports/evaluation.md` (temporal dev split, 300 postings / 78 companies / 1,283 replay cases, amended policy) and `reports/evaluation_company_split.md` (150 postings / 33 companies).
 
 | measure | A | B | C |
 |---|---|---|---|
 | runs | 1,185 | 1,185 | not run (no LLM endpoint was reachable) |
-| action distribution | apply_now 17 · quick_apply 1,053 · skip 115 | identical | n/a |
+| action distribution | apply_now 32 · quick_apply 1,024 · skip 118 · wait 14 | identical | n/a |
 | agreement with A (overall / macro) | — | 100% / 100% | n/a |
-| medium/high probes per run | 1.78 | 1.42 | n/a |
-| probe cost points per run | 7.52 | 6.77 | n/a |
+| medium/high probes per run | 2.38 | 1.42 | n/a |
+| probe cost points per run | 13.85 | 6.79 | n/a |
 | leakage violations | 0 | 0 | n/a |
 
-The agent gate (C medium/high probe use ≤ 70% of B and agreement with A within 2 points of B's) cannot be evaluated until System C runs against a live LLM endpoint. Rules (B) currently reproduce A exactly at 90% of A's probe cost, so if C does not beat that, the spec says to remove the agent.
+The agent gate (C medium/high probe use ≤ 70% of B and agreement with A within 2 points of B's) cannot be evaluated until System C runs against a live LLM endpoint. Rules (B) currently reproduce A exactly at about half of A's probe cost (A always runs the high-cost team_signal probe), so if C does not beat that, the spec says to remove the agent.
 
 **Stale pending regeneration: the two probe-use rows above and the 90%-of-A figure predate a case-builder fix.** `rli.eval.case.build_case_state` used to pre-populate `material_negative_event` / `freeze_or_pause` / `last_material_event_at` by reading the `company_events` store directly, with no evidence behind them — which made spec.md §4's populates-the-unpopulated eligibility rule call `company_events` ineligible for any company whose events were already collected, so System C's controller never reached the probe at all (its pre-flight stopped with `no_unresolved_question`) and System B's R1/R3 routing condition, which only asks for the probe while those inputs are Unknown or True, declined to name it. System A was unaffected: it neutralizes the eligibility gate by treating every dynamic input as unpopulated, and B filters through that same neutralized gate. Those three inputs are now derived only from the `company_events` probe's own evidence, so the probe is eligible on every case. The absolute medium/high-cost figures above will go up once `reports/evaluation.md` is regenerated; A-vs-B-vs-C stay comparable because all three now pay for it.
 
-Read the 100% agreement with the action distribution: almost every replay case is archive-era and therefore `weak` evidence, which routes to `quick_apply` by construction. This is not proof that B is as good as A on live-era postings.
+Read the 100% agreement with the action distribution: after the 2026-09-10 policy amendment all four actions occur, but most replay cases are still archive-era and route to `quick_apply`. This is not proof that B is as good as A on live-era postings.
 
 ## Product gate
 
