@@ -77,6 +77,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
@@ -424,23 +425,65 @@ def compute_cost_usd(cfg: Config, model_id: str, input_tokens: int, output_token
 _RETRYABLE_STATUS_FLOOR = 500
 _RETRY_ALWAYS = frozenset({429})
 
-# Backoff between retries: min(_MAX_BACKOFF_S, base * 2**attempt). No jitter,
-# unlike `rli.net` — that client fans out across many hosts from many probes
-# and needs de-correlated retries, whereas this one is a single serialized
-# conversation with one endpoint, where a deterministic (and therefore
-# testable) delay is strictly more useful.
+# Backoff between 5xx retries: min(_MAX_BACKOFF_S, base * 2**attempt). No
+# jitter, unlike `rli.net` — that client fans out across many hosts from many
+# probes and needs de-correlated retries, whereas this one is a single
+# serialized conversation with one endpoint, where a deterministic (and
+# therefore testable) delay is strictly more useful. 429 does NOT use this
+# schedule — see `_RATE_LIMIT_BACKOFF_BASE_S` and `_rate_limit_wait_s` below,
+# and the class docstring for why the two are split.
 _BACKOFF_BASE_S = 0.5
 _MAX_BACKOFF_S = 8.0
 
+# Backoff floor for a 429 with no usable server hint: min(rate_limit_max_wait_s,
+# base * 2**attempt). Deliberately much larger than `_BACKOFF_BASE_S`: a 5xx
+# is a transient server fault where sub-second retries are reasonable, but a
+# 429 against a PER-MINUTE quota cannot possibly clear in under a minute, so
+# retrying on the 5xx schedule is guaranteed to exhaust `max_retries` before
+# the window resets. 15s doubling (15/30/60/...) reaches a full minute within
+# three attempts instead of sixteen.
+_RATE_LIMIT_BACKOFF_BASE_S = 15.0
+
 # A server can ask for an arbitrarily long `Retry-After`. We honour it, but
-# not past this: a 15-minute quota reset must fail the run so the operator
-# sees it, not silently freeze the agent inside one step's budget.
-_MAX_RETRY_AFTER_S = 60.0
+# not past this: a multi-hour quota reset must fail the run so the operator
+# sees it, not silently freeze the agent inside one step's budget. Applies to
+# the header on BOTH 429 and 5xx (same parsing helper); the per-call ceiling
+# for 429 specifically is `[llm].rate_limit_max_wait_s` (see
+# `_rate_limit_wait_s`), which is independently configurable and defaults
+# lower than this.
+_MAX_RETRY_AFTER_S = 120.0
 
 # Bytes of an error response body quoted in an exception message. Enough to
 # carry the provider's error JSON, short enough not to paste a whole HTML
-# error page into a `run_steps.error` column.
-_ERROR_BODY_CHARS = 500
+# error page into a `run_steps.error` column. Raised from 500 to make room
+# for Gemini's quota message, which can run long before the actionable
+# "Quota exceeded for metric: ..." sentence even begins — though that
+# sentence is also extracted and placed FIRST regardless (see
+# `_extract_quota_lines`), so truncation no longer risks losing it.
+_ERROR_BODY_CHARS = 800
+
+# Extracts a Gemini-style `Quota exceeded for metric: ..., limit: ... per
+# ...` fragment out of a longer wrapping sentence (e.g. "You exceeded your
+# current quota, please check your plan and billing details. Quota exceeded
+# for metric: generate_content_free_tier_requests, limit: 15 per minute.").
+# Anchored on the fixed "Quota exceeded for metric:"/"limit:"/"per" shape
+# Gemini actually emits, rather than an open-ended run to the next quote or
+# period — the metric name and unit are free text, but this structure is
+# stable, so matching it precisely (instead of a greedy `.*?`) cannot
+# accidentally swallow unrelated trailing prose in the same JSON string.
+_QUOTA_LINE_RE = re.compile(
+    r"Quota exceeded for metric:\s*[^,]+,\s*limit:\s*\d+(?:\.\d+)?\s*per\s*\w+",
+    re.IGNORECASE,
+)
+
+# A 429 body's own suggested wait, in the two shapes Gemini emits depending
+# on which layer generated the error: a human-readable "retry in 22.5s"
+# sentence, or a structured `"retryDelay": "45s"` field inside
+# `error.details`. Checked only when there is no `Retry-After` HEADER (see
+# `_rate_limit_wait_s`) — the header is the more standard signal when both
+# are present.
+_RETRY_IN_BODY_RE = re.compile(r"retry in (\d+(?:\.\d+)?)s", re.IGNORECASE)
+_RETRY_DELAY_BODY_RE = re.compile(r'retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"', re.IGNORECASE)
 
 # `response_format.json_schema.name` must match this (OpenAI's rule, and the
 # strictest of the compatible servers); anything else is replaced with `_`.
@@ -561,6 +604,104 @@ def _retry_after_seconds(value: str | None) -> float | None:
     return max(0.0, min(_MAX_RETRY_AFTER_S, delta))
 
 
+def _body_retry_hint_seconds(text: str) -> float | None:
+    """A provider-suggested retry delay parsed out of a 429 error BODY.
+
+    Only consulted when there is no usable `Retry-After` header (see
+    `_rate_limit_wait_s`): the header is the standard channel for this, the
+    body is Gemini's fallback for the cases where its gateway does not set
+    one. Unlike the header, this is NOT clamped here — `_rate_limit_wait_s`
+    applies `rate_limit_max_wait_s` uniformly to whatever hint it ends up
+    with, header or body.
+    """
+    for pattern in (_RETRY_IN_BODY_RE, _RETRY_DELAY_BODY_RE):
+        match = pattern.search(text)
+        if match is not None:
+            try:
+                return float(match.group(1))
+            except ValueError:  # pragma: no cover - regex only captures digits
+                continue
+    return None
+
+
+def _extract_quota_lines(text: str) -> str:
+    """Pull `Quota exceeded for metric: ..., limit: ...` fragment(s) out of `text`.
+
+    Called on the FULL, pre-truncation error body: the quota sentence is
+    usually preceded by a generic "you exceeded your quota" preamble, so on a
+    verbose response it can land past `_ERROR_BODY_CHARS` and be silently cut
+    off by the truncation applied everywhere else in this module. Scanning
+    the whole body once, here, and surfacing what it finds up front (see
+    `OpenAICompatibleClient._transport_error_message`) means the one
+    actionable fact — which metric, what limit — survives truncation even
+    though the raw body around it does not.
+
+    Multiple matches (a multi-quota response) are joined so none are lost.
+    Returns `""` when nothing matches, which callers treat as "no quota line
+    to prepend", not as an error.
+    """
+    return "; ".join(_QUOTA_LINE_RE.findall(text))
+
+
+class _MinIntervalThrottle:
+    """Client-side pacing: at most one attempt START per `60 / requests_per_minute`
+    seconds (spec.md §2 concern: a free-tier per-minute quota cannot be
+    survived by retrying after the fact, per `_RATE_LIMIT_BACKOFF_BASE_S`
+    above — this throttle exists to avoid tripping it in the first place).
+
+    Modeled on `rli.net.client.TokenBucket`'s lock discipline: accounting
+    happens under a lock, but the lock is NEVER held across the `sleep`
+    call — holding it would serialize concurrent callers into a queue whose
+    total wait is the SUM of their deficits rather than each simply waiting
+    its own turn against a shared timeline. `monotonic` and `sleep` are
+    injectable for the same reason `TokenBucket`'s are: deterministic tests
+    with no real delay.
+
+    Deliberately simpler than a token bucket: there is no burst allowance,
+    because this throttles ONE client's calls to ONE endpoint in a strictly
+    serialized agent loop (one call in flight at a time), not many
+    concurrent probes fanning out across hosts. "Last start time plus the
+    remainder of the interval" is the whole algorithm.
+
+    `requests_per_minute <= 0` makes `wait()` a true no-op: `_interval_s` is
+    `0.0`, the `<= 0.0` check short-circuits before the lock or a `monotonic`
+    call, and no `sleep` is ever invoked. This matters because the default
+    is 0 (unthrottled) and must cost nothing — not a lock acquisition, not a
+    clock read — for every caller who never opts in.
+    """
+
+    def __init__(
+        self,
+        requests_per_minute: int,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._interval_s = 60.0 / requests_per_minute if requests_per_minute > 0 else 0.0
+        self._monotonic = monotonic
+        self._sleep = sleep
+        self._last_start: float | None = None
+        self._lock = threading.Lock()
+
+    def wait(self) -> None:
+        """Block, if needed, so this call starts no sooner than the interval allows."""
+        if self._interval_s <= 0.0:
+            return
+        while True:
+            with self._lock:
+                now = self._monotonic()
+                deficit = (
+                    0.0 if self._last_start is None else self._interval_s - (now - self._last_start)
+                )
+                if deficit <= 0.0:
+                    self._last_start = now
+                    return
+            # Sleep the deficit, then re-check under the lock: another
+            # thread may have claimed the slot this sleep was aimed at,
+            # exactly the `TokenBucket.acquire` re-check.
+            self._sleep(deficit)
+
+
 class OpenAICompatibleClient:
     """Live structured-output client over `POST {base_url}/chat/completions`.
 
@@ -630,6 +771,31 @@ class OpenAICompatibleClient:
     `choices[0].message.content` is parsed as JSON and validated into the
     caller's Pydantic model, and anything that does not fit raises
     `LLMSchemaError`.
+
+    --------------------------------------------------------------------
+    429 vs 5xx: two different retry schedules
+    --------------------------------------------------------------------
+
+    A 5xx is a transient server fault, so it keeps the original
+    `_backoff_s` schedule (sub-second, doubling, capped at
+    `_MAX_BACKOFF_S`). A 429 is a RATE limit, most often per-MINUTE on a
+    free tier, and no sub-16-second retry schedule can ever outlast one —
+    it just spends `max_retries` faster. So 429 gets its own, much longer
+    schedule (`_rate_limit_wait_s`, floor `_RATE_LIMIT_BACKOFF_BASE_S`
+    doubling, capped at `[llm].rate_limit_max_wait_s`), and `requests_per_minute`
+    (`_MinIntervalThrottle`) exists to make hitting 429 at all the
+    exception rather than the norm.
+
+    JUDGMENT CALL, preserved deliberately: the 429 wait is
+    `max(server_hint, exponential_floor)`, not `server_hint` alone. That
+    means a SMALL server-supplied hint can be overridden UPWARD by the
+    exponential floor (a `Retry-After: 7` on the first attempt becomes 15,
+    since `min(rate_limit_max_wait_s, 15) == 15 > 7`), while a LARGE hint —
+    a real quota-reset delay — is honoured because it exceeds the floor.
+    This is intentional, not a bug to "fix" into always trusting the
+    header: a rate-limited endpoint that undersells its own reset time
+    (or omits `Retry-After` on some responses but not others) should not
+    cause a tighter retry than the schedule would otherwise use.
     """
 
     def __init__(
@@ -642,8 +808,11 @@ class OpenAICompatibleClient:
         max_tokens: int = 4096,
         prices: Mapping[str, ModelPrice] | None = None,
         max_retries: int = 2,
+        requests_per_minute: int = 0,
+        rate_limit_max_wait_s: float = 90.0,
         client: httpx.Client | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model_id = model_id
@@ -652,7 +821,9 @@ class OpenAICompatibleClient:
         self._max_tokens = max_tokens
         self._prices: Mapping[str, ModelPrice] = prices if prices is not None else {}
         self._max_retries = max(0, max_retries)
+        self._rate_limit_max_wait_s = rate_limit_max_wait_s
         self._sleep = sleep
+        self._throttle = _MinIntervalThrottle(requests_per_minute, monotonic=monotonic, sleep=sleep)
         self._owns_client = client is None
         self._client = client if client is not None else httpx.Client(timeout=timeout_s)
         # Latched by the first 400 on a json_schema request. See the class
@@ -667,6 +838,7 @@ class OpenAICompatibleClient:
         model_id: str | None = None,
         client: httpx.Client | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> OpenAICompatibleClient:
         """Build from `[llm]`. `model_id` overrides `[llm].model_id` (CLI `--model`).
 
@@ -683,8 +855,11 @@ class OpenAICompatibleClient:
             max_tokens=cfg.llm.max_tokens,
             prices=cfg.llm.prices,
             max_retries=cfg.llm.max_retries,
+            requests_per_minute=cfg.llm.requests_per_minute,
+            rate_limit_max_wait_s=cfg.llm.rate_limit_max_wait_s,
             client=client,
             sleep=sleep,
+            monotonic=monotonic,
         )
 
     # -- request construction ------------------------------------------------
@@ -772,7 +947,53 @@ class OpenAICompatibleClient:
     # -- transport -----------------------------------------------------------
 
     def _backoff_s(self, attempt: int) -> float:
+        """5xx backoff schedule. See the class docstring for why 429 does not share it."""
         return min(_MAX_BACKOFF_S, _BACKOFF_BASE_S * (2.0**attempt))
+
+    def _rate_limit_wait_s(self, attempt: int, response: httpx.Response) -> float:
+        """429 backoff schedule: `max(server_hint, exponential_floor)`.
+
+        `server_hint` prefers the `Retry-After` HEADER (via
+        `_retry_after_seconds`, clamped to `_MAX_RETRY_AFTER_S`); when that
+        header is absent or unparseable, it falls back to a hint parsed out
+        of the response BODY (`_body_retry_hint_seconds`) — Gemini's gateway
+        does not always set the header. `None` when neither is present or
+        parseable.
+
+        The exponential floor doubles from `_RATE_LIMIT_BACKOFF_BASE_S`,
+        capped by the configured `[llm].rate_limit_max_wait_s`. See the class
+        docstring's JUDGMENT CALL note for why the floor can override a small
+        hint but never a large one.
+        """
+        header_hint = _retry_after_seconds(response.headers.get("Retry-After"))
+        server_hint = (
+            header_hint if header_hint is not None else _body_retry_hint_seconds(response.text)
+        )
+        floor = min(self._rate_limit_max_wait_s, _RATE_LIMIT_BACKOFF_BASE_S * (2.0**attempt))
+        if server_hint is None:
+            return floor
+        return max(server_hint, floor)
+
+    def _transport_error_message(self, status: int, attempt: int, raw_text: str) -> str:
+        """Message for an `LLMTransportError` raised once retries are exhausted.
+
+        `raw_text` is the FULL response body (not yet truncated): scanned
+        for a quota-metric fragment (`_extract_quota_lines`) before the
+        truncation happens, so a long preamble ahead of the actionable
+        sentence cannot push it past `_ERROR_BODY_CHARS` and lose it. When
+        found, the quota line is placed FIRST, ahead of the (still-included,
+        now-truncated) raw body; when not found, the message is exactly the
+        truncated body, unchanged from before this method existed.
+        """
+        prefix = (
+            f"LLM endpoint returned HTTP {status} after {attempt + 1} "
+            f"attempt(s) for model {self.model_id!r}: "
+        )
+        detail = self._scrub(raw_text[:_ERROR_BODY_CHARS])
+        quota = self._scrub(_extract_quota_lines(raw_text))
+        if quota:
+            return f"{prefix}{quota} | body: {detail}"
+        return f"{prefix}{detail}"
 
     def _send(self, body: Mapping[str, Any]) -> Mapping[str, Any]:
         """POST once, retrying only 429/5xx and connection failures.
@@ -781,9 +1002,15 @@ class OpenAICompatibleClient:
         retry loops" — the bound is a configured number, not a duration).
         A non-retryable status raises immediately: retrying a 401 or a 404
         cannot change the answer and only delays the operator's error.
+
+        `self._throttle.wait()` runs before EVERY attempt, including
+        retries of this same logical call: the throttle paces the START of
+        each attempt against `[llm].requests_per_minute`, independent of
+        whatever wait a previous attempt's 429/5xx already served.
         """
         attempt = 0
         while True:
+            self._throttle.wait()
             try:
                 response = self._client.post(self._url, json=body, headers=self._headers())
             except httpx.HTTPError as exc:
@@ -822,12 +1049,23 @@ class OpenAICompatibleClient:
             # names. A 3xx therefore falls through to the non-retryable branch
             # below and surfaces as an error naming the status, which is the
             # right diagnosis for a mistyped `base_url`.
-            detail = self._scrub(response.text[:_ERROR_BODY_CHARS])
-            if status in _RETRY_ALWAYS or status >= _RETRYABLE_STATUS_FLOOR:
+            # 429 and 5xx are both retryable but on DIFFERENT schedules — see
+            # the class docstring for why a per-minute rate limit cannot
+            # share a sub-second server-error backoff.
+            if status in _RETRY_ALWAYS:
                 if attempt >= self._max_retries:
                     raise LLMTransportError(
-                        f"LLM endpoint returned HTTP {status} after {attempt + 1} "
-                        f"attempt(s) for model {self.model_id!r}: {detail}",
+                        self._transport_error_message(status, attempt, response.text),
+                        status_code=status,
+                    )
+                self._sleep(self._rate_limit_wait_s(attempt, response))
+                attempt += 1
+                continue
+
+            if status >= _RETRYABLE_STATUS_FLOOR:
+                if attempt >= self._max_retries:
+                    raise LLMTransportError(
+                        self._transport_error_message(status, attempt, response.text),
                         status_code=status,
                     )
                 retry_after = _retry_after_seconds(response.headers.get("Retry-After"))
@@ -835,6 +1073,7 @@ class OpenAICompatibleClient:
                 attempt += 1
                 continue
 
+            detail = self._scrub(response.text[:_ERROR_BODY_CHARS])
             raise LLMRequestError(
                 f"LLM endpoint returned HTTP {status} for model {self.model_id!r}: {detail}",
                 status_code=status,

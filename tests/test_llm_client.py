@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -113,9 +114,18 @@ def make_client(
     api_key: str = "",
     model_id: str = "test-model",
     max_retries: int = 2,
+    requests_per_minute: int = 0,
+    rate_limit_max_wait_s: float = 90.0,
     sleeps: list[float] | None = None,
+    monotonic: Any = None,
 ) -> OpenAICompatibleClient:
-    """A client pointed at the fake endpoint, whose retries never really sleep."""
+    """A client pointed at the fake endpoint, whose retries never really sleep.
+
+    `requests_per_minute` defaults to 0 (the throttle is a true no-op), so
+    every test that does not care about client-side pacing is unaffected by
+    its existence. `monotonic` defaults to the real clock, which is fine
+    precisely because the default throttle never calls it.
+    """
     return OpenAICompatibleClient(
         BASE_URL,
         api_key,
@@ -124,7 +134,10 @@ def make_client(
         max_tokens=256,
         prices=TEST_PRICES,
         max_retries=max_retries,
+        requests_per_minute=requests_per_minute,
+        rate_limit_max_wait_s=rate_limit_max_wait_s,
         sleep=(sleeps.append if sleeps is not None else (lambda _seconds: None)),
+        monotonic=(monotonic if monotonic is not None else time.monotonic),
     )
 
 
@@ -386,11 +399,20 @@ def test_a_second_400_in_json_object_mode_raises() -> None:
 
 
 @respx.mock
-def test_a_429_is_retried_and_honours_retry_after_seconds() -> None:
+def test_a_429_retry_after_header_wins_when_it_exceeds_the_rate_limit_floor() -> None:
+    """A LARGE `Retry-After` (e.g. a real quota-reset delay) is honoured.
+
+    `_rate_limit_wait_s` is `max(server_hint, exponential_floor)`, and the
+    floor for attempt 0 is `min(rate_limit_max_wait_s=90, 15*2**0) == 15`.
+    50 is chosen specifically because it EXCEEDS that floor (`max(50, 15) ==
+    50`), which is what actually demonstrates "the header is honoured" — a
+    header smaller than 15 would be overridden upward instead (see
+    `test_a_small_429_retry_after_is_overridden_by_the_rate_limit_floor`).
+    """
     sleeps: list[float] = []
     route = respx.post(CHAT_URL).mock(
         side_effect=[
-            httpx.Response(429, headers={"Retry-After": "7"}, text="slow down"),
+            httpx.Response(429, headers={"Retry-After": "50"}, text="slow down"),
             httpx.Response(200, json=chat_body()),
         ]
     )
@@ -399,9 +421,25 @@ def test_a_429_is_retried_and_honours_retry_after_seconds() -> None:
 
     assert response.parsed.verdict == "live"  # type: ignore[attr-defined]
     assert route.call_count == 2
-    # The header wins over the 0.5s exponential backoff that would otherwise
-    # apply to the first retry.
-    assert sleeps == [7.0]
+    assert sleeps == [50.0]
+
+
+@respx.mock
+def test_a_small_429_retry_after_is_overridden_by_the_rate_limit_floor() -> None:
+    """JUDGMENT CALL (see `OpenAICompatibleClient`'s docstring): a server hint
+    SMALLER than the exponential floor is overridden upward, not trusted. A
+    `Retry-After: 7` on the first attempt (floor 15) waits 15, not 7 —
+    `max(7, 15) == 15`.
+    """
+    sleeps: list[float] = []
+    respx.post(CHAT_URL).mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "7"}, text="slow down"),
+            httpx.Response(200, json=chat_body()),
+        ]
+    )
+    make_client(sleeps=sleeps).complete_structured(make_prompt(), Answer)
+    assert sleeps == [15.0]
 
 
 @respx.mock
@@ -434,12 +472,22 @@ def test_an_absurd_retry_after_is_clamped() -> None:
         ]
     )
     make_client(sleeps=sleeps).complete_structured(make_prompt(), Answer)
-    # A quota that resets tomorrow must fail the run, not freeze the agent.
-    assert sleeps == [60.0]
+    # A quota that resets tomorrow must fail the run, not freeze the agent:
+    # the header clamps at `_MAX_RETRY_AFTER_S` (120), and that clamped value
+    # still wins over the attempt-0 rate-limit floor of 15 (`max(120, 15) ==
+    # 120`).
+    assert sleeps == [120.0]
 
 
 @respx.mock
-def test_a_malformed_retry_after_falls_back_to_exponential_backoff() -> None:
+def test_a_malformed_429_retry_after_falls_back_to_the_rate_limit_floor() -> None:
+    """An unparseable header AND no body hint means no `server_hint` at all,
+    so the wait is exactly the exponential floor for attempt 0:
+    `min(rate_limit_max_wait_s=90, 15*2**0) == 15`. This used to fall back to
+    the 5xx schedule's `0.5s`; 429 has its own, much longer schedule now
+    (see the class docstring) precisely because 0.5s is hopeless against a
+    per-minute quota.
+    """
     sleeps: list[float] = []
     respx.post(CHAT_URL).mock(
         side_effect=[
@@ -448,7 +496,159 @@ def test_a_malformed_retry_after_falls_back_to_exponential_backoff() -> None:
         ]
     )
     make_client(sleeps=sleeps).complete_structured(make_prompt(), Answer)
-    assert sleeps == [0.5]
+    assert sleeps == [15.0]
+
+
+@respx.mock
+def test_a_429_body_retry_hint_is_used_when_it_exceeds_the_floor() -> None:
+    """No header at all, but the BODY names a delay (Gemini's "retry in Ns"
+    sentence). 22.5 exceeds the attempt-0 floor of 15, so it is the binding
+    term: `max(22.5, 15) == 22.5`.
+    """
+    sleeps: list[float] = []
+    respx.post(CHAT_URL).mock(
+        side_effect=[
+            httpx.Response(429, text="please retry in 22.5s and try again"),
+            httpx.Response(200, json=chat_body()),
+        ]
+    )
+    make_client(sleeps=sleeps).complete_structured(make_prompt(), Answer)
+    assert sleeps == [22.5]
+
+
+@respx.mock
+def test_a_429_retrydelay_body_field_is_parsed_like_the_retry_in_form() -> None:
+    """Gemini's OTHER body shape: a structured `"retryDelay": "45s"` field
+    inside `error.details`, rather than the human-readable sentence. 45
+    exceeds the attempt-0 floor of 15, so `max(45, 15) == 45`.
+    """
+    sleeps: list[float] = []
+    body = json.dumps(
+        {
+            "error": {
+                "code": 429,
+                "message": "Resource exhausted",
+                "details": [
+                    {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "45s"}
+                ],
+            }
+        }
+    )
+    respx.post(CHAT_URL).mock(
+        side_effect=[
+            httpx.Response(429, text=body),
+            httpx.Response(200, json=chat_body()),
+        ]
+    )
+    make_client(sleeps=sleeps).complete_structured(make_prompt(), Answer)
+    assert sleeps == [45.0]
+
+
+@respx.mock
+def test_429_backoff_doubles_and_is_capped_by_rate_limit_max_wait_s() -> None:
+    """No header, no body hint, four consecutive 429s: the floor doubles
+    15/30/60/... and is capped at `rate_limit_max_wait_s` (90 by default),
+    so the 4th wait (`15*2**3 == 120`) is clamped down to 90.
+    """
+    sleeps: list[float] = []
+    respx.post(CHAT_URL).mock(
+        side_effect=[
+            httpx.Response(429),
+            httpx.Response(429),
+            httpx.Response(429),
+            httpx.Response(429),
+            httpx.Response(200, json=chat_body()),
+        ]
+    )
+    make_client(max_retries=4, sleeps=sleeps).complete_structured(make_prompt(), Answer)
+    assert sleeps == [15.0, 30.0, 60.0, 90.0]
+
+
+@respx.mock
+def test_requests_per_minute_zero_never_sleeps_for_pacing() -> None:
+    """`requests_per_minute=0` (the default) is a true no-op: with every
+    response a plain 200, there is no retry sleep either, so ANY sleep call
+    at all would have to be the throttle's — and there must be none.
+    """
+    sleeps: list[float] = []
+    respx.post(CHAT_URL).mock(return_value=httpx.Response(200, json=chat_body()))
+    client = make_client(requests_per_minute=0, sleeps=sleeps)
+
+    client.complete_structured(make_prompt(), Answer)
+    client.complete_structured(make_prompt(), Answer)
+
+    assert sleeps == []
+
+
+@respx.mock
+def test_requests_per_minute_spaces_out_successive_attempt_starts() -> None:
+    """`requests_per_minute=30` means a minimum spacing of `60/30 == 2.0`
+    seconds between the START of successive attempts. A fake `monotonic`
+    that does not itself advance except via the injected `sleep` (which
+    mirrors the real relationship between sleeping and the clock moving
+    forward) makes the wait exactly computable: the first call claims t=0
+    with no wait, the second call is still at t=0 when it asks, so it must
+    wait the full 2.0s.
+    """
+    clock = {"t": 0.0}
+
+    def fake_monotonic() -> float:
+        return clock["t"]
+
+    sleeps: list[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock["t"] += seconds
+
+    respx.post(CHAT_URL).mock(return_value=httpx.Response(200, json=chat_body()))
+    # Built directly (not via `make_client`) so BOTH the throttle and any
+    # retry backoff share one fake clock/sleep pair — `make_client`'s
+    # `sleeps` kwarg wires a plain `list.append` that does not advance time.
+    client = OpenAICompatibleClient(
+        BASE_URL,
+        "",
+        "test-model",
+        timeout_s=1.0,
+        max_tokens=256,
+        prices=TEST_PRICES,
+        max_retries=2,
+        requests_per_minute=30,
+        sleep=fake_sleep,
+        monotonic=fake_monotonic,
+    )
+
+    client.complete_structured(make_prompt(), Answer)
+    assert sleeps == []  # first call: nothing to wait for yet
+
+    client.complete_structured(make_prompt(), Answer)
+    assert sleeps == [2.0]
+
+
+@respx.mock
+def test_exhausted_429_error_message_leads_with_the_quota_line() -> None:
+    """When the exhausted body contains Gemini's quota-metric sentence, that
+    sentence appears in the exception message AHEAD of the (truncated) raw
+    body, so it is legible even if the raw body gets cut off.
+    """
+    quota_body = (
+        '{"error": {"code": 429, "message": "You exceeded your current quota, please check '
+        "your plan and billing details. Quota exceeded for metric: "
+        'generate_content_free_tier_requests, limit: 15 per minute."}}'
+    )
+    respx.post(CHAT_URL).mock(return_value=httpx.Response(429, text=quota_body))
+
+    with pytest.raises(LLMTransportError) as excinfo:
+        make_client(max_retries=0).complete_structured(make_prompt(), Answer)
+
+    message = str(excinfo.value)
+    quota_line = (
+        "Quota exceeded for metric: generate_content_free_tier_requests, limit: 15 per minute"
+    )
+    assert quota_line in message
+    # The quota line comes before the raw (truncated) body, not somewhere
+    # buried inside it.
+    assert message.index(quota_line) < message.index("body:")
 
 
 @respx.mock

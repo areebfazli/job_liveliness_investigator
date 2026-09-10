@@ -488,6 +488,16 @@ class Llm(BaseModel):
     ONE call, i.e. transport-level retries. It is unrelated to
     `[agent].max_probe_retries`, which is the agent loop's retry of a failed
     PROBE.
+
+    `requests_per_minute` and `rate_limit_max_wait_s` exist because
+    `max_retries` alone cannot survive a PER-MINUTE quota: the old retry
+    schedule burned all its retries within ~16s, which is nothing against a
+    60s window. `requests_per_minute` (0 = unlimited) throttles the CLIENT
+    side pre-emptively, so a free-tier quota is rarely hit at all;
+    `rate_limit_max_wait_s` bounds how long a single 429 retry may wait when
+    it is hit anyway, so a genuine multi-minute quota reset still fails the
+    run instead of freezing it. See `OpenAICompatibleClient` for how the two
+    interact with `Retry-After`.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -508,6 +518,21 @@ class Llm(BaseModel):
     max_tokens: int = Field(4096, gt=0)
     timeout_s: float = Field(60.0, gt=0.0)
     max_retries: int = Field(2, ge=0)
+
+    # Minimum spacing the CLIENT imposes on its own outgoing requests: 0
+    # (default) means unthrottled. A positive value spaces the START of
+    # every attempt (including retries) at least `60 / requests_per_minute`
+    # seconds apart, so a client pointed at a provider with a known
+    # per-minute cap can mostly avoid hitting 429 in the first place rather
+    # than reacting to it after the fact.
+    requests_per_minute: int = Field(0, ge=0)
+
+    # Ceiling on how long a single 429 retry may wait, no matter what a
+    # `Retry-After` header or the response body suggests. Distinct from
+    # `_MAX_BACKOFF_S` (the 5xx schedule's cap): a rate-limit wait is
+    # legitimately much longer than a server-error backoff, but it still
+    # must not exceed a step's budget by parking the agent indefinitely.
+    rate_limit_max_wait_s: float = Field(90.0, gt=0.0)
 
     # Cost accounting only — never sent to the API (see `ModelPrice`).
     prices: dict[str, ModelPrice] = Field(

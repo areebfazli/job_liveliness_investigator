@@ -396,6 +396,22 @@ timeout_s = 600.0
 # unrelated to [agent].max_probe_retries, which retries a failed PROBE.
 max_retries = 2
 
+# Client-side throttle: minimum spacing (in requests/minute) the client
+# imposes on its OWN outgoing calls, independent of and in addition to
+# max_retries. Gemini's free tier for gemini-3.5-flash-lite is ~15 RPM;
+# staying under it here means most calls never see a 429 at all, rather than
+# retrying into one. Set to 0 to disable (unthrottled). This costs nothing on
+# replay: CachedClient serves a hit for every previously-answered case
+# without going anywhere near the network, so a conservative cap here only
+# ever slows down cache MISSES (a changed prompt, a new case), never a replay
+# of an already-cached run.
+requests_per_minute = 10
+
+# Ceiling on how long one 429 retry may wait (seconds), overriding both the
+# `Retry-After` header and the 429 backoff schedule when both would go
+# higher. See rli.llm.client.OpenAICompatibleClient for the exact formula.
+rate_limit_max_wait_s = 90.0
+
 # Price table used ONLY for cost accounting — these numbers are never sent to
 # the API and never enter a prompt or cache key, so editing them re-prices
 # future runs without invalidating any cached model output. Rates are list
