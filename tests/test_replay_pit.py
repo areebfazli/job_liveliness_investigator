@@ -14,10 +14,11 @@ import sqlite3
 from datetime import timedelta
 
 import pytest
-from test_eval_helpers import COMPANY, add_capture, add_posting, job
+from test_eval_helpers import COMPANY, add_capture, add_company, add_posting, job
 from test_replay_helpers import CLOSED_JOB, NOW, OPEN_JOB, TENANT, seed_corpus
 
 from rli.config import Config
+from rli.db import connect
 from rli.history.features import coverage_window, posting_features
 from rli.models.policy_inputs import UNKNOWN
 from rli.models.time import to_utc_z
@@ -31,6 +32,11 @@ from rli.replay.pit import (
 
 OPEN_POSTING = f"greenhouse:{TENANT}:{OPEN_JOB}"
 CLOSED_POSTING = f"greenhouse:{TENANT}:{CLOSED_JOB}"
+
+
+def _db_path(conn: sqlite3.Connection) -> str:
+    """The file `conn` is open on, so a test can open a SECOND connection to it."""
+    return next(row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main")
 
 
 def _replacement(conn: sqlite3.Connection, posting_id: str) -> str | None:
@@ -161,6 +167,80 @@ def test_the_context_never_mutates_the_real_corpus(conn: sqlite3.Connection) -> 
         )
     }
     assert before == after
+
+
+def test_no_read_snapshot_is_held_across_the_yield(conn: sqlite3.Connection) -> None:
+    """Installing the context writes; that transaction must not reach the block.
+
+    See the module docstring's "The connection must never hold a read
+    snapshot across the `yield`" — an open transaction here is what makes the
+    block's first write an upgrade, and an upgrade is what SQLite can refuse.
+    """
+    seed_corpus(conn)
+    with point_in_time(conn, NOW - timedelta(days=40), company_ids=[COMPANY]) as pit_conn:
+        assert pit_conn is conn
+        assert not conn.in_transaction
+        # ...and the shadows survived the commit that released it: temp
+        # objects belong to the connection, not to the transaction.
+        assert installed_shadows(conn) == list(PIT_SHADOWED_TABLES)
+        assert conn.execute("SELECT COUNT(*) FROM board_snapshots").fetchone()[0] == 4
+    assert not conn.in_transaction
+
+
+def test_a_concurrent_commit_does_not_wedge_the_block(conn: sqlite3.Connection) -> None:
+    """Another connection committing to `main` must not fail this block's writes.
+
+    With a read snapshot held across the yield, SQLite refuses the
+    read->write upgrade outright (`SQLITE_BUSY_SNAPSHOT`, which
+    `busy_timeout` does not retry), and nothing resets it — so one concurrent
+    commit used to fail this case AND every later case at the same `T`.
+    """
+    seed_corpus(conn)
+    with point_in_time(conn, NOW - timedelta(days=40), company_ids=[COMPANY]):
+        other = connect(_db_path(conn))
+        try:
+            add_company(other, "concurrent-writer.example")
+        finally:
+            other.close()
+
+        # `companies` is not shadowed, so these are ordinary `main` writes —
+        # the same upgrade a replayed run's `INSERT INTO runs` performs, for
+        # this case and then for the next one at the same `T`.
+        add_company(conn, "written-inside-the-block.example")
+        add_company(conn, "the-next-case-at-this-t.example")
+
+    stored = {row[0] for row in conn.execute("SELECT company_id FROM main.companies")}
+    assert {
+        "concurrent-writer.example",
+        "written-inside-the-block.example",
+        "the-next-case-at-this-t.example",
+    } <= stored
+
+
+def test_a_failing_block_leaves_no_transaction_and_no_partial_write(
+    conn: sqlite3.Connection,
+) -> None:
+    """The exception path rolls back, so the next `T` starts on a clean connection."""
+    seed_corpus(conn)
+    with pytest.raises(RuntimeError, match="boom"), point_in_time(conn, NOW):
+        conn.execute(
+            "INSERT INTO companies (company_id, name, website_domain, created_at) "
+            "VALUES ('half-written.example', 'half', 'half-written.example', ?)",
+            (to_utc_z(NOW),),
+        )
+        assert conn.in_transaction
+        raise RuntimeError("boom")
+
+    assert not conn.in_transaction
+    # The interrupted write was rolled back, not committed by the teardown.
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM companies WHERE company_id = 'half-written.example'"
+        ).fetchone()[0]
+        == 0
+    )
+    with point_in_time(conn, NOW):
+        assert installed_shadows(conn) == list(PIT_SHADOWED_TABLES)
 
 
 def test_the_shadows_are_removed_even_when_the_block_raises(

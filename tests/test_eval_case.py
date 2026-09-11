@@ -11,13 +11,15 @@ routing/policy layers those two systems add on top.
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
 import respx
+from pydantic import BaseModel
 from test_eval_helpers import COMPANY, add_capture, add_posting, evidence_rows, job
 
 from rli.config import Config
@@ -36,18 +38,23 @@ from rli.events.store import (
     upsert_event,
     write_collection_status_csv,
 )
+from rli.models.evidence import EvidenceItem
 from rli.models.policy_inputs import UNKNOWN
+from rli.models.probe import ProbeResult
 from rli.models.time import to_utc_z
 from rli.policy.action import decide
 from rli.policy.inputs import (
     CLAIM_BOARD_ABSENT,
     CLAIM_POSTING_STATE,
     CLAIM_REFRESHED_AT,
+    CLAIM_TEAM_SIGNAL,
     could_change_action,
     last_publish_or_refresh,
 )
 from rli.policy.quality import evidence_quality_detail
+from rli.probes.base import Probe, ProbeClaim
 from rli.probes.company_events import CompanyEventsProbe
+from rli.probes.team_signal import TeamSignalArgs, TeamSignalProbe
 
 NOW = datetime(2026, 9, 7, tzinfo=UTC)
 REFRESH_MATCH_DAYS = 3  # cfg.thresholds.refresh_match_days default (config.toml)
@@ -852,3 +859,178 @@ def test_material_event_after_last_refresh_forces_wait_on_p3c(
     )
     assert outcome_after.recommended_action == "wait"
     assert outcome_after.branch == "P3c_material_event_unrefreshed"
+
+
+# ---------------------------------------------------------------------------
+# The point-in-time invariant: every policy input comes from CLAIMS (which
+# replay gates by `available_at <= T`) plus history features, and never from
+# a `ProbeResult.data` blob. See `extend_case_state`'s docstring — "NOTHING
+# is threaded into `derive_policy_inputs` from a `ProbeResult.data` blob" —
+# and `rli.replay.build`, which writes the same contract down.
+# ---------------------------------------------------------------------------
+
+#: When the replay dataset's `team_signal` record was built. `TeamSignalArgs`
+#: carries no `as_of`, so ONE record serves every `T`, and every claim on it
+#: is stamped `available_at = BUILD_TIME` — months after the archive-era
+#: `NOW` the first test below replays it at.
+BUILD_TIME = NOW + timedelta(days=90)
+
+
+@dataclass
+class _RecordedProbeRunner(ProbeRunner):
+    """`rli.replay.mode.ReplayProbeRunner` in miniature: two overridden methods.
+
+    `execute` serves the probes named in `record` from that pre-built record
+    instead of running them, which is what replay does for every dynamic
+    probe; probes absent from `record` still run live, so the always-run pair
+    goes through respx exactly as in every other test in this file.
+    `save_evidence` applies spec.md §3's gate — "expose only evidence with
+    `available_at <= T`" — at the one choke point every system's evidence
+    passes through, with the same inclusive comparison as the real thing.
+
+    Written here rather than imported from `rli.replay.mode` on purpose. This
+    is a test of `rli.eval.case`'s own contract, and the dependency runs one
+    way only: replay knows about the systems, the systems know only
+    `rli.eval.runner.ReplayHook` (see its docstring). Importing the replay
+    runner here would also make the test pass or fail for reasons that live
+    in `rli/replay/`, which is not what it is asserting.
+    """
+
+    record: dict[str, ProbeResult]
+    replay_at: datetime
+
+    def execute(self, probe_cls: type[Probe], args: BaseModel) -> ProbeResult:
+        recorded = self.record.get(probe_cls.name)
+        return recorded if recorded is not None else super().execute(probe_cls, args)
+
+    def save_evidence(
+        self, *, probe: str, claims: Sequence[ProbeClaim], posting_id: str | None = None
+    ) -> list[EvidenceItem]:
+        kept = [claim for claim in claims if claim.available_at <= self.replay_at]
+        return self.run.save_evidence(probe=probe, claims=kept, posting_id=posting_id)
+
+
+def _recorded(
+    probes: ProbeRunner, record: dict[str, ProbeResult], replay_at: datetime
+) -> _RecordedProbeRunner:
+    """The same run, context and client pool, wrapped to serve `record` at `replay_at`."""
+    return _RecordedProbeRunner(
+        run=probes.run,
+        ctx=probes.ctx,
+        cfg=probes.cfg,
+        now=probes.now,
+        pool=probes.pool,
+        record=record,
+        replay_at=replay_at,
+    )
+
+
+def _team_history_with_a_post_t_new_role(conn: sqlite3.Connection, job_id: str) -> None:
+    """Board history deep and dense at `NOW`, plus a new role opened AFTER it.
+
+    The sibling posting on the same team is first observed ten days before
+    `BUILD_TIME`, i.e. a fortnight of hiring activity that had not happened
+    yet at `NOW`. That is what makes the leak measurable rather than merely
+    structural: the build-time probe answers `True` on evidence that did not
+    exist at the `T` the answer is about.
+    """
+    for offset in range(60):
+        add_capture(conn, NOW - timedelta(days=59 - offset), [])
+    add_posting(conn, job_id=job_id, first_observed=NOW - timedelta(days=200), last_seen_open=NOW)
+    add_posting(conn, job_id="5002", first_observed=BUILD_TIME - timedelta(days=10))
+
+
+def _build_time_team_signal_record(probes: ProbeRunner, posting_id: str) -> ProbeResult:
+    """Run the REAL `team_signal` probe on a build-time clock, as the builder does.
+
+    The asserts are not the test — they are what stops the test from passing
+    vacuously if the fixture ever stops producing the shape the bug needed: a
+    genuine `bool` in `data` and claims stamped after `NOW`.
+    """
+    ctx = replace(probes.ctx, now=lambda: BUILD_TIME)
+    result = TeamSignalProbe().run(TeamSignalArgs(posting_id=posting_id, company_id=COMPANY), ctx)
+
+    assert result.ok is True
+    assert result.data is not None
+    assert result.data["corroborating_hiring_signal"] is True
+    assert result.data["evidence"]
+    assert all(claim.available_at == BUILD_TIME for claim in result.data["evidence"])
+    return result
+
+
+@respx.mock
+def test_team_signal_blob_does_not_populate_the_input_when_its_claims_are_after_t(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    """An archive-era case must not learn `corroborating_hiring_signal` from a blob.
+
+    The replay shape exactly: one build-time `team_signal` record whose
+    `data["corroborating_hiring_signal"]` is a real `True` and whose claims
+    are all `available_at = BUILD_TIME`. At `NOW` the point-in-time gate drops
+    every one of those claims — correctly, because nothing the probe said was
+    knowable then — so the input must stay UNKNOWN and stay an OPEN QUESTION
+    for the controller.
+
+    This is the regression guard for the leak. `extend_case_state` used to
+    read `team.data["corroborating_hiring_signal"]` and thread it into
+    `derive_policy_inputs`, so the case came out of replay answered `True`
+    with zero team_signal evidence rows behind it and the key absent from
+    `unpopulated`: a post-T value deciding a pre-T case, and one `rli replay
+    check` cannot see, because it audits `evidence` and `run_steps` rather
+    than policy inputs.
+    """
+    _team_history_with_a_post_t_new_role(conn, "5001")
+    _mock_greenhouse("5001", _gh_job("5001"))
+
+    with _run_and_probes(conn, cfg) as (_run, probes):
+        case = build_case_state(
+            conn, cfg, url="https://boards.greenhouse.io/acme/jobs/5001", now=NOW, probes=probes
+        )
+        assert case.posting_id is not None
+        record = {TeamSignalProbe.name: _build_time_team_signal_record(probes, case.posting_id)}
+        extend_case_state(case, [TeamSignalProbe], probes=_recorded(probes, record, NOW))
+
+    # The probe ran and its blob says True...
+    served = case.probe_results[TeamSignalProbe.name]
+    assert served.data is not None
+    assert served.data["corroborating_hiring_signal"] is True
+    # ...and not one of its claims was knowable at T.
+    assert [c for c in case.evidence if c.probe == TeamSignalProbe.name] == []
+    # ...so the question is still open, and says so.
+    assert case.inputs.corroborating_hiring_signal is UNKNOWN
+    assert "corroborating_hiring_signal" in case.unpopulated
+
+
+@respx.mock
+def test_team_signal_claim_available_at_t_does_populate_the_input(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    """The complementary half: a claim the gate admits still answers the input.
+
+    Same corpus, same record, same runner — only the gate's `T` moves, to the
+    moment the record was built. Every claim is now `available_at <= T`, the
+    `corroborating_hiring_signal` claim reaches the evidence table, and the
+    input is answered FROM THAT CLAIM. Deleting the blob fallback deleted a
+    leak, not the feature.
+
+    The decision clock stays at `NOW` so that exactly one thing differs
+    between this test and the one above; `corroborating_hiring_signal` is not
+    a windowed input, so it reads the same either way.
+    """
+    _team_history_with_a_post_t_new_role(conn, "5001")
+    _mock_greenhouse("5001", _gh_job("5001"))
+
+    with _run_and_probes(conn, cfg) as (_run, probes):
+        case = build_case_state(
+            conn, cfg, url="https://boards.greenhouse.io/acme/jobs/5001", now=NOW, probes=probes
+        )
+        assert case.posting_id is not None
+        record = {TeamSignalProbe.name: _build_time_team_signal_record(probes, case.posting_id)}
+        extend_case_state(case, [TeamSignalProbe], probes=_recorded(probes, record, BUILD_TIME))
+
+    claims = [c for c in case.evidence if c.claim_type == CLAIM_TEAM_SIGNAL]
+    assert len(claims) == 1
+    assert claims[0].probe == TeamSignalProbe.name
+    assert claims[0].value == "true"
+    assert case.inputs.corroborating_hiring_signal is True
+    assert "corroborating_hiring_signal" not in case.unpopulated

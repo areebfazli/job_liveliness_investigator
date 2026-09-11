@@ -19,6 +19,7 @@ import respx
 from test_eval_helpers import (
     COMPANY,
     add_capture,
+    add_company,
     add_company_event,
     add_posting,
     job,
@@ -37,6 +38,7 @@ from test_replay_helpers import (
 )
 
 from rli.config import Config
+from rli.db import connect
 from rli.eval.runner import Run, RunResult
 from rli.eval.system_a import run_system_a
 from rli.eval.system_b import run_system_b
@@ -786,6 +788,118 @@ def test_summary_describe_reports_skipped_and_a_quota_stop_without_breaking_old_
     assert f"replay {stopped.system} over dataset" in stopped_text
     assert "STOPPED: quota_exhausted" in stopped_text
     assert stopped.quota_detail in stopped_text
+
+
+# ---------------------------------------------------------------------------
+# One case never stops the walk, including when the failure is the DATABASE
+# rather than the system (the `rli.replay.pit` read-snapshot failure: a
+# System C replay is a multi-day walk holding one connection, and `resume`
+# does database work of its own outside `_replay_one`'s handler).
+# ---------------------------------------------------------------------------
+
+
+def _db_path(conn: sqlite3.Connection) -> str:
+    """The file `conn` is open on, so a test can open a SECOND connection to it."""
+    return next(row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main")
+
+
+def test_a_database_failure_in_the_resume_path_fails_one_case_not_the_walk(
+    conn: sqlite3.Connection, cfg: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_delete_run_ids` runs inside the `point_in_time` block, outside `_replay_one`.
+
+    An uncaught `sqlite3.Error` there ended the whole replay — the worst
+    possible place for it, since `resume=True` is the default for System C's
+    multi-day walk and the case had not even been run yet.
+    """
+    _build(conn, cfg)
+    run_replay(conn, cfg, dataset_id=DATASET, system="A", limit_cases=3)
+    for run_id in _replay_run_ids(conn):
+        _plant_quota_error(conn, run_id)  # so `resume` reruns all three
+
+    from rli.replay.run import _delete_run_ids
+
+    calls = {"n": 0}
+
+    def flaky_delete(conn_: sqlite3.Connection, run_ids) -> int:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return _delete_run_ids(conn_, run_ids)
+
+    monkeypatch.setattr("rli.replay.run._delete_run_ids", flaky_delete)
+    summary = run_replay(conn, cfg, dataset_id=DATASET, system="A", resume=True)
+
+    assert summary.cases == 8  # the walk visited the whole grid
+    assert summary.errors == 1
+    assert summary.completed == 7
+    assert calls["n"] == 3  # the other two resumed cases still got their cleanup
+
+    failed = [outcome for outcome in summary.outcomes if outcome.error is not None]
+    assert len(failed) == 1
+    assert "OperationalError: database is locked" in failed[0].error
+    assert failed[0].run_id is None  # it failed before the case could run
+    assert failed[0].error in summary.describe()
+
+
+def test_a_concurrent_commit_during_a_case_does_not_fail_any_case(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    """The walk shares `main` with anything else that writes to the database.
+
+    Each case here commits from a SECOND connection before the replayed run
+    makes its own first write, which is exactly the sequence that made the
+    walk's connection refuse the write outright while `rli.replay.pit` held a
+    read snapshot across its `yield`.
+    """
+    _build(conn, cfg)
+    path = _db_path(conn)
+    seen: list[str] = []
+
+    def system_c(conn_, cfg_, url, **kwargs):
+        other = connect(path)
+        try:
+            add_company(other, f"concurrent-writer-{len(seen)}.example")
+        finally:
+            other.close()
+        seen.append(url)
+        result = run_system_b(conn_, cfg_, url, **kwargs)
+        return result.model_copy(update={"system": "C"})
+
+    summary = run_replay(conn, cfg, dataset_id=DATASET, system="C", runner=system_c)
+
+    assert len(seen) == 8
+    assert summary.cases == 8
+    assert summary.errors == 0, summary.describe()
+    assert summary.completed == 8
+    # Every case recorded its run, and every concurrent commit survived too
+    # (the runner delegates to System B, so the rows carry its `system`).
+    assert conn.execute("SELECT COUNT(*) FROM runs WHERE mode = 'replay'").fetchone()[0] == 8
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM companies WHERE company_id LIKE 'concurrent-writer-%'"
+        ).fetchone()[0]
+        == 8
+    )
+
+
+def test_a_programming_error_in_the_walk_still_propagates(
+    conn: sqlite3.Connection, cfg: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The per-case handler is `sqlite3.Error`, deliberately not `Exception`.
+
+    A bug in this module is not a case-level fact, and the CLI exits nonzero
+    on `violations` but not on `errors` — so burying one in the error count
+    would make it silent (module docstring's judgment call).
+    """
+    _build(conn, cfg)
+
+    def broken_case_run_rows(*args, **kwargs):
+        raise KeyError("canonical_url")
+
+    monkeypatch.setattr("rli.replay.run._case_run_rows", broken_case_run_rows)
+    with pytest.raises(KeyError, match="canonical_url"):
+        run_replay(conn, cfg, dataset_id=DATASET, system="A", resume=True)
 
 
 def test_dataset_status_reports_per_system_completion(

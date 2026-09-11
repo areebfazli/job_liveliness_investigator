@@ -200,13 +200,23 @@ class TeamSignalSource(Protocol):
     Implementations must obey the probe contract: never raise for a network
     or parse problem, return `ProbeResult(ok=False, error=..., retryable=...)`
     instead, and put any `ProbeClaim`s under `data["evidence"]`. To populate
-    `corroborating_hiring_signal` an implementation must emit a claim whose
+    `corroborating_hiring_signal` an implementation must emit a CLAIM whose
     `claim_type` is `CORROBORATING_HIRING_SIGNAL_CLAIM_TYPE` with `value` in
-    `"true"`/`"false"` AND set `data["corroborating_hiring_signal"]` to a
-    real `bool` (or `None` for Unknown) — the two readers are
-    `rli.policy.inputs._team_signal` and `rli.eval.case`'s fallback, and
-    they read different places. A licensed source should additionally use
-    `source_quality="enrichment"` (spec.md §3's source ordering).
+    `"true"`/`"false"`. That claim is the ONLY thing that can populate the
+    policy input: `rli.policy.inputs._team_signal` reads it out of the
+    evidence, and nothing reads `data`. Setting
+    `data["corroborating_hiring_signal"]` as well is expected — the trace
+    and `rli.replay.mode`'s codec want it — but it decides nothing, and an
+    implementation that sets ONLY the blob leaves the input UNKNOWN.
+
+    That asymmetry is deliberate and is the fix for security review H4.
+    `rli.eval.case.extend_case_state` used to read the blob whenever the
+    claim path came back UNKNOWN, which is exactly what replay's
+    `available_at <= T` gate produces at an archive-era `T` — so a
+    build-time boolean decided pre-`T` cases with no evidence behind it. A
+    claim carries `available_at` and can be gated; a blob cannot. A licensed
+    source should additionally use `source_quality="enrichment"` (spec.md
+    §3's source ordering).
     """
 
     def fetch(self, args: TeamSignalArgs, ctx: ProbeContext) -> ProbeResult: ...
@@ -427,9 +437,10 @@ class BoardHistoryTeamSignalSource:
                 )
             )
         # Unknown emits nothing: an absent claim IS the honest "not asserted"
-        # (module docstring), and `data["corroborating_hiring_signal"]` stays
-        # None so `rli.eval.case`'s `isinstance(candidate, bool)` fallback
-        # cannot read it as a negative either.
+        # (module docstring), and an absent claim now means an UNKNOWN input,
+        # full stop -- no reader falls back to the blob. It still stays None
+        # rather than False so a trace reader cannot misread "not asserted"
+        # as a negative.
 
         return ProbeResult(
             ok=True,
@@ -445,8 +456,10 @@ class BoardHistoryTeamSignalSource:
                 "new_roles_30d": activity.new_roles_30d,
                 "closures_60d": activity.closures_60d,
                 "open_roles_now": activity.open_roles_now,
-                # A real bool, or None for Unknown — never a string. Read
-                # directly by `rli.eval.case` when no evidence was built.
+                # A real bool, or None for Unknown — never a string. For
+                # the trace and `rli.replay.mode`'s codec only: NO policy
+                # input is derived from it (see the module docstring on H4).
+                # The claim above is what decides the input.
                 "corroborating_hiring_signal": hiring_signal,
                 "evidence": claims,
             },

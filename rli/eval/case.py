@@ -60,6 +60,16 @@ user-facing statement maps to evidence). This module satisfies that contract:
 * **`refreshed_at`** — an ATS `updated_at` timestamp that COINCIDES with a
   content-hash change we actually observed. See "The refresh match" below.
 
+It satisfies it in `extend_case_state` too, which is worth saying out loud
+because for a while it did not: that function used to read
+`corroborating_hiring_signal` straight out of the `team_signal` probe's
+`data` blob and hand it to `derive_policy_inputs`. A blob has no
+`available_at`, so replay could not gate it, and an archive-era case was
+decided on a boolean produced long after its `T`. `extend_case_state`'s
+docstring has the full account; the rule that falls out of it is that this
+module derives inputs from `EvidenceItem`s and history features and from
+nothing else.
+
 **Why a same-instant `posting_state` + `board_absent` pair is NOT a
 contradiction, and why that is correct.** `rli.policy.quality`'s C2 rule
 fires only when a `board_absent` claim's `available_at` is *strictly later*
@@ -322,7 +332,7 @@ from rli.eval.runner import STEP_PROBE_SKIPPED, ProbeRunner
 from rli.history.features import PostingHistoryFeatures, posting_features
 from rli.models.case_file import CaseFile
 from rli.models.evidence import EvidenceItem
-from rli.models.policy_inputs import UNKNOWN, PolicyInputs, Unknown
+from rli.models.policy_inputs import PolicyInputs
 from rli.models.probe import ProbeResult
 from rli.models.time import ensure_aware, parse_utc, to_utc_z
 from rli.policy.action import PolicyThresholds
@@ -339,7 +349,6 @@ from rli.probes.board_snapshot import BoardJob, BoardSnapshotArgs, BoardSnapshot
 from rli.probes.lookups import posting_row
 from rli.probes.registry import build_args
 from rli.probes.resolve_posting import ResolvePostingArgs, ResolvePostingProbe
-from rli.probes.team_signal import TeamSignalProbe
 from rli.resolvers.common import normalize_domain
 
 __all__ = [
@@ -1041,24 +1050,19 @@ def extend_case_state(
     invite a second `refreshed_at` claim for the same refresh. If a future
     probe ever emits `updated_at`, this is the function that must change.
 
-    ONE input cannot be read from evidence alone and is threaded through
-    explicitly:
+    **NOTHING is threaded into `derive_policy_inputs` from a
+    `ProbeResult.data` blob.** Every policy input this function re-derives
+    comes from the `EvidenceItem`s in `case.evidence` — which replay filters
+    by `available_at <= T` at the single choke point above
+    (`ProbeRunner.save_evidence`) — plus the `rli.history.features` computed
+    under the point-in-time corpus. `rli.replay.build` writes that contract
+    down; this function and `build_case_state` are the two places that have
+    to honour it.
 
-    * `team_signal` — spec.md §4 makes `team_signal` the only source for
-      `corroborating_hiring_signal`. The documented path is a
-      `corroborating_hiring_signal` CLAIM (`rli.policy.inputs.CLAIM_TEAM_SIGNAL`),
-      which `derive_policy_inputs` reads from the evidence and which always
-      wins. The `team_signal=` keyword here is a narrow fallback for a
-      licensed adapter that reports the boolean in `data` without emitting a
-      claim; it is only used when the probe succeeded AND the value is
-      genuinely a `bool`. `NullTeamSignalSource` returns `ok=False`, so an
-      unlicensed run never populates the input — which is the whole point of
-      that class (see `rli.probes.team_signal`).
-
-    The company-event signals used to be threaded the same way, from
-    `company_events`' `ProbeResult.data`, on top of a triple this module had
-    pre-populated from the local store. Both halves of that are gone:
-    `derive_policy_inputs` reads `material_negative_event`,
+    The company-event triple is the precedent. It used to be threaded here
+    from `company_events`' `ProbeResult.data`, on top of a triple this
+    module had pre-populated from the local store. Both halves of that are
+    gone: `derive_policy_inputs` reads `material_negative_event`,
     `freeze_or_pause` and `last_material_event_at` out of the probe's own
     claims. The probe's `data` still reports all three (the replay codec in
     `rli.replay.mode` decodes them, and a trace reader wants to see them),
@@ -1066,6 +1070,41 @@ def extend_case_state(
     makes it impossible for the trace and the policy to disagree about
     whether there was a layoff. See this module's docstring for the bug that
     made the difference matter.
+
+    **`corroborating_hiring_signal` now follows the same rule, and the
+    exception that used to be made for it is why.** spec.md §4 makes
+    `team_signal` the only source for that input, and the documented path is
+    a `corroborating_hiring_signal` CLAIM
+    (`rli.policy.inputs.CLAIM_TEAM_SIGNAL`). This function additionally read
+    `team.data["corroborating_hiring_signal"]` and passed it to
+    `derive_policy_inputs` through a `team_signal=` keyword — a narrow
+    fallback for a licensed adapter that reports the boolean in `data`
+    without emitting a claim. Both the read and the keyword are deleted.
+
+    The fallback bypassed the point-in-time gate, and in replay that was not
+    a theoretical hole but the normal case. `TeamSignalArgs` carries no
+    `as_of`, so ONE cached `team_signal` record — built at dataset-build
+    time — serves every T, and its claims are stamped `available_at = <build
+    time>`. At an archive-era T the gate therefore drops every one of those
+    claims, correctly: nothing the probe said was knowable at T. The `data`
+    blob, however, has no `available_at` to gate on, so the build-time
+    boolean survived and filled the input anyway — a post-T value deciding a
+    pre-T case, with no evidence row behind it, absent from
+    `case.unpopulated`, and invisible to `rli replay check`, which audits
+    `evidence` and `run_steps` rather than policy inputs. This was measured,
+    not feared: 830 archive-era replay runs executed `team_signal` with zero
+    team_signal evidence rows behind them, and in every sampled case the
+    leaked value was the INVERSE of the honest at-T answer — hiring activity
+    that had not happened yet at T had happened by build time.
+
+    If the licensed-adapter path is ever wanted again, the fix is not to
+    re-add a keyword: it is to give `TeamSignalArgs` an `as_of` field and
+    re-run the probe per T, exactly as `company_events` already does, so the
+    value is PRODUCED at T instead of reused across every T — and to emit it
+    as a claim, whose `available_at` the gate can then judge like any other.
+    (`NullTeamSignalSource` returning `ok=False` was never the safeguard it
+    looked like: it only governed whether a blob existed, not whether the
+    blob was knowable at T.)
     """
     case_file = case.case_file()
     if case_file is None:
@@ -1085,20 +1124,12 @@ def extend_case_state(
                 probe=probe_cls.name, claims=claims, posting_id=evidence_posting_id
             )
 
-    team = case.probe_results.get(TeamSignalProbe.name)
-    team_value: bool | Unknown = UNKNOWN
-    if team is not None and team.ok and team.data is not None:
-        candidate = team.data.get("corroborating_hiring_signal")
-        if isinstance(candidate, bool):
-            team_value = candidate
-
     case.inputs = derive_policy_inputs(
         case.evidence,
         case.features,
         probes.now,
         cfg=probes.cfg,
         resolver_ok=case.resolver_ok,
-        team_signal=team_value,
     )
     case.unpopulated = case.inputs.unpopulated()
     case.next_evidence_index = probes.run.next_evidence_index

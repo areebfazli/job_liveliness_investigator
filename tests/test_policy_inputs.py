@@ -9,6 +9,7 @@ in terms of that set.
 
 from __future__ import annotations
 
+import inspect
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -533,8 +534,49 @@ def test_corroborating_hiring_signal_ignores_other_probes():
     assert derive([claim]).corroborating_hiring_signal is UNKNOWN
 
 
-def test_corroborating_hiring_signal_keyword_injection():
-    assert derive([], team_signal=False).corroborating_hiring_signal is False
+def test_corroborating_hiring_signal_is_unknown_when_the_claim_is_gated_out():
+    """The replay invariant at this layer: gate the claim out, lose the input.
+
+    `rli.replay.mode.ReplayProbeRunner.save_evidence` drops every claim whose
+    `available_at` is after `T`, so at an archive-era `T` the evidence list
+    this function is handed simply has no `team_signal` claim in it. The
+    input must then be UNKNOWN — an open question — because a claim is the
+    ONLY channel the value can arrive through.
+
+    That was not true while `derive_policy_inputs` took a `team_signal=`
+    keyword: `rli.eval.case.extend_case_state` read the probe's
+    `data["corroborating_hiring_signal"]` blob and passed it in, and a blob
+    carries no `available_at` for the gate to judge. The build-time boolean
+    therefore answered archive-era cases whose claims had all been dropped.
+    """
+    build_time = NOW + timedelta(days=90)
+    claim = ev(
+        "e1",
+        CLAIM_TEAM_SIGNAL,
+        probe="team_signal",
+        value="true",
+        source_quality="enrichment",
+        available_at=build_time,
+    )
+    at_t = [item for item in [state_ev("open"), claim] if item.available_at <= NOW]
+
+    inputs = derive(at_t)
+
+    assert inputs.corroborating_hiring_signal is UNKNOWN
+    assert "corroborating_hiring_signal" in unpopulated(inputs)
+
+
+def test_derive_policy_inputs_takes_no_team_signal_keyword():
+    """The keyword is GONE, not merely unused — the leak must be unreachable.
+
+    Leaving an inert parameter in place would keep the door open for the next
+    caller that holds a `ProbeResult` and no claim. Removing it makes the
+    point-in-time bypass a `TypeError` rather than a judgment call. Every
+    caller in the tree derives the input from evidence, so nothing needs it.
+    """
+    assert "team_signal" not in inspect.signature(derive_policy_inputs).parameters
+    with pytest.raises(TypeError, match="team_signal"):
+        derive([], team_signal=False)
 
 
 def test_naive_now_is_rejected():

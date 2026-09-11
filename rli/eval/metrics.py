@@ -834,6 +834,14 @@ class DataQuality(BaseModel):
     leakage_violations: int = 0
     leakage_counts: dict[str, int] = {}
     leakage_clean: bool = True
+    # The two figures `rli.replay.leakage` reports but deliberately does NOT
+    # count as violations. They are carried through to here because this is
+    # the durable report an operator actually reads: a `blob_input_exposures`
+    # that only ever appeared on the CLI would leave `reports/evaluation.md`
+    # saying "0 violations / CLEAN" for a dataset that still needs rebuilding
+    # — the same silence that let security review H4 run for 830 runs.
+    leakage_model_cache_misses: int = 0
+    leakage_blob_input_exposures: int = 0
 
     def describe(self) -> str:
         lines = [
@@ -853,6 +861,11 @@ class DataQuality(BaseModel):
             *(f"  {line}" for line in self.citation.describe().splitlines()),
             f"  future leakage: {self.leakage_violations} violation(s) "
             f"{'CLEAN' if self.leakage_clean else 'NOT CLEAN'} — {_render(self.leakage_counts)}",
+            f"  future leakage (reported, not counted): "
+            f"model cache misses={self.leakage_model_cache_misses} (spec.md §6 allows "
+            f"live LLM calls on cache miss), blob input exposures="
+            f"{self.leakage_blob_input_exposures} (a served `data` blob answers a policy "
+            f"input no claim backs at T; clearing it needs a dataset rebuild)",
         ]
         return "\n".join(lines)
 
@@ -1154,6 +1167,8 @@ def data_quality(
         leakage_counts = dict(leakage.counts)
         leakage_violations = leakage.total
         leakage_clean = leakage.clean
+        leakage_model_cache_misses = leakage.model_cache_misses
+        leakage_blob_input_exposures = leakage.blob_input_exposures
     except Exception as exc:  # pragma: no cover - defensive
         # An audit that could not run is NOT an audit that passed. Reporting
         # `clean=True` here would be the single most dangerous default in
@@ -1161,6 +1176,11 @@ def data_quality(
         leakage_counts = {f"leakage_check_error: {type(exc).__name__}": 1}
         leakage_violations = 1
         leakage_clean = False
+        # Left at 0 because the audit did not run: `leakage_clean=False`
+        # above is what says so. A 0 here is not a claim that the dataset is
+        # unexposed, and no caller should read it as one.
+        leakage_model_cache_misses = 0
+        leakage_blob_input_exposures = 0
 
     precision, precision_note = read_match_precision(match_precision_path)
 
@@ -1184,6 +1204,8 @@ def data_quality(
         leakage_violations=leakage_violations,
         leakage_counts=leakage_counts,
         leakage_clean=leakage_clean,
+        leakage_model_cache_misses=leakage_model_cache_misses,
+        leakage_blob_input_exposures=leakage_blob_input_exposures,
     )
 
 

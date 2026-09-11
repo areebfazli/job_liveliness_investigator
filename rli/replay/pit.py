@@ -78,6 +78,42 @@ derivation here would create a second source of truth about what
 everywhere else.
 
 --------------------------------------------------------------------------
+The connection must never hold a read snapshot across the `yield`
+--------------------------------------------------------------------------
+
+Installing the context WRITES: `_install_postings` runs `UPDATE postings`
+(twice, through `apply_to_postings`) and `_install_repost_links` re-points
+`replacement_job_id`. Under Python's legacy sqlite3 transaction control a DML
+statement opens an implicit `BEGIN`, and that `BEGIN` takes a WAL read
+snapshot of `main` — even though every one of those writes lands in `temp`,
+because the statements read `main` to produce them.
+
+Handing that open transaction back at the `yield` is the failure this
+context has to prevent. The block's first write (a replay run's
+`INSERT INTO runs`) then has to upgrade read->write, and SQLite refuses the
+upgrade with `SQLITE_BUSY_SNAPSHOT` (517) if any other connection committed
+to `main` after the snapshot was taken: the writer cannot be shown a
+database that differs from the one it has already been reading. That refusal
+is NOT a lock contention, so `busy_timeout` (5 s, set by
+`rli.db.connect`) does not retry it — it fails in ~0 ms, and it fails with
+the text "database is locked", which reads like contention and is not.
+Worse, nothing resets the snapshot afterwards, so every remaining case at
+that `T` fails the same way on a connection that is wedged rather than busy.
+
+So this context commits immediately before the `yield`, and rolls back if
+the block raises. The commit is safe for the shadows and has to come AFTER
+all three installers: temp objects live in the `temp` schema for the life of
+the CONNECTION, not of the transaction, so `COMMIT` keeps them (and a later
+`ROLLBACK` inside the block keeps them too) — but a rollback of the
+transaction that CREATED them would take them with it, which is exactly what
+the exception path wants, and what makes a half-installed context tear
+itself down.
+
+`rli.replay.run` holds one connection for a whole multi-day System C replay,
+so the invariant is that connection's: it may hold a read snapshot only for
+as long as one statement needs it, never across a case.
+
+--------------------------------------------------------------------------
 Judgment calls
 --------------------------------------------------------------------------
 
@@ -342,6 +378,16 @@ def point_in_time(
     shadowed, so a replay run recorded inside this block lands in the real
     database exactly as a live run would.
 
+    The connection is COMMITTED immediately before the yield and rolled back
+    if the block raises, because it must never hold a read snapshot across
+    the yield: the installers write, an implicit `BEGIN` therefore takes a
+    WAL read snapshot of `main`, and the block's first write would have to
+    upgrade it — which SQLite refuses outright (`SQLITE_BUSY_SNAPSHOT`, not
+    retried by `busy_timeout`) once any other connection has committed to
+    `main`, wedging the connection for every later case at this `T`. The
+    module docstring has the full account; the temp shadows are unaffected by
+    either the commit or the rollback.
+
     The boundary is INCLUSIVE (`<= T`), matching spec.md §3's
     `available_at <= T`: an observation made at exactly `T` was available
     at `T`.
@@ -369,6 +415,29 @@ def point_in_time(
         _install_views(conn, to_utc_z(moment))
         _install_postings(conn, moment, company_ids)
         _install_repost_links(conn)
+        # Release the WAL read snapshot the installers' writes opened, so the
+        # block starts in autocommit. See the module docstring — this is the
+        # difference between a replay that can run beside anything else and a
+        # connection that wedges on the first `INSERT INTO runs`.
+        conn.commit()
         yield conn
+    except BaseException:
+        # Whatever went wrong, this connection must not leave the context
+        # holding a transaction: the caller keeps using it for the next `T`,
+        # and a half-open one would either wedge it (a read snapshot) or
+        # leave a partial write (e.g. `_delete_run_ids` between its
+        # `evidence` and `runs` deletes) for the `finally` to commit below.
+        # `rli.eval.runner` commits after every write, so nothing a completed
+        # case recorded is rolled back here; only work the failure
+        # interrupted. Rolling back BEFORE `_drop_shadows` also means a
+        # failure DURING installation discards the shadows it created —
+        # `_drop_shadows` then finds nothing, which is the correct end state.
+        conn.rollback()
+        raise
     finally:
         _drop_shadows(conn)
+        # The drops are DDL, which Python's legacy transaction control does
+        # not wrap in an implicit `BEGIN`; the commit is for whatever the
+        # BLOCK left uncommitted on the normal path, and is a no-op after the
+        # rollback above.
+        conn.commit()

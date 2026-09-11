@@ -58,6 +58,31 @@ Judgment calls
   message kept; a summary with a nonzero `violations` is a failed replay and
   the CLI exits nonzero on it.
 
+* **A DATABASE failure around one case fails that case too, and the class
+  that says so is `sqlite3.Error` — not `Exception`.** `_replay_one` already
+  turns anything the system under test raises into a failed `CaseOutcome`,
+  but the walk does database work of its own OUTSIDE that handler: the
+  `resume` path reads prior runs and deletes the stale ones, and the
+  `stop_on_quota` path deletes the quota-cut run. Those calls are writes, and
+  a write on a connection that is holding a WAL read snapshot fails with
+  `SQLITE_BUSY_SNAPSHOT` as soon as anything else has committed to `main`
+  (`rli.replay.pit` explains the mechanism it now prevents). Uncaught, one
+  such failure ended the WHOLE replay — which for System C means a multi-day,
+  quota-limited walk, with `resume=True` on by default, aborting on a case it
+  had not even run yet. So the per-case body catches `sqlite3.Error`,
+  `ROLLBACK`s (the wedged snapshot is released, and a `_delete_run_ids` that
+  failed between its `evidence` and `runs` deletes is undone rather than left
+  half applied), records the failure as that case's outcome — counted in
+  `errors`, visible in `describe()` — and moves to the next case. It
+  deliberately does NOT catch `Exception`: a `LookupError`, `ValueError`,
+  `TypeError` or `KeyError` in this module is a bug in the walk itself, not a
+  case-level fact, and the CLI exits nonzero on `violations` but not on
+  `errors`, so burying a programming error in the error count would make it
+  silent. `PointInTimeError` and failures INSTALLING a `T`'s corpus are
+  outside the per-case handler for the same reason: a corpus that cannot be
+  built is not one case's problem, and continuing would replay the remaining
+  cases of that `T` against the wrong view.
+
 * **The dataset's own `posting_id` keys the record lookup, not the one the
   running system re-derives from the URL.** The two can legitimately differ:
   `rli.history.closures` creates `"archive:{company}:{job}"` postings that
@@ -237,6 +262,40 @@ def _bump(counts: dict[str, int], key: str) -> None:
     counts[key] = counts.get(key, 0) + 1
 
 
+def _sqlite_error_text(exc: sqlite3.Error) -> str:
+    """A `sqlite3` failure, with the SQLite error NAME kept.
+
+    `SQLITE_BUSY` and `SQLITE_BUSY_SNAPSHOT` both stringify as "database is
+    locked" and mean opposite things: the first is contention, which
+    `rli.db.connect`'s 5 s `busy_timeout` retries, and the second is a
+    read-snapshot conflict, which fails in ~0 ms and is never retried. A
+    recorded per-case error that says only "database is locked" sends the
+    reader after the wrong problem, so the name goes in the text.
+    """
+    name = getattr(exc, "sqlite_errorname", None)
+    text = f"{type(exc).__name__}: {exc}"
+    return f"{text} [{name}]" if name else text
+
+
+def _failed_case(row: sqlite3.Row, error: str, outcome: CaseOutcome | None) -> CaseOutcome:
+    """This case's outcome when the database work around it failed.
+
+    `outcome` is whatever `_replay_one` had already returned, if it got that
+    far: a case whose run completed and whose post-run quota bookkeeping then
+    failed is recorded as what it actually produced, with the error stamped
+    on it, rather than as a case that never ran. `error` makes it count in
+    `ReplayRunSummary.errors` either way.
+    """
+    if outcome is not None:
+        return outcome.model_copy(update={"error": error})
+    return CaseOutcome(
+        posting_id=row["posting_id"],
+        replay_at=row["replay_at"],
+        input_url=row["canonical_url"],
+        error=error,
+    )
+
+
 def _delete_run_ids(conn: sqlite3.Connection, run_ids: Sequence[str]) -> int:
     """Delete `evidence`, `run_steps` and `runs` rows for exactly these run ids."""
     if not run_ids:
@@ -409,7 +468,12 @@ def run_replay(
             exactly it rather than skipping it as "completed".
 
     Raises `LookupError` if the dataset has no cases, and `ValueError` for a
-    system with no runner.
+    system with no runner — both before any case runs. Once the walk starts,
+    a per-case failure (the system raising, a `ReplayViolation`, or a
+    `sqlite3.Error` in the resume/quota bookkeeping around it) is recorded in
+    `outcomes` and counted in `errors`; it never ends the walk. Anything else
+    escaping this loop is a bug in this module and is left to propagate (see
+    the module docstring's judgment call).
     """
     rows = dataset_case_rows(conn, dataset_id)
     if not rows:
@@ -442,6 +506,12 @@ def run_replay(
     skipped = 0
     archive_cases = 0
     seen = 0
+    # The `run_steps.error` text of the case that exhausted the daily LLM
+    # quota, set only under `stop_on_quota`. It doubles as the walk's stop
+    # flag: the case loop breaks on it, then the `T` loop does, so the walk
+    # leaves the `point_in_time` block the ordinary way and there is exactly
+    # one place a `ReplayRunSummary` is built.
+    quota_stop: str | None = None
 
     for stamp, group in _group_by_replay_at(rows):
         if limit_cases is not None and seen >= limit_cases:
@@ -460,56 +530,58 @@ def run_replay(
                     break
                 seen += 1
 
-                if resume:
-                    prior = _case_run_rows(
-                        conn,
-                        dataset_id=dataset_id,
-                        system=system_name,
-                        input_url=row["canonical_url"],
-                        replay_at=row["replay_at"],
-                    )
-                    done = [r for r in prior if r["status"] == "completed"]
-                    if done and not any(_run_quota_detail(conn, r["id"]) is not None for r in done):
-                        skipped += 1
-                        continue
-                    if prior:
-                        _delete_run_ids(conn, [r["id"] for r in prior])
-
-                outcome = _replay_one(
-                    conn,
-                    cfg,
-                    execute,
-                    dataset_id=dataset_id,
-                    posting_id=row["posting_id"],
-                    url=row["canonical_url"],
-                    replay_at=replay_at,
-                    collection_status_csv=collection_status_csv,
-                )
-
-                if stop_on_quota and outcome.run_id is not None:
-                    quota_text = _run_quota_detail(conn, outcome.run_id)
-                    if quota_text is not None:
-                        _delete_run_ids(conn, [outcome.run_id])
-                        outcomes.append(outcome)
-                        return ReplayRunSummary(
+                outcome: CaseOutcome | None = None
+                try:
+                    if resume:
+                        prior = _case_run_rows(
+                            conn,
                             dataset_id=dataset_id,
                             system=system_name,
-                            cases=seen,
-                            completed=completed,
-                            violations=violations,
-                            errors=errors,
-                            replaced_runs=replaced,
-                            skipped=skipped,
-                            action_distribution=actions,
-                            posting_state_distribution=states,
-                            evidence_quality_distribution=qualities,
-                            probe_counts=probe_counts,
-                            cases_with_archive_state=archive_cases,
-                            outcomes=tuple(outcomes),
-                            stopped_reason="quota_exhausted",
-                            quota_detail=quota_text,
-                            resume_after=to_utc_z(_next_quota_reset()),
+                            input_url=row["canonical_url"],
+                            replay_at=row["replay_at"],
                         )
+                        done = [r for r in prior if r["status"] == "completed"]
+                        if done and not any(
+                            _run_quota_detail(conn, r["id"]) is not None for r in done
+                        ):
+                            skipped += 1
+                            continue
+                        if prior:
+                            _delete_run_ids(conn, [r["id"] for r in prior])
+
+                    outcome = _replay_one(
+                        conn,
+                        cfg,
+                        execute,
+                        dataset_id=dataset_id,
+                        posting_id=row["posting_id"],
+                        url=row["canonical_url"],
+                        replay_at=replay_at,
+                        collection_status_csv=collection_status_csv,
+                    )
+
+                    if stop_on_quota and outcome.run_id is not None:
+                        quota_text = _run_quota_detail(conn, outcome.run_id)
+                        if quota_text is not None:
+                            _delete_run_ids(conn, [outcome.run_id])
+                            outcomes.append(outcome)
+                            quota_stop = quota_text
+                            break
+                except sqlite3.Error as exc:
+                    # Everything the SYSTEM can raise is already a case
+                    # outcome by the time it gets here (`_replay_one`). What
+                    # is left is this module's own database work AROUND that
+                    # call — the resume path's `_case_run_rows` /
+                    # `_delete_run_ids`, the quota check, and the archive
+                    # claim lookup `_replay_one` makes before its own
+                    # handler — and a failure in it is this case's failure,
+                    # not the walk's. See the module docstring's judgment
+                    # call for why the class is `sqlite3.Error` and not
+                    # `Exception`.
+                    conn.rollback()
+                    outcomes.append(_failed_case(row, _sqlite_error_text(exc), outcome))
+                    errors += 1
+                    continue
 
                 outcomes.append(outcome)
                 if outcome.archive_state_claims:
@@ -526,6 +598,9 @@ def run_replay(
                 for name in outcome.probes_run:
                     _bump(probe_counts, name)
 
+        if quota_stop is not None:
+            break
+
     return ReplayRunSummary(
         dataset_id=dataset_id,
         system=system_name,
@@ -541,6 +616,9 @@ def run_replay(
         probe_counts=probe_counts,
         cases_with_archive_state=archive_cases,
         outcomes=tuple(outcomes),
+        stopped_reason=None if quota_stop is None else "quota_exhausted",
+        quota_detail=quota_stop,
+        resume_after=None if quota_stop is None else to_utc_z(_next_quota_reset()),
     )
 
 

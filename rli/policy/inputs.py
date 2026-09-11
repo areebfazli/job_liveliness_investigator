@@ -110,11 +110,17 @@ Judgment calls (documented because they are not forced by spec.md)
   silently overrule the resolver's direct observation. If a posting is to be
   called `reposted`, the resolver/history layer must say so in the
   `posting_state` claim itself.
-* **`corroborating_hiring_signal` has exactly one source.** spec.md §4:
-  "`team_signal` is the only source for the policy input
-  `corroborating_hiring_signal`". It is read from `team_signal` evidence
-  (or injected via the `team_signal=` keyword) and is UNKNOWN otherwise —
-  never inferred from board activity.
+* **`corroborating_hiring_signal` has exactly one source, and that source
+  is a CLAIM.** spec.md §4: "`team_signal` is the only source for the policy
+  input `corroborating_hiring_signal`". It is read from a
+  `corroborating_hiring_signal` claim emitted by the `team_signal` probe and
+  is UNKNOWN otherwise — never inferred from board activity, and never
+  threaded in from a `ProbeResult.data` blob. There was once a
+  `team_signal=` keyword on `derive_policy_inputs` for exactly that
+  threading, used by `rli.eval.case`; it is gone, parameter and all, because
+  a `data` blob carries no `available_at` and therefore walked straight past
+  replay's point-in-time gate. `rli.eval.case.extend_case_state` documents
+  what that cost.
 """
 
 from __future__ import annotations
@@ -505,16 +511,31 @@ def derive_policy_inputs(
     *,
     cfg: Config | PolicyThresholds | None = None,
     resolver_ok: bool = True,
-    team_signal: bool | Unknown = UNKNOWN,
 ) -> PolicyInputs:
     """Build `PolicyInputs` from the case file's evidence and derived features.
 
-    A pure function of `(evidence, features, now)` plus the two narrow
-    keyword fallbacks below. In particular there is NO `event_signals`
-    parameter: `material_negative_event`, `freeze_or_pause` and
-    `last_material_event_at` are read out of `company_events`' claims like
-    every other evidence-backed input, so calling this twice with the same
-    evidence cannot produce two different answers depending on who called it.
+    A pure function of `(evidence, features, now)`. Every input value comes
+    from the evidence list or from the history features; `resolver_ok` is the
+    one remaining keyword, and it supplies no VALUE — it says whether
+    `resolve_posting` ran at all, which is what licenses the known-absent
+    `declared_expiry=None` conclusion below. In particular there is NO
+    `event_signals` parameter and NO `team_signal` parameter:
+    `material_negative_event`, `freeze_or_pause`, `last_material_event_at`
+    and `corroborating_hiring_signal` are all read out of their probe's
+    claims like every other evidence-backed input, so calling this twice with
+    the same evidence cannot produce two different answers depending on who
+    called it.
+
+    That "no value parameters" rule is a point-in-time guarantee, not only a
+    tidiness one. An `EvidenceItem` carries `available_at`, so replay can
+    gate it (spec.md §3: "expose only evidence with `available_at <= T`"); a
+    value handed in through a keyword carries no timestamp and cannot be
+    gated. `rli.eval.case.extend_case_state` used to pass the `team_signal`
+    probe's `data["corroborating_hiring_signal"]` through a `team_signal=`
+    keyword here, and that is precisely how a build-time boolean ended up
+    deciding archive-era replay cases whose team_signal claims the gate had
+    correctly dropped. The keyword was deleted rather than left unused, so
+    the leak is now unreachable by construction rather than by discipline.
 
     Arguments:
         evidence: every `EvidenceItem` gathered so far for this posting.
@@ -526,9 +547,6 @@ def derive_policy_inputs(
             Defaults to the loaded project config.
         resolver_ok: `resolve_posting`'s `ProbeResult.ok`. `False` prevents
             the known-absent `declared_expiry=None` conclusion.
-        team_signal: direct injection for `corroborating_hiring_signal`, for
-            callers that hold the `team_signal` probe result but have not yet
-            turned it into evidence. Evidence wins when both are present.
     """
     from rli.policy.action import PolicyThresholds as _PolicyThresholds
 
@@ -544,9 +562,6 @@ def derive_policy_inputs(
         evidence, now, thresholds.negative_event_window_days
     )
 
-    from_evidence = _team_signal(evidence)
-    corroborating = from_evidence if not isinstance(from_evidence, Unknown) else team_signal
-
     return PolicyInputs(
         posting_state=posting_state,
         publish_recency=_publish_recency(evidence, now, thresholds.recent_publish_days),
@@ -554,7 +569,7 @@ def derive_policy_inputs(
         freeze_or_pause=freeze_or_pause,
         declared_expiry=_declared_expiry(evidence, posting_state, resolver_ok=resolver_ok),
         repost_pattern=(features.repost_pattern if features is not None else UNKNOWN),
-        corroborating_hiring_signal=corroborating,
+        corroborating_hiring_signal=_team_signal(evidence),
         last_material_event_at=last_material_event_at,
     )
 

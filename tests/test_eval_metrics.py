@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 
 from rli.config import Config
+from rli.eval import metrics
 from rli.eval.baseline import HoldoutSplitRequestedError
 from rli.eval.metrics import (
     ALL_SPLITS,
@@ -38,6 +39,7 @@ from rli.eval.metrics import (
     split_map_for_dataset,
 )
 from rli.models.time import to_utc_z
+from rli.replay.leakage import LeakageReport
 
 NOW = datetime(2026, 9, 7, tzinfo=UTC)
 DATASET = "ds-m6"
@@ -956,6 +958,54 @@ def test_data_quality_records_the_leakage_audit(
     assert quality.leakage_clean is True
     assert quality.leakage_counts == {}
     assert quality.repost_match_precision_note.startswith("pending")
+    # The two figures `rli.replay.leakage` reports but does not COUNT reach
+    # the durable report too. A clean run has none of either; the point of
+    # the assertion is that the fields exist and are carried, so a dataset
+    # that does have exposures cannot show up here as a bare "CLEAN".
+    assert quality.leakage_model_cache_misses == 0
+    assert quality.leakage_blob_input_exposures == 0
+
+
+def test_data_quality_reports_leakage_figures_that_are_not_violations(
+    conn: sqlite3.Connection, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A CLEAN verdict must still surface the reported-not-counted figures.
+
+    `rli.replay.leakage` keeps `model_cache_misses` and
+    `blob_input_exposures` out of `counts` on purpose, so `clean` stays
+    reachable. That only works if they survive the trip into `DataQuality`:
+    if they stopped here, `reports/evaluation.md` would say "0 violations /
+    CLEAN" for a dataset that still exposes a post-T blob, which is the
+    silence security review H4 hid in.
+    """
+    splits: dict[str, str] = {}
+    _pair(conn, "p1", a_action="wait", b_action="wait", split_map=splits)
+
+    real = metrics.check_dataset
+
+    def _with_figures(*args: object, **kwargs: object) -> LeakageReport:
+        report = real(*args, **kwargs)  # type: ignore[arg-type]
+        return report.model_copy(update={"model_cache_misses": 199, "blob_input_exposures": 645})
+
+    monkeypatch.setattr(metrics, "check_dataset", _with_figures)
+    quality = data_quality(
+        conn,
+        cfg,
+        dataset_id=DATASET,
+        splits=splits,
+        systems=("A",),
+        match_precision_path=tmp_path / "absent.md",
+    )
+
+    assert quality.leakage_model_cache_misses == 199
+    assert quality.leakage_blob_input_exposures == 645
+    # Neither moves the verdict...
+    assert quality.leakage_violations == 0
+    assert quality.leakage_clean is True
+    # ...and both are visible where an operator reads it.
+    described = quality.describe()
+    assert "model cache misses=199" in described
+    assert "blob input exposures=645" in described
 
 
 # ---------------------------------------------------------------------------
