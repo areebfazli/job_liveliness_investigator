@@ -359,18 +359,18 @@ provider = "openai_compatible"
 
 # Default: a local Ollama. Free, no API key, nothing leaves the machine.
 #   ollama serve && ollama pull qwen3:8b
-base_url = "http://localhost:11434/v1"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
 
 # Name of the environment variable holding the API key — NOT the key. Leaving
 # the variable unset is normal and supported (local Ollama needs no key).
-api_key_env = "LLM_API_KEY"
+api_key_env = "GEMINI_API_KEY"
 
 # Model used by System C's investigator and explanation calls. Both prompts
 # demand a JSON object matching a schema, so pick a model that can actually
 # hold a structured format. `qwen3:4b` is the smaller alternative if RAM is
 # tight; `llama3.2:3b` is smaller still but noticeably weaker at schema
 # adherence (it leans on the json_object fallback).
-model_id = "llama3.2:3b"
+model_id = "gemini-3.5-flash-lite"
 
 # ---------------------------------------------------------------------------
 # Google Gemini free tier instead of a local model: uncomment and export the
@@ -388,13 +388,13 @@ max_tokens = 4096
 # Per-request timeout (seconds). Kept well under [budgets].max_latency_s so a
 # single hung call cannot silently consume the whole run's latency budget.
 # A CPU-only local model is slow: raise this rather than lowering it.
-timeout_s = 600.0
+timeout_s = 120.0
 
 # Transport-level retries of ONE API call, applied by the client
 # (spec.md §2: "no uncontrolled retry loops"). Only 429 and 5xx are retried,
 # and a `Retry-After` header wins over the exponential backoff. This is
 # unrelated to [agent].max_probe_retries, which retries a failed PROBE.
-max_retries = 2
+max_retries = 3
 
 # Client-side throttle: minimum spacing (in requests/minute) the client
 # imposes on its OWN outgoing calls, independent of and in addition to
