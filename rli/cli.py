@@ -18,7 +18,7 @@ from rli.history.cli import app as history_app
 from rli.models.time import now_utc, parse_utc
 from rli.replay.build import DEFAULT_GRID_STEP_DAYS, build_dataset
 from rli.replay.leakage import check_dataset
-from rli.replay.run import SYSTEM_RUNNERS, run_replay
+from rli.replay.run import SYSTEM_RUNNERS, dataset_status, run_replay
 from rli.snapshots.daily import run_daily_snapshot
 from rli.snapshots.targets import DEFAULT_TARGETS_PATH, load_targets, upsert_companies
 
@@ -355,7 +355,9 @@ def replay_build_command(
 @replay_app.command("run")
 def replay_run_command(
     system: str = typer.Option(
-        ..., "--system", help="Which system to replay: A (full probes) or B (rules)."
+        ...,
+        "--system",
+        help="Which system to replay: A (full probes), B (rules), or C (LLM agent, PLAN.md M5).",
     ),
     dataset: str = typer.Option(..., "--dataset", help="Replay dataset id to run against."),
     limit_cases: int | None = typer.Option(
@@ -367,14 +369,41 @@ def replay_run_command(
         help="Keep this dataset's earlier replay runs for this system instead of "
         "replacing them. Leaves duplicate cases for the baseline report to collapse.",
     ),
+    resume: bool | None = typer.Option(
+        None,
+        "--resume/--no-resume",
+        help="Skip cases with a prior non-quota-affected completed run for this "
+        "(dataset, system). Defaults to on for --system C, off otherwise.",
+    ),
+    stop_on_quota: bool | None = typer.Option(
+        None,
+        "--stop-on-quota/--no-stop-on-quota",
+        help="Stop the moment a case's run shows daily LLM-quota exhaustion, deleting "
+        "that case's run so `--resume` redoes it later. Defaults to on for --system C, "
+        "off otherwise.",
+    ),
     db: str = typer.Option(_DEFAULT_DB_PATH, "--db", help="Path to the SQLite database file."),
 ) -> None:
     """Replay one system over every (posting, T) case of a dataset."""
-    chosen = _normalized_system(system)
-    if chosen not in SYSTEM_RUNNERS:  # pragma: no cover - defensive
+    raw_system = system.strip().upper()
+    if raw_system == "C":
+        chosen = "C"
+    else:
+        chosen = _normalized_system(system)
+
+    runner = None
+    if chosen == "C":
+        from rli.agent.loop import make_system_c  # lazy: avoids importing the agent stack for A/B
+
+        runner = make_system_c()
+    elif chosen not in SYSTEM_RUNNERS:  # pragma: no cover - defensive
         raise typer.BadParameter(
             f"system {chosen!r} has no shipped replay runner", param_hint="--system"
         )
+
+    effective_resume = resume if resume is not None else (chosen == "C")
+    effective_stop_on_quota = stop_on_quota if stop_on_quota is not None else (chosen == "C")
+
     cfg = load_config()
     init_db(db)
     conn = connect(db)
@@ -384,10 +413,15 @@ def replay_run_command(
             cfg,
             dataset_id=dataset,
             system=chosen,
+            runner=runner,
             limit_cases=limit_cases,
             replace=not keep_previous,
+            resume=effective_resume,
+            stop_on_quota=effective_stop_on_quota,
         )
         typer.echo(summary.describe())
+        if summary.stopped_reason == "quota_exhausted":
+            raise typer.Exit(code=3)
         if summary.violations:
             raise typer.Exit(code=1)
     finally:
@@ -411,6 +445,26 @@ def replay_check_command(
         typer.echo(report.describe())
         if not report.clean:
             raise typer.Exit(code=1)
+    finally:
+        conn.close()
+
+
+@replay_app.command("status")
+def replay_status_command(
+    dataset: str = typer.Option(..., "--dataset", help="Replay dataset id to report on."),
+    db: str = typer.Option(_DEFAULT_DB_PATH, "--db", help="Path to the SQLite database file."),
+) -> None:
+    """Per-system case totals for a replay dataset: total / completed / remaining.
+
+    A quota-cut run counts as still remaining (see `rli.replay.run.dataset_status`),
+    which is what makes this the right thing to check before resuming a multi-day
+    System C replay against a free-tier LLM API's daily quota.
+    """
+    init_db(db)
+    conn = connect(db)
+    try:
+        status = dataset_status(conn, dataset_id=dataset)
+        typer.echo(status.describe())
     finally:
         conn.close()
 

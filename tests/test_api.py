@@ -415,15 +415,18 @@ def test_health_reports_the_configured_llm_without_probing_it(
     made would raise, so a passing test is itself the proof that /health
     does not probe the endpoint.
     """
+    # Configured = a credential is present (or the endpoint is local); make
+    # this independent of where the shipped config.toml points.
+    monkeypatch.setenv(cfg.llm.api_key_env, "test-key")
     resp = client.get("/health")
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["status"] == "ok"
     assert payload["llm_base_url"] == cfg.llm.base_url
     assert payload["llm_model_id"] == cfg.llm.model_id
-    # The shipped default is a local endpoint, which needs no credential.
     assert payload["llm_configured"] is True
 
+    monkeypatch.delenv(cfg.llm.api_key_env, raising=False)
     remote = "https://generativelanguage.googleapis.com/v1beta/openai"
     monkeypatch.setattr(
         app_module,

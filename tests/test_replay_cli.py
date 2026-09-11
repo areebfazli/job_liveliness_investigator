@@ -9,8 +9,10 @@ replay mode would fail loudly instead of silently succeeding.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
+import pytest
 import respx
 from test_eval_helpers import COMPANY
 from test_replay_helpers import NOW, dev_everything_cutoff, mock_ats, seed_corpus
@@ -19,6 +21,7 @@ from typer.testing import CliRunner
 from rli.cli import app
 from rli.db import connect, init_db
 from rli.models.time import to_utc_z
+from rli.replay.run import ReplayRunSummary
 
 runner = CliRunner()
 
@@ -208,3 +211,67 @@ def test_eval_behavior_scopes_to_one_company(tmp_path: Path) -> None:
     )
     assert result.exit_code == 0, result.output
     assert out.exists()
+
+
+# ---------------------------------------------------------------------------
+# `replay run --system C` / `--stop-on-quota` / `replay status` (PLAN.md M5)
+# ---------------------------------------------------------------------------
+
+
+def test_replay_run_stop_on_quota_exits_3(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """CLI exit-code wiring for a quota stop.
+
+    A true CLI-level System C quota test would need a live/fake LLM client
+    behind `make_system_c()`. Instead this monkeypatches `rli.cli.run_replay`
+    (as imported into the CLI module) to return a canned quota-stopped
+    summary and asserts the exit code — option (b) from the task spec, since
+    it exercises the CLI's own exit-code wiring without needing a fake LLM.
+    """
+    db_path = _prepared_db(tmp_path)
+
+    def _canned_quota_stop(*args, **kwargs):
+        return ReplayRunSummary(
+            dataset_id=DATASET,
+            system="C",
+            cases=1,
+            completed=0,
+            stopped_reason="quota_exhausted",
+            quota_detail="Quota exceeded for metric: x, limit: 500 per day",
+            resume_after="2026-09-12T08:00:00.000000Z",
+        )
+
+    monkeypatch.setattr("rli.cli.run_replay", _canned_quota_stop)
+
+    result = runner.invoke(
+        app,
+        ["replay", "run", "--system", "C", "--dataset", DATASET, "--db", str(db_path)],
+    )
+    assert result.exit_code == 3, result.output
+    assert "STOPPED: quota_exhausted" in result.output
+
+
+def test_replay_status_reports_per_system_completion(tmp_path: Path) -> None:
+    db_path = _prepared_db(tmp_path)
+    assert _build(db_path).exit_code == 0
+    assert (
+        runner.invoke(
+            app, ["replay", "run", "--system", "A", "--dataset", DATASET, "--db", str(db_path)]
+        ).exit_code
+        == 0
+    )
+
+    status = runner.invoke(app, ["replay", "status", "--dataset", DATASET, "--db", str(db_path)])
+    assert status.exit_code == 0, status.output
+    assert f"replay dataset {DATASET!r}" in status.output
+
+    match_a = re.search(r"A: completed=(\d+) remaining=(\d+) total=(\d+)", status.output)
+    assert match_a, status.output
+    completed_a, remaining_a, total_a = (int(x) for x in match_a.groups())
+    assert completed_a == total_a
+    assert remaining_a == 0
+
+    match_b = re.search(r"B: completed=(\d+) remaining=(\d+) total=(\d+)", status.output)
+    assert match_b, status.output
+    completed_b, remaining_b, total_b = (int(x) for x in match_b.groups())
+    assert completed_b == 0
+    assert remaining_b == total_b == total_a

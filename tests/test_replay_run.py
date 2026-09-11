@@ -26,6 +26,7 @@ from test_eval_helpers import (
 )
 from test_replay_helpers import (
     CLOSED_JOB,
+    CLOSED_URL,
     NOW,
     OPEN_JOB,
     OPEN_URL,
@@ -36,9 +37,11 @@ from test_replay_helpers import (
 )
 
 from rli.config import Config
-from rli.eval.runner import Run
+from rli.eval.runner import Run, RunResult
 from rli.eval.system_a import run_system_a
+from rli.eval.system_b import run_system_b
 from rli.events.policy_signals import CLAIM_EVENTS_SEARCHED
+from rli.models.decision import Decision
 from rli.models.time import parse_utc, to_utc_z
 from rli.policy.inputs import CLAIM_POSTING_STATE
 from rli.probes.registry import DYNAMIC_PROBES
@@ -51,7 +54,7 @@ from rli.replay.mode import (
     ReplayViolation,
     open_replay_probe_runner,
 )
-from rli.replay.run import run_replay
+from rli.replay.run import dataset_status, run_replay
 
 DATASET = "ds-run"
 OPEN_POSTING = f"greenhouse:{TENANT}:{OPEN_JOB}"
@@ -526,3 +529,285 @@ def test_company_events_produces_evidence_in_a_replay_run(
     # claim that makes a "checked, none found" answer citable at all.
     assert by_type.get("layoff")
     assert by_type.get(CLAIM_EVENTS_SEARCHED)
+
+
+# ---------------------------------------------------------------------------
+# `resume` / `stop_on_quota` — System C's free-tier daily-quota reality
+# (PLAN.md M5): a replay that must survive being cut off mid-quota and
+# resumed on a later day without redoing (or losing) completed work.
+# ---------------------------------------------------------------------------
+
+# The exact shape `rli.llm.client`'s daily-quota `LLMTransportError` message
+# takes, truncated the way `rli.agent.loop`/`rli.agent.explanation` persist
+# it into `run_steps.error` (module docstring, "error text shape").
+QUOTA_ERROR_TEXT = (
+    "LLMTransportError: LLM endpoint returned HTTP 429 after 4 attempt(s) for "
+    "model 'x': Quota exceeded for metric: generate_content_free_tier_requests, "
+    "limit: 500 per day"
+)
+
+
+def _run_row(conn: sqlite3.Connection, run_id: str) -> sqlite3.Row:
+    return conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+
+
+def _replay_run_ids(conn: sqlite3.Connection, *, system: str = "A") -> set[str]:
+    return {
+        row["id"]
+        for row in conn.execute(
+            "SELECT id FROM runs WHERE mode = 'replay' AND system = ?", (system,)
+        ).fetchall()
+    }
+
+
+def _plant_quota_error(
+    conn: sqlite3.Connection, run_id: str, *, decision_type: str = "explanation"
+) -> None:
+    """Add a `run_steps` row on an existing run carrying a daily-quota error.
+
+    `decision_type` defaults to `'explanation'` but is deliberately
+    parameterizable: `_run_quota_detail` must not care which step carried the
+    error (module docstring — it scans every `run_steps.error`, not one
+    labeled row).
+    """
+    conn.execute(
+        """
+        INSERT INTO run_steps
+            (run_id, step_index, component, decision_type, error, created_at)
+        VALUES (?, 999, 'model', ?, ?, ?)
+        """,
+        (run_id, decision_type, QUOTA_ERROR_TEXT, to_utc_z(NOW)),
+    )
+    conn.commit()
+
+
+def _make_quota_runner(target_call: int, *, decision_type: str = "explanation"):
+    """A scripted System-C-shaped runner.
+
+    On its `target_call`-th invocation it opens a REAL `Run` (via
+    `rli.eval.runner.Run`, exactly as System C would), writes one
+    `run_steps` row carrying the daily-quota error text, finishes the run
+    normally with a policy-only decision, and returns a `RunResult` —
+    mirroring `run_system_c`'s own contract of never raising for an LLM
+    failure (module docstring). Every other invocation delegates to the real
+    System B so the surrounding cases in the grid behave like an ordinary
+    replay.
+    """
+    calls = {"n": 0}
+
+    def runner(
+        conn_: sqlite3.Connection,
+        cfg_: Config,
+        url: str,
+        *,
+        now=None,
+        replay=None,
+        collection_status_csv=None,
+    ) -> RunResult:
+        calls["n"] += 1
+        if calls["n"] != target_call:
+            return run_system_b(
+                conn_,
+                cfg_,
+                url,
+                now=now,
+                replay=replay,
+                collection_status_csv=collection_status_csv,
+            )
+        run = Run(
+            conn_,
+            cfg_,
+            input_url=url,
+            system="C",
+            config_hash="cfg:test" + replay.config_hash_suffix(),
+            started_at=now,
+            mode="replay",
+            replay_at=now,
+        )
+        run.open()
+        run.step(
+            component="model",
+            decision_type=decision_type,
+            error=QUOTA_ERROR_TEXT,
+            created_at=now,
+        )
+        decision = Decision(
+            posting_state="open", recommended_action="apply_now", evidence_quality="strong"
+        )
+        run.finish(decision)
+        return RunResult(run_id=run.id, system="C", decision=decision)
+
+    return runner, calls
+
+
+def test_resume_skips_cases_with_a_prior_completed_non_quota_run(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    _build(conn, cfg)
+    first = run_replay(conn, cfg, dataset_id=DATASET, system="A", limit_cases=3)
+    assert first.cases == 3
+    kept_ids = _replay_run_ids(conn)
+    assert len(kept_ids) == 3
+
+    second = run_replay(conn, cfg, dataset_id=DATASET, system="A", resume=True)
+    assert second.skipped == 3
+    assert second.cases == 8  # the whole grid was visited this call
+    assert second.completed == 5  # 8 total cases minus the 3 skipped
+    assert second.errors == 0
+
+    after_ids = _replay_run_ids(conn)
+    assert len(after_ids) == 8
+    # The 3 kept runs are untouched: same ids, still present, not duplicated.
+    assert kept_ids <= after_ids
+
+
+def test_resume_redoes_a_failed_or_quota_affected_case(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    _build(conn, cfg)
+    first = run_replay(conn, cfg, dataset_id=DATASET, system="A", limit_cases=2)
+    assert first.cases == 2
+    # The first two grid positions (both at T1): OPEN_URL and CLOSED_URL.
+    failed_case = conn.execute(
+        "SELECT id, input_url, replay_at FROM runs WHERE mode = 'replay' AND input_url = ?",
+        (OPEN_URL,),
+    ).fetchone()
+    quota_case = conn.execute(
+        "SELECT id, input_url, replay_at FROM runs WHERE mode = 'replay' AND input_url = ?",
+        (CLOSED_URL,),
+    ).fetchone()
+    assert failed_case is not None
+    assert quota_case is not None
+
+    conn.execute("UPDATE runs SET status = 'failed' WHERE id = ?", (failed_case["id"],))
+    conn.commit()
+    _plant_quota_error(conn, quota_case["id"])
+    # Sanity: the quota run is otherwise a normal completed run.
+    assert _run_row(conn, quota_case["id"])["status"] == "completed"
+
+    second = run_replay(conn, cfg, dataset_id=DATASET, system="A", resume=True)
+    assert second.skipped == 0
+    assert second.cases == 8
+    assert second.completed == 8
+    assert second.errors == 0
+
+    # Both stale rows are gone...
+    remaining_ids = _replay_run_ids(conn)
+    assert failed_case["id"] not in remaining_ids
+    assert quota_case["id"] not in remaining_ids
+    # ...and fresh, completed runs exist for the same two cases.
+    for stale in (failed_case, quota_case):
+        fresh = conn.execute(
+            "SELECT status FROM runs WHERE mode = 'replay' AND input_url = ? AND replay_at = ?",
+            (stale["input_url"], stale["replay_at"]),
+        ).fetchone()
+        assert fresh is not None
+        assert fresh["status"] == "completed"
+    assert len(remaining_ids) == 8
+
+
+def test_stop_on_quota_deletes_the_offending_run_and_returns_immediately(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    _build(conn, cfg)
+    runner, calls = _make_quota_runner(target_call=1)
+
+    summary = run_replay(
+        conn, cfg, dataset_id=DATASET, system="C", runner=runner, stop_on_quota=True
+    )
+
+    assert calls["n"] == 1  # stopped before any later case was even attempted
+    assert summary.cases == 1
+    assert summary.completed == 0
+    assert summary.stopped_reason == "quota_exhausted"
+    assert summary.quota_detail is not None
+    assert "per day" in summary.quota_detail
+    assert summary.resume_after is not None
+    reset_at = parse_utc(summary.resume_after)
+    assert (reset_at.hour, reset_at.minute, reset_at.second) == (8, 0, 0)
+
+    # The `CaseOutcome` for the stopped case is still reported, even though
+    # its run no longer exists in the DB (a snapshot, not a live reference).
+    assert len(summary.outcomes) == 1
+    deleted_run_id = summary.outcomes[0].run_id
+    assert deleted_run_id is not None
+
+    # The offending case's run/run_steps/evidence are gone entirely, and no
+    # other System C run exists (the walk stopped before reaching case 2).
+    assert _replay_run_ids(conn, system="C") == set()
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM run_steps WHERE run_id = ?", (deleted_run_id,)
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM evidence WHERE run_id = ?", (deleted_run_id,)
+        ).fetchone()[0]
+        == 0
+    )
+
+
+def test_stop_on_quota_treats_an_investigator_labeled_error_the_same(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    """`_run_quota_detail` scans every `run_steps.error`, not one labeled row."""
+    _build(conn, cfg)
+    runner, calls = _make_quota_runner(target_call=1, decision_type="investigator")
+
+    summary = run_replay(
+        conn, cfg, dataset_id=DATASET, system="C", runner=runner, stop_on_quota=True
+    )
+
+    assert calls["n"] == 1
+    assert summary.stopped_reason == "quota_exhausted"
+    assert summary.quota_detail is not None
+    assert _replay_run_ids(conn, system="C") == set()
+
+
+def test_summary_describe_reports_skipped_and_a_quota_stop_without_breaking_old_assertions(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    """The existing substring assertions other tests rely on must still hold."""
+    _build(conn, cfg)
+    run_replay(conn, cfg, dataset_id=DATASET, system="A", limit_cases=2)
+    resumed = run_replay(conn, cfg, dataset_id=DATASET, system="A", resume=True)
+    text = resumed.describe()
+    assert f"replay {resumed.system} over dataset" in text
+    assert "violations=0" in text
+    assert "skipped=2" in text
+
+    runner, _ = _make_quota_runner(target_call=1)
+    stopped = run_replay(
+        conn, cfg, dataset_id=DATASET, system="C", runner=runner, stop_on_quota=True
+    )
+    stopped_text = stopped.describe()
+    assert f"replay {stopped.system} over dataset" in stopped_text
+    assert "STOPPED: quota_exhausted" in stopped_text
+    assert stopped.quota_detail in stopped_text
+
+
+def test_dataset_status_reports_per_system_completion(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    _build(conn, cfg)
+    before = dataset_status(conn, dataset_id=DATASET)
+    assert before.total_cases == 8
+    assert {s.system for s in before.by_system} == {"A", "B", "C", "C2"}
+    assert all(s.completed == 0 and s.remaining == s.total for s in before.by_system)
+
+    run_replay(conn, cfg, dataset_id=DATASET, system="A", limit_cases=3)
+    after = dataset_status(conn, dataset_id=DATASET)
+    by_name = {s.system: s for s in after.by_system}
+    assert by_name["A"].completed == 3
+    assert by_name["A"].remaining == 5
+    assert by_name["B"].completed == 0
+    assert by_name["B"].remaining == 8
+
+
+def test_dataset_status_of_an_unbuilt_dataset_is_a_lookup_error(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    with pytest.raises(LookupError, match="no cases"):
+        dataset_status(conn, dataset_id="nope")

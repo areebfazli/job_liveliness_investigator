@@ -69,13 +69,26 @@ Judgment calls
   clock IS `T` (spec.md §6), which is what makes `recheck_after_days`,
   `publish_recency` and every trace timestamp a function of the dataset
   rather than of when the replay happened to be executed.
+
+* **`resume=True` and `stop_on_quota=True` are the one exception to
+  "replace by default", and they exist for one reason: System C is replayed
+  against Google Gemini's free tier, which allows 15 requests/minute and
+  500/day per model. A full pass over either dataset needs several times
+  that many calls, so it necessarily spans multiple days and multiple
+  process restarts. Deleting yesterday's progress on every invocation (the
+  normal `replace` behavior) would make no forward progress at all — so
+  `resume` instead skips cases with a prior completed, non-quota-affected
+  run, and `stop_on_quota` detects the run whose `run_steps` shows daily
+  quota exhaustion, deletes just that one run (so it looks "never attempted"
+  to the next `resume=True` call), and returns immediately rather than
+  burning the rest of the grid against an exhausted quota.
 """
 
 from __future__ import annotations
 
 import sqlite3
 from collections.abc import Callable, Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 
@@ -85,7 +98,7 @@ from rli.config import Config
 from rli.eval.runner import ReplayHook, RunResult, SystemName
 from rli.eval.system_a import run_system_a
 from rli.eval.system_b import run_system_b
-from rli.models.time import parse_utc, to_utc_z
+from rli.models.time import now_utc, parse_utc, to_utc_z
 from rli.replay.build import archive_state_args_hash, dataset_case_rows
 from rli.replay.mode import (
     ARCHIVE_BOARD_STATE_PROBE,
@@ -99,9 +112,12 @@ from rli.replay.pit import point_in_time
 __all__ = [
     "SYSTEM_RUNNERS",
     "CaseOutcome",
+    "ReplayDatasetStatus",
     "ReplayRunSummary",
+    "SystemCaseStatus",
     "SystemRunner",
     "clear_replay_runs",
+    "dataset_status",
     "run_replay",
 ]
 
@@ -164,6 +180,17 @@ class ReplayRunSummary(BaseModel):
     violations: int = 0
     errors: int = 0
     replaced_runs: int = 0
+    #: Cases skipped this call because a prior non-quota-affected completed
+    #: run already existed (`resume=True` only; see the module docstring).
+    skipped: int = 0
+    #: `"quota_exhausted"` when `stop_on_quota` cut this call short; `None`
+    #: for a normal (possibly partial, via `limit_cases`) completion.
+    stopped_reason: str | None = None
+    #: The `run_steps.error` text that triggered a quota stop.
+    quota_detail: str | None = None
+    #: `to_utc_z` of the next moment a daily quota is expected to have reset,
+    #: set only alongside `stopped_reason`.
+    resume_after: str | None = None
 
     action_distribution: dict[str, int] = {}
     posting_state_distribution: dict[str, int] = {}
@@ -177,7 +204,7 @@ class ReplayRunSummary(BaseModel):
         lines = [
             f"replay {self.system} over dataset {self.dataset_id!r}: "
             f"cases={self.cases} completed={self.completed} "
-            f"violations={self.violations} errors={self.errors} "
+            f"violations={self.violations} errors={self.errors} skipped={self.skipped} "
             f"(replaced {self.replaced_runs} previous run(s))",
             f"  actions: {_render(self.action_distribution)}",
             f"  posting_state: {_render(self.posting_state_distribution)}",
@@ -186,6 +213,11 @@ class ReplayRunSummary(BaseModel):
             f"  cases with an observable archive board state: "
             f"{self.cases_with_archive_state}/{self.cases}",
         ]
+        if self.stopped_reason is not None:
+            lines.append(
+                f"  STOPPED: {self.stopped_reason} — {self.quota_detail} "
+                f"(resume after {self.resume_after})"
+            )
         for outcome in self.outcomes:
             if outcome.error is not None:
                 lines.append(f"    ! {outcome.posting_id} @ {outcome.replay_at}: {outcome.error}")
@@ -205,18 +237,22 @@ def _bump(counts: dict[str, int], key: str) -> None:
     counts[key] = counts.get(key, 0) + 1
 
 
-def clear_replay_runs(conn: sqlite3.Connection, *, dataset_id: str, system: str) -> int:
-    """Delete this dataset's previous replay runs for `system`. Returns the count.
+def _delete_run_ids(conn: sqlite3.Connection, run_ids: Sequence[str]) -> int:
+    """Delete `evidence`, `run_steps` and `runs` rows for exactly these run ids."""
+    if not run_ids:
+        return 0
+    placeholders = ",".join("?" for _ in run_ids)
+    conn.execute(f"DELETE FROM evidence WHERE run_id IN ({placeholders})", run_ids)
+    conn.execute(f"DELETE FROM run_steps WHERE run_id IN ({placeholders})", run_ids)
+    conn.execute(f"DELETE FROM runs WHERE id IN ({placeholders})", run_ids)
+    conn.commit()
+    return len(run_ids)
 
-    Removes `evidence` and `run_steps` first (both reference `runs`), then the
-    `runs` rows themselves. Only rows that are `mode='replay'`, this system,
-    and whose `config_hash` ends in this dataset's `|dataset:<id>` suffix —
-    the same identity `rli.eval.baseline.collect_cases` uses, so "what this
-    deletes" and "what the report would have counted" are the same set by
-    construction. Live runs, other systems and other datasets are untouched.
-    """
+
+def _dataset_run_ids(conn: sqlite3.Connection, *, dataset_id: str, system: str) -> list[str]:
+    """This dataset's replay run ids for `system` (the `clear_replay_runs` filter)."""
     suffix = f"|dataset:{dataset_id}"
-    run_ids = [
+    return [
         row["id"]
         for row in conn.execute(
             """
@@ -227,15 +263,91 @@ def clear_replay_runs(conn: sqlite3.Connection, *, dataset_id: str, system: str)
         ).fetchall()
         if str(row["config_hash"]).endswith(suffix)
     ]
-    if not run_ids:
-        return 0
 
-    placeholders = ",".join("?" for _ in run_ids)
-    conn.execute(f"DELETE FROM evidence WHERE run_id IN ({placeholders})", run_ids)
-    conn.execute(f"DELETE FROM run_steps WHERE run_id IN ({placeholders})", run_ids)
-    conn.execute(f"DELETE FROM runs WHERE id IN ({placeholders})", run_ids)
-    conn.commit()
-    return len(run_ids)
+
+def clear_replay_runs(conn: sqlite3.Connection, *, dataset_id: str, system: str) -> int:
+    """Delete this dataset's previous replay runs for `system`. Returns the count.
+
+    Removes `evidence` and `run_steps` first (both reference `runs`), then the
+    `runs` rows themselves. Only rows that are `mode='replay'`, this system,
+    and whose `config_hash` ends in this dataset's `|dataset:<id>` suffix —
+    the same identity `rli.eval.baseline.collect_cases` uses, so "what this
+    deletes" and "what the report would have counted" are the same set by
+    construction. Live runs, other systems and other datasets are untouched.
+    """
+    return _delete_run_ids(conn, _dataset_run_ids(conn, dataset_id=dataset_id, system=system))
+
+
+def _case_run_rows(
+    conn: sqlite3.Connection, *, dataset_id: str, system: str, input_url: str, replay_at: str
+) -> list[sqlite3.Row]:
+    """Prior replay runs for exactly this `(dataset, system, input_url, replay_at)` case.
+
+    Same `(input_url, replay_at)` case identity `rli.eval.evaluate` pairs
+    cases by (module docstring) — not the dataset's own `posting_id`, which a
+    replayed system can legitimately re-derive differently.
+    """
+    suffix = f"|dataset:{dataset_id}"
+    return [
+        row
+        for row in conn.execute(
+            """
+            SELECT id, status, config_hash FROM runs
+            WHERE mode = 'replay' AND system = ? AND config_hash IS NOT NULL
+              AND input_url = ? AND replay_at = ?
+            """,
+            (system, input_url, replay_at),
+        ).fetchall()
+        if str(row["config_hash"]).endswith(suffix)
+    ]
+
+
+#: Substrings that mark a `run_steps.error` as daily (not per-minute) LLM
+#: quota exhaustion. The first two are Gemini's own quota-metric wording
+#: (`rli.llm.client._extract_quota_lines`); "429"+"llmtransporterror" is the
+#: fallback for a quota message this list doesn't otherwise recognize.
+_QUOTA_TEXT_SIGNATURES = ("requestsperday", "perdayperprojectpermodel", "per day")
+
+
+def _looks_like_quota_exhaustion(text: str) -> bool:
+    lowered = text.lower()
+    if any(sig in lowered for sig in _QUOTA_TEXT_SIGNATURES):
+        return True
+    return "429" in lowered and "llmtransporterror" in lowered
+
+
+def _run_quota_detail(conn: sqlite3.Connection, run_id: str) -> str | None:
+    """First `run_steps.error` on this run that looks like daily-quota exhaustion, else `None`.
+
+    Scans every non-null error on the run regardless of which step produced
+    it (`rli.agent.loop`'s investigator call and `rli.agent.explanation`'s
+    call both persist the same `LLMTransportError` text shape on failure —
+    see the module docstring), so this needs no special case for which
+    `decision_type` carried the error.
+    """
+    rows = conn.execute(
+        "SELECT error FROM run_steps WHERE run_id = ? AND error IS NOT NULL ORDER BY step_index",
+        (run_id,),
+    ).fetchall()
+    for row in rows:
+        text = row["error"]
+        if text and _looks_like_quota_exhaustion(text):
+            return text
+    return None
+
+
+_QUOTA_RESET_HOUR_UTC = 8  # 08:00 UTC covers Pacific midnight both in and out of DST
+# (07:00 UTC during PDT, 08:00 UTC during PST); picking the
+# later of the two is the safe choice — it never returns a
+# time before the quota has actually reset.
+
+
+def _next_quota_reset(after: datetime | None = None) -> datetime:
+    moment = after if after is not None else now_utc()
+    candidate = moment.replace(hour=_QUOTA_RESET_HOUR_UTC, minute=0, second=0, microsecond=0)
+    if candidate <= moment:
+        candidate += timedelta(days=1)
+    return candidate
 
 
 def _group_by_replay_at(rows: Sequence[sqlite3.Row]) -> list[tuple[str, list[sqlite3.Row]]]:
@@ -257,6 +369,8 @@ def run_replay(
     limit_cases: int | None = None,
     collection_status_csv: str | Path | None = None,
     replace: bool = True,
+    resume: bool = False,
+    stop_on_quota: bool = False,
 ) -> ReplayRunSummary:
     """Replay `system` over every case of `dataset_id` (spec.md §6).
 
@@ -277,7 +391,22 @@ def run_replay(
             this company by T?" from a different corpus than the one the
             dataset record was written from.
         replace: delete this dataset's previous replay runs for `system`
-            first (see the module docstring).
+            first (see the module docstring). Ignored (treated as `False` for
+            the bulk pass) when `resume=True`: resuming needs last call's
+            completed runs kept, and per-case cleanup below handles the
+            cases that actually get rerun.
+        resume: skip any case that already has a completed, non-quota-
+            affected replay run for this `(dataset, system)`; rerun (after
+            deleting the stale row) any case whose prior run failed or was
+            itself cut short by quota exhaustion. See the module docstring's
+            "resume/stop_on_quota" judgment call — this is what makes a
+            multi-day replay against a free-tier LLM API make forward
+            progress instead of restarting from zero every day.
+        stop_on_quota: stop the walk (returning immediately, `cases`
+            reflecting only what was visited so far) the moment a case's run
+            shows `run_steps` evidence of daily LLM-quota exhaustion. That
+            case's run is deleted first, so a later `resume=True` call redoes
+            exactly it rather than skipping it as "completed".
 
     Raises `LookupError` if the dataset has no cases, and `ValueError` for a
     system with no runner.
@@ -296,7 +425,11 @@ def run_replay(
             f"(this module ships {sorted(SYSTEM_RUNNERS)})"
         )
 
-    replaced = clear_replay_runs(conn, dataset_id=dataset_id, system=system_name) if replace else 0
+    replaced = (
+        clear_replay_runs(conn, dataset_id=dataset_id, system=system_name)
+        if replace and not resume
+        else 0
+    )
 
     outcomes: list[CaseOutcome] = []
     actions: dict[str, int] = {}
@@ -306,6 +439,7 @@ def run_replay(
     completed = 0
     violations = 0
     errors = 0
+    skipped = 0
     archive_cases = 0
     seen = 0
 
@@ -325,6 +459,22 @@ def run_replay(
                 if limit_cases is not None and seen >= limit_cases:
                     break
                 seen += 1
+
+                if resume:
+                    prior = _case_run_rows(
+                        conn,
+                        dataset_id=dataset_id,
+                        system=system_name,
+                        input_url=row["canonical_url"],
+                        replay_at=row["replay_at"],
+                    )
+                    done = [r for r in prior if r["status"] == "completed"]
+                    if done and not any(_run_quota_detail(conn, r["id"]) is not None for r in done):
+                        skipped += 1
+                        continue
+                    if prior:
+                        _delete_run_ids(conn, [r["id"] for r in prior])
+
                 outcome = _replay_one(
                     conn,
                     cfg,
@@ -335,6 +485,32 @@ def run_replay(
                     replay_at=replay_at,
                     collection_status_csv=collection_status_csv,
                 )
+
+                if stop_on_quota and outcome.run_id is not None:
+                    quota_text = _run_quota_detail(conn, outcome.run_id)
+                    if quota_text is not None:
+                        _delete_run_ids(conn, [outcome.run_id])
+                        outcomes.append(outcome)
+                        return ReplayRunSummary(
+                            dataset_id=dataset_id,
+                            system=system_name,
+                            cases=seen,
+                            completed=completed,
+                            violations=violations,
+                            errors=errors,
+                            replaced_runs=replaced,
+                            skipped=skipped,
+                            action_distribution=actions,
+                            posting_state_distribution=states,
+                            evidence_quality_distribution=qualities,
+                            probe_counts=probe_counts,
+                            cases_with_archive_state=archive_cases,
+                            outcomes=tuple(outcomes),
+                            stopped_reason="quota_exhausted",
+                            quota_detail=quota_text,
+                            resume_after=to_utc_z(_next_quota_reset()),
+                        )
+
                 outcomes.append(outcome)
                 if outcome.archive_state_claims:
                     archive_cases += 1
@@ -358,6 +534,7 @@ def run_replay(
         violations=violations,
         errors=errors,
         replaced_runs=replaced,
+        skipped=skipped,
         action_distribution=actions,
         posting_state_distribution=states,
         evidence_quality_distribution=qualities,
@@ -444,3 +621,87 @@ def _replay_one(
         exposed_probes=tuple(name for name, _ in store.exposed),
         archive_state_claims=len(archive_claims),
     )
+
+
+# ---------------------------------------------------------------------------
+# Dataset status (for `rli replay status` / a multi-day System C replay)
+# ---------------------------------------------------------------------------
+
+
+class SystemCaseStatus(BaseModel):
+    """One system's completion count against one dataset's case grid."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    system: str
+    total: int
+    completed: int
+    remaining: int
+
+
+class ReplayDatasetStatus(BaseModel):
+    """Per-system case totals for a replay dataset (spec.md §6, PLAN.md M5).
+
+    "Completed" here means exactly what `run_replay(resume=True)` would skip:
+    a completed run with no quota-exhaustion signature in its `run_steps`. A
+    quota-cut run counts as still remaining, since `resume=True` reruns it.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    dataset_id: str
+    total_cases: int
+    by_system: tuple[SystemCaseStatus, ...]
+
+    def describe(self) -> str:
+        lines = [f"replay dataset {self.dataset_id!r}: {self.total_cases} case(s)"]
+        for s in self.by_system:
+            lines.append(
+                f"  {s.system}: completed={s.completed} remaining={s.remaining} total={s.total}"
+            )
+        return "\n".join(lines)
+
+    def __str__(self) -> str:  # pragma: no cover - trivial delegation
+        return self.describe()
+
+
+#: systems `runs.system`'s CHECK constraint allows; status is reported for all four
+#: unconditionally so a fresh, never-replayed dataset still shows "remaining = total".
+_ALL_SYSTEMS = ("A", "B", "C", "C2")
+
+
+def dataset_status(conn: sqlite3.Connection, *, dataset_id: str) -> ReplayDatasetStatus:
+    """Per-system `(completed, remaining)` counts over `dataset_id`'s case grid.
+
+    O(cases × systems) with one `_case_run_rows` query per case per system —
+    fine for this project's dataset sizes (hundreds to ~1300 cases). Raises
+    `LookupError` for an unbuilt dataset, matching `run_replay`'s message
+    shape, so a caller can rely on the same exception either way.
+    """
+    rows = dataset_case_rows(conn, dataset_id)
+    if not rows:
+        raise LookupError(
+            f"replay dataset {dataset_id!r} has no cases; build it first (`rli replay build`)"
+        )
+
+    total = len(rows)
+    by_system = []
+    for system in _ALL_SYSTEMS:
+        completed = 0
+        for row in rows:
+            prior = _case_run_rows(
+                conn,
+                dataset_id=dataset_id,
+                system=system,
+                input_url=row["canonical_url"],
+                replay_at=row["replay_at"],
+            )
+            done = [r for r in prior if r["status"] == "completed"]
+            if done and not any(_run_quota_detail(conn, r["id"]) is not None for r in done):
+                completed += 1
+        by_system.append(
+            SystemCaseStatus(
+                system=system, total=total, completed=completed, remaining=total - completed
+            )
+        )
+    return ReplayDatasetStatus(dataset_id=dataset_id, total_cases=total, by_system=tuple(by_system))
