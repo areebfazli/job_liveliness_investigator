@@ -881,33 +881,48 @@ def test_from_config_model_id_override_is_used_for_the_call_and_the_price(
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def local_cfg(cfg: Config) -> Config:
+    """`cfg` re-pointed at a local, credential-free endpoint.
+
+    `endpoint_unavailable_reason` short-circuits on "remote base_url and no
+    API key in the environment" before it ever touches the network, so tests
+    that mock `/models` must not depend on where the shipped config.toml
+    happens to point this deployment.
+    """
+    llm = cfg.llm.model_copy(
+        update={"base_url": "http://localhost:11434/v1", "api_key_env": "LLM_API_KEY"}
+    )
+    return cfg.model_copy(update={"llm": llm})
+
+
 @respx.mock
-def test_a_reachable_endpoint_has_no_unavailable_reason(cfg: Config) -> None:
-    respx.get(f"{cfg.llm.base_url}/models").mock(
+def test_a_reachable_endpoint_has_no_unavailable_reason(local_cfg: Config) -> None:
+    respx.get(f"{local_cfg.llm.base_url}/models").mock(
         return_value=httpx.Response(200, json={"data": []})
     )
-    assert endpoint_unavailable_reason(cfg) is None
+    assert endpoint_unavailable_reason(local_cfg) is None
 
 
 @respx.mock
-def test_an_unreachable_endpoint_reports_why(cfg: Config) -> None:
-    respx.get(f"{cfg.llm.base_url}/models").mock(side_effect=httpx.ConnectError("refused"))
-    reason = endpoint_unavailable_reason(cfg)
+def test_an_unreachable_endpoint_reports_why(local_cfg: Config) -> None:
+    respx.get(f"{local_cfg.llm.base_url}/models").mock(side_effect=httpx.ConnectError("refused"))
+    reason = endpoint_unavailable_reason(local_cfg)
     assert reason is not None and "not reachable" in reason
 
 
 @respx.mock
-def test_a_404_on_models_still_counts_as_reachable(cfg: Config) -> None:
+def test_a_404_on_models_still_counts_as_reachable(local_cfg: Config) -> None:
     # Not every compatible server implements /models; a 404 still proves a
     # server answered.
-    respx.get(f"{cfg.llm.base_url}/models").mock(return_value=httpx.Response(404))
-    assert endpoint_unavailable_reason(cfg) is None
+    respx.get(f"{local_cfg.llm.base_url}/models").mock(return_value=httpx.Response(404))
+    assert endpoint_unavailable_reason(local_cfg) is None
 
 
 @respx.mock
-def test_rejected_credentials_are_reported(cfg: Config) -> None:
-    respx.get(f"{cfg.llm.base_url}/models").mock(return_value=httpx.Response(401))
-    reason = endpoint_unavailable_reason(cfg)
+def test_rejected_credentials_are_reported(local_cfg: Config) -> None:
+    respx.get(f"{local_cfg.llm.base_url}/models").mock(return_value=httpx.Response(401))
+    reason = endpoint_unavailable_reason(local_cfg)
     assert reason is not None and "credentials" in reason
 
 

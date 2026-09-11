@@ -507,3 +507,8 @@ min_accuracy_gain = 0.0
 seed = 20260607
 max_iter = 1000
 c = 1.0
+
+# Free tier bills $0 (paid tier list price: $0.30 in / $2.50 out per MTok).
+[llm.prices."gemini-3.5-flash-lite"]
+input_usd_per_mtok = 0.0
+output_usd_per_mtok = 0.0
