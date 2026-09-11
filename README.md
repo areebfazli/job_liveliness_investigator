@@ -114,19 +114,19 @@ protocol works and switching providers is a two-line config change.
 
 Three ways to point it somewhere, in `config.toml`'s `[llm]` table:
 
-**1. Google Gemini's free tier (the shipped default — an API key, no local
+**1. Mistral's free Experiment tier (the shipped default — an API key, no local
 RAM, but data leaves the machine — see below).**
 
 ```bash
-export GEMINI_API_KEY=...     # https://aistudio.google.com/apikey
+export MISTRAL_API_KEY=...    # https://console.mistral.ai (free Experiment plan; phone verification, no card)
 ```
 
 ```toml
 [llm]
 provider = "openai_compatible"
-base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
-model_id = "gemini-3.5-flash-lite"
-api_key_env = "GEMINI_API_KEY"
+base_url = "https://api.mistral.ai/v1"
+model_id = "ministral-14b-latest"
+api_key_env = "MISTRAL_API_KEY"
 ```
 
 #### What is sent to the LLM endpoint
@@ -141,9 +141,9 @@ whichever `base_url` is configured:
   by default)
 - the computed policy inputs (the fields the LLM prompt is built from)
 
-No user notes or outcomes are sent. With the shipped Gemini default, this
+No user notes or outcomes are sent. With the shipped Mistral default, this
 data leaves the machine and reaches Google's free tier; free-tier prompts
-sent to Gemini (and other free tiers, e.g. Mistral's "Experiment" tier) may
+sent to Mistral's Experiment tier (and other free tiers, e.g. Google Gemini's) may
 be used by the provider for model training. Provider terms around this can
 change, so check them before relying on any particular data-use posture.
 The local-Ollama option below is the no-egress alternative — with it,
@@ -258,8 +258,8 @@ percentage or headcount. Events live in `data/events/company_events.csv` and
 must be loaded with `rli load-events` before any run or evaluation; an earlier
 evaluation was generated before that step existed and saw no events at all.
 
-**The shipped default sends data to Google Gemini, not a local model.**
-`config.toml`'s `[llm]` table defaults to Gemini's free tier
+**The shipped default sends data to Mistral, not a local model.**
+`config.toml`'s `[llm]` table defaults to Mistral's free Experiment tier
 (`generativelanguage.googleapis.com`); every System C call sends the
 posting URL/title, company name, evidence claim values (including
 third-party news headline text), the truncated raw excerpt, and the

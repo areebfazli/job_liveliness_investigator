@@ -357,33 +357,33 @@ min_coverage = 0.5
 # path no longer exists fails loudly at load time instead of being ignored.
 provider = "openai_compatible"
 
-# Default: Google Gemini's free tier (generativelanguage.googleapis.com),
-# NOT a local model. Every call over the network to this endpoint sends:
+# Default: Mistral's free "Experiment" tier (api.mistral.ai), NOT a local
+# model. Every call over the network to this endpoint sends:
 #   - the posting URL and title, and the company name
 #   - evidence claim values (including third-party news headline text
 #     surfaced by the `company_events` probe)
 #   - the raw-excerpt text, truncated to [agent].max_excerpt_chars (400 by
 #     default)
 #   - the computed policy inputs (the fields the LLM prompt is built from)
-# No user notes or outcomes are sent. Free-tier prompts sent to Gemini (and
-# other free tiers, e.g. Mistral's "Experiment" tier) may be used by the
-# provider for model training — check the provider's current terms, since
+# No user notes or outcomes are sent. Free-tier prompts sent to Mistral's
+# Experiment tier (and other free tiers, e.g. Google Gemini's) may be used by
+# the provider for model training — check the provider's current terms, since
 # these change; this is not something this project's config can control.
 # For a no-egress alternative, see the commented-out local Ollama block
 # below.
-base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+base_url = "https://api.mistral.ai/v1"
 
 # Name of the environment variable holding the API key — NOT the key.
-api_key_env = "GEMINI_API_KEY"
+api_key_env = "MISTRAL_API_KEY"
 
 # Model used by System C's investigator and explanation calls. Both prompts
 # demand a JSON object matching a schema, so pick a model that can actually
 # hold a structured format.
-model_id = "gemini-3.5-flash-lite"
+model_id = "ministral-14b-latest"
 
 # ---------------------------------------------------------------------------
 # No-egress alternative: a local Ollama. Free, no API key, nothing leaves
-# the machine. Uncomment to use instead of the live Gemini block above.
+# the machine. Uncomment to use instead of the live Mistral block above.
 #
 #   ollama serve && ollama pull qwen3:8b
 #
@@ -413,14 +413,15 @@ max_retries = 3
 
 # Client-side throttle: minimum spacing (in requests/minute) the client
 # imposes on its OWN outgoing calls, independent of and in addition to
-# max_retries. Gemini's free tier for gemini-3.5-flash-lite is ~15 RPM;
-# staying under it here means most calls never see a 429 at all, rather than
-# retrying into one. Set to 0 to disable (unthrottled). This costs nothing on
+# max_retries. Measured 2026-09-11 from Mistral's x-ratelimit headers:
+# ministral-14b-latest allows 30 RPM (ministral-8b 188, ministral-3b 750;
+# Google Gemini flash-lite is 15 RPM and 500/day). Staying under the limit
+# means most calls never see a 429 at all, rather than retrying into one. Set to 0 to disable (unthrottled). This costs nothing on
 # replay: CachedClient serves a hit for every previously-answered case
 # without going anywhere near the network, so a conservative cap here only
 # ever slows down cache MISSES (a changed prompt, a new case), never a replay
 # of an already-cached run.
-requests_per_minute = 10
+requests_per_minute = 25
 
 # Ceiling on how long one 429 retry may wait (seconds), overriding both the
 # `Retry-After` header and the 429 backoff schedule when both would go
@@ -525,5 +526,10 @@ c = 1.0
 
 # Free tier bills $0 (paid tier list price: $0.30 in / $2.50 out per MTok).
 [llm.prices."gemini-3.5-flash-lite"]
+input_usd_per_mtok = 0.0
+output_usd_per_mtok = 0.0
+
+# Mistral Experiment tier bills $0 (paid list price ~$0.20 in / $0.20 out per MTok).
+[llm.prices."ministral-14b-latest"]
 input_usd_per_mtok = 0.0
 output_usd_per_mtok = 0.0
