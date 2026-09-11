@@ -12,6 +12,13 @@ All commands assume you are in the repo root and have run `uv sync`. Use a
 scratch path for `--db` / `RLI_DB_PATH`, e.g. under `/tmp`, so nothing here
 touches `data/rli.db`.
 
+**If you have set `RLI_API_TOKEN`,** every `curl` call below against
+`POST /investigate` or `GET /watch*` needs an extra header:
+`-H "Authorization: Bearer $RLI_API_TOKEN"`. The examples below assume
+`RLI_API_TOKEN` is unset (the API bound to loopback, unauthenticated), which
+is the default for a scratch demo database; add the header to each call if
+you have configured a token.
+
 ```bash
 export DB=/tmp/rli-demo.db
 uv run rli init-db --path "$DB"

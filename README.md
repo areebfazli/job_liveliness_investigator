@@ -114,8 +114,42 @@ protocol works and switching providers is a two-line config change.
 
 Three ways to point it somewhere, in `config.toml`'s `[llm]` table:
 
-**1. A local model with Ollama (the shipped default — free, no API key, no
-data leaves the machine).**
+**1. Google Gemini's free tier (the shipped default — an API key, no local
+RAM, but data leaves the machine — see below).**
+
+```bash
+export GEMINI_API_KEY=...     # https://aistudio.google.com/apikey
+```
+
+```toml
+[llm]
+provider = "openai_compatible"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+model_id = "gemini-3.5-flash-lite"
+api_key_env = "GEMINI_API_KEY"
+```
+
+#### What is sent to the LLM endpoint
+
+Every System C investigator/explanation call sends, over the network, to
+whichever `base_url` is configured:
+
+- the posting URL and title, and the company name
+- evidence claim values (including third-party news headline text surfaced
+  by the `company_events` probe)
+- the raw-excerpt text, truncated to `[agent].max_excerpt_chars` (400 chars
+  by default)
+- the computed policy inputs (the fields the LLM prompt is built from)
+
+No user notes or outcomes are sent. With the shipped Gemini default, this
+data leaves the machine and reaches Google's free tier; free-tier prompts
+sent to Gemini (and other free tiers, e.g. Mistral's "Experiment" tier) may
+be used by the provider for model training. Provider terms around this can
+change, so check them before relying on any particular data-use posture.
+The local-Ollama option below is the no-egress alternative — with it,
+nothing in the list above leaves the machine.
+
+**2. A local model with Ollama (no API key, no data leaves the machine).**
 
 ```bash
 ollama serve                 # in its own shell
@@ -133,20 +167,6 @@ model_id = "qwen3:8b"
 Pick a model that can hold a structured output format: both System C prompts
 demand a JSON object matching a schema. On a CPU-only machine expect tens of
 seconds per call, so raise `[llm].timeout_s` rather than lowering it.
-
-**2. Google Gemini's free tier (an API key, no local RAM).**
-
-```bash
-export GEMINI_API_KEY=...     # https://aistudio.google.com/apikey
-```
-
-```toml
-[llm]
-provider = "openai_compatible"
-base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
-model_id = "gemini-2.5-flash"
-api_key_env = "GEMINI_API_KEY"
-```
 
 **3. Any other OpenAI-compatible endpoint** — vLLM, llama.cpp's server, LM
 Studio, OpenAI, an internal gateway. Set `base_url`, `model_id`, and
@@ -238,6 +258,16 @@ percentage or headcount. Events live in `data/events/company_events.csv` and
 must be loaded with `rli load-events` before any run or evaluation; an earlier
 evaluation was generated before that step existed and saw no events at all.
 
+**The shipped default sends data to Google Gemini, not a local model.**
+`config.toml`'s `[llm]` table defaults to Gemini's free tier
+(`generativelanguage.googleapis.com`); every System C call sends the
+posting URL/title, company name, evidence claim values (including
+third-party news headline text), the truncated raw excerpt, and the
+computed policy inputs to that endpoint, and free-tier prompts may be used
+by the provider for training. See "LLM setup (System C)" above — in
+particular "What is sent to the LLM endpoint" — for the full disclosure and
+for the no-egress local-Ollama alternative.
+
 **System C (the LLM agent) has not been exercised live in this
 environment.** No LLM endpoint was reachable during development or in the
 last evaluation run, so System C's investigator/controller loop has 1,103
@@ -318,7 +348,7 @@ uvicorn.
   the spec §1 decision fields plus `run_id`, `system_used`, `degraded`,
   `degraded_reason`.
 - `GET /runs/{run_id}` — the internal `run_steps` trace, only when header
-  `X-RLI-Debug: 1` is sent **and** `RLI_API_DEBUG_ROUTES` is on (the
+  `X-RLI-Debug: 1` is sent **and** `RLI_API_DEBUG_ROUTES` is on (**off** by
   default); `404` otherwise.
 - `POST /outcomes {run_id|posting_id, outcome, occurred_at?, note?}` —
   records one of `applied | reply | screen | interview | offer | rejection
@@ -331,9 +361,23 @@ uvicorn.
 
 Settings are environment variables, not `config.toml` (Phase 5 was not
 allowed to touch the frozen config system): `RLI_DB_PATH` (default
-`./data/rli.db`), `RLI_API_DEBUG_ROUTES` (default on), `RLI_WATCH_STORE_PATH`
-(default `./data/watches.json`), `RLI_API_HOST` (default `127.0.0.1`),
-`RLI_API_PORT` (default `8000`).
+`./data/rli.db`), `RLI_API_DEBUG_ROUTES` (default **off**),
+`RLI_WATCH_STORE_PATH` (default `./data/watches.json`), `RLI_API_HOST`
+(default `127.0.0.1`), `RLI_API_PORT` (default `8000`).
+
+- `RLI_API_TOKEN` — bearer token guarding the API. When set, every route
+  except `GET /health` and `GET /` requires `Authorization: Bearer
+  <token>`; requests without a matching header are rejected. When unset,
+  the API is open (no auth on any route) but `python -m rli.api` refuses to
+  start unless `RLI_API_HOST` is a loopback address (`127.0.0.1`,
+  `localhost`, or `::1`).
+- `RLI_API_RPM` — requests/minute per client IP allowed on `POST
+  /investigate` and `GET /watch/due` (the two routes that spend LLM/network
+  budget), default `10`; exceeding it returns `429`.
+- **Loopback rule, restated:** unset `RLI_API_TOKEN` + a non-loopback
+  `RLI_API_HOST` → the process refuses to start. Unset `RLI_API_TOKEN` +
+  a loopback `RLI_API_HOST` → the process starts, but logs a startup
+  warning that it is running unauthenticated.
 
 `rli/ui/index.html` is a single self-contained HTML+vanilla-JS page: a URL
 input with a system selector, the recommended action / posting state /

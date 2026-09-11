@@ -41,6 +41,7 @@ app = typer.Typer(
     name="agent",
     help="System C: the bounded LLM agent loop, plus its run_steps trace (spec.md §2/§4/§7).",
     no_args_is_help=True,
+    pretty_exceptions_show_locals=False,
 )
 
 DEFAULT_DB_PATH = "./data/rli.db"

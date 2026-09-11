@@ -6,11 +6,19 @@ sqlite3 connection and reshapes their `RunResult` into JSON. It owns no
 evaluation logic of its own.
 
 Settings that would normally live in `rli.config.Config` (db path, whether
-the debug trace route is exposed, host/port, the watch-list JSON file path)
-are instead environment-driven (`rli.api.settings.ApiSettings`) because
-`Config` is frozen with `extra="forbid"` and Phase 5 is not allowed to edit
-`rli/config.py` or `config.toml`. See `rli/api/settings.py`'s docstring for
-the full rationale.
+the debug trace route is exposed, host/port, the watch-list JSON file path,
+the bearer token, the per-client rate limit) are instead environment-driven
+(`rli.api.settings.ApiSettings`) because `Config` is frozen with
+`extra="forbid"` and Phase 5 is not allowed to edit `rli/config.py` or
+`config.toml`. See `rli/api/settings.py`'s docstring for the full rationale.
+
+Authentication: every endpoint that spends LLM quota, fetches from the
+network, or writes to the database requires `Authorization: Bearer
+<RLI_API_TOKEN>` when that variable is set, and is open when it is not —
+the unauthenticated mode is safe only behind the default loopback bind,
+which `rli.api.settings.startup_security_error` enforces at process start.
+`GET /health` and `GET /` (the UI shell, which holds no data of its own)
+are always open so a health check and a browser can reach them.
 
 Connection lifecycle: one `sqlite3.Connection` is opened per request (via
 `rli.db.connect`) and always closed in a `finally` block. FastAPI runs sync
@@ -21,6 +29,8 @@ waiting to happen under concurrent requests.
 
 from __future__ import annotations
 
+import logging
+import secrets
 import sqlite3
 import traceback
 from collections.abc import AsyncIterator
@@ -28,10 +38,11 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+from rli.api.ratelimit import RateLimiter
 from rli.api.settings import ApiSettings
 from rli.api.watch_logic import add_watch, check_due_watches
 from rli.config import load_config
@@ -47,6 +58,8 @@ from rli.llm.client import (
 )
 from rli.models.time import now_utc, parse_utc, to_utc_z
 from rli.net import DisallowedHostError, check_allowed
+
+_LOG = logging.getLogger("rli.api")
 
 _UI_INDEX = Path(__file__).parent.parent / "ui" / "index.html"
 
@@ -64,7 +77,10 @@ class OutcomeRequest(BaseModel):
     posting_id: str | None = None
     outcome: OutcomeType
     occurred_at: str | None = None
-    note: str | None = None
+    # Capped rather than unbounded: `notes` is persisted verbatim and echoed
+    # back, so an unbounded field is a free write-amplification primitive.
+    # Pydantic rejects an over-long note as a 422 before the handler runs.
+    note: str | None = Field(default=None, max_length=2000)
 
 
 class WatchRequest(BaseModel):
@@ -111,8 +127,54 @@ def create_app(
     db_path: str | None = None,
     *,
     watch_store_path: str | None = None,
+    debug_routes: bool | None = None,
+    api_token: str | None = None,
+    rate_limit_rpm: int | None = None,
 ) -> FastAPI:
-    settings = ApiSettings.from_env(db_path=db_path, watch_store_path=watch_store_path)
+    settings = ApiSettings.from_env(
+        db_path=db_path,
+        watch_store_path=watch_store_path,
+        debug_routes=debug_routes,
+        api_token=api_token,
+        rate_limit_rpm=rate_limit_rpm,
+    )
+    limiter = RateLimiter(settings.rate_limit_rpm)
+
+    def require_auth(authorization: str | None = Header(default=None)) -> None:
+        """Reject the request unless it carries the configured bearer token.
+
+        A no-op when no token is configured: that is the default single-user
+        loopback mode, which the entrypoint refuses to start on a non-loopback
+        bind. The comparison is `secrets.compare_digest` so a wrong token
+        cannot be recovered a byte at a time from response timing.
+        """
+        if not settings.api_token:
+            return
+        prefix = "Bearer "
+        provided = (
+            authorization[len(prefix) :]
+            if authorization and authorization.startswith(prefix)
+            else ""
+        )
+        if not secrets.compare_digest(provided, settings.api_token):
+            raise HTTPException(
+                status_code=401,
+                detail="unauthorized",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+    def enforce_rate_limit(request: Request) -> None:
+        """429 when this client has burned its per-minute budget.
+
+        Applied only to the two routes that can spend money or reach the
+        network on a single call (`/investigate`, `/watch/due`); the cheap
+        local-read routes are covered by the token alone.
+        """
+        client_key = request.client.host if request.client else "unknown"
+        if not limiter.allow(client_key):
+            raise HTTPException(status_code=429, detail="rate limit exceeded")
+
+    auth_only = [Depends(require_auth)]
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -123,6 +185,13 @@ def create_app(
         # request) runs this, and by then `settings.db_path` already carries
         # whatever scratch path the caller injected.
         init_db(settings.db_path)
+        if not settings.api_token:
+            _LOG.warning(
+                "RLI_API_TOKEN is not set: /investigate, /outcomes and /watch are "
+                "open to anyone who can reach this process, which is safe only "
+                "because it is trusting its bind host (%s) to be loopback.",
+                settings.host,
+            )
         yield
 
     app = FastAPI(title="Role-Liveness Investigator", lifespan=lifespan)
@@ -131,8 +200,10 @@ def create_app(
     # ------------------------------------------------------------------ #
     # /investigate
     # ------------------------------------------------------------------ #
-    @app.post("/investigate")
-    def investigate(body: InvestigateRequest) -> JSONResponse:
+    @app.post("/investigate", dependencies=auth_only)
+    def investigate(body: InvestigateRequest, request: Request) -> JSONResponse:
+        enforce_rate_limit(request)
+
         cfg = load_config()
         try:
             check_allowed(body.url, cfg.allowlists.json_ld)
@@ -206,7 +277,7 @@ def create_app(
     # ------------------------------------------------------------------ #
     # /runs/{run_id} — internal/debug only
     # ------------------------------------------------------------------ #
-    @app.get("/runs/{run_id}")
+    @app.get("/runs/{run_id}", dependencies=auth_only)
     def get_run(run_id: str, x_rli_debug: str | None = Header(default=None)) -> JSONResponse:
         if not settings.debug_routes or x_rli_debug != "1":
             raise HTTPException(status_code=404, detail="not found")
@@ -232,7 +303,7 @@ def create_app(
     # ------------------------------------------------------------------ #
     # /outcomes
     # ------------------------------------------------------------------ #
-    @app.post("/outcomes")
+    @app.post("/outcomes", dependencies=auth_only)
     def create_outcome(body: OutcomeRequest) -> JSONResponse:
         if not body.posting_id and not body.run_id:
             raise HTTPException(
@@ -256,6 +327,23 @@ def create_app(
                     )
 
             occurred_at = parse_utc(body.occurred_at) if body.occurred_at else now_utc()
+            occurred_at_z = to_utc_z(occurred_at)
+
+            # `outcomes` has no uniqueness constraint (Phase 5 may not edit
+            # rli/db/schema.sql), and the UI's "Save outcome" button is a
+            # trivial double-click away from writing the same event twice.
+            # SELECT-then-INSERT, so two *concurrent* identical requests can
+            # still both land: an accepted residual for a single-user local
+            # tool, and strictly better than no check at all.
+            duplicate = conn.execute(
+                """
+                SELECT 1 FROM outcomes
+                WHERE posting_id = ? AND outcome_type = ? AND occurred_at = ?
+                """,
+                (posting_id, body.outcome, occurred_at_z),
+            ).fetchone()
+            if duplicate is not None:
+                raise HTTPException(status_code=409, detail="duplicate outcome")
 
             try:
                 cursor = conn.execute(
@@ -263,7 +351,7 @@ def create_app(
                     INSERT INTO outcomes (posting_id, outcome_type, occurred_at, notes)
                     VALUES (?, ?, ?, ?)
                     """,
-                    (posting_id, body.outcome, to_utc_z(occurred_at), body.note),
+                    (posting_id, body.outcome, occurred_at_z, body.note),
                 )
                 conn.commit()
             except sqlite3.IntegrityError as exc:
@@ -275,7 +363,7 @@ def create_app(
                     "id": cursor.lastrowid,
                     "posting_id": posting_id,
                     "outcome": body.outcome,
-                    "occurred_at": to_utc_z(occurred_at),
+                    "occurred_at": occurred_at_z,
                     "note": body.note,
                 },
             )
@@ -287,7 +375,7 @@ def create_app(
     # ------------------------------------------------------------------ #
     # /watch
     # ------------------------------------------------------------------ #
-    @app.post("/watch")
+    @app.post("/watch", dependencies=auth_only)
     def post_watch(body: WatchRequest) -> JSONResponse:
         cfg = load_config()
         try:
@@ -305,14 +393,16 @@ def create_app(
         finally:
             conn.close()
 
-    @app.get("/watch")
+    @app.get("/watch", dependencies=auth_only)
     def get_watch() -> JSONResponse:
         from rli.api.watch_store import load_watches
 
         return JSONResponse(load_watches(settings.watch_store_path))
 
-    @app.get("/watch/due")
-    def get_watch_due() -> JSONResponse:
+    @app.get("/watch/due", dependencies=auth_only)
+    def get_watch_due(request: Request) -> JSONResponse:
+        enforce_rate_limit(request)
+
         cfg = load_config()
         conn = connect(settings.db_path)
         try:

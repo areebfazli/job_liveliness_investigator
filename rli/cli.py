@@ -26,16 +26,19 @@ app = typer.Typer(
     name="rli",
     help="Role-Liveness Investigator — evidence-backed job posting liveness analysis.",
     no_args_is_help=True,
+    pretty_exceptions_show_locals=False,
 )
 replay_app = typer.Typer(
     name="replay",
     help="Point-in-time replay (spec.md §6): build a dataset, replay a system, audit leakage.",
     no_args_is_help=True,
+    pretty_exceptions_show_locals=False,
 )
 eval_app = typer.Typer(
     name="eval",
     help="Evaluation reports (spec.md §6): A/B baseline metrics and posting-behavior curves.",
     no_args_is_help=True,
+    pretty_exceptions_show_locals=False,
 )
 app.add_typer(agent_app, name="agent")
 app.add_typer(archive_app, name="archive")

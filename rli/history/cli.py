@@ -56,6 +56,7 @@ app = typer.Typer(
     name="history",
     help="Closure derivation, repost matching and the hand-check match sample.",
     no_args_is_help=True,
+    pretty_exceptions_show_locals=False,
 )
 
 DEFAULT_DB_PATH = "./data/rli.db"

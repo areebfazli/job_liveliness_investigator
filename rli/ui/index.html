@@ -136,6 +136,13 @@
 <section>
   <h2>Investigate a posting</h2>
   <div class="row">
+    <div>
+      <label for="api-token-input">API token</label>
+      <input type="password" id="api-token-input" placeholder="optional — set only if RLI_API_TOKEN is configured" />
+      <small class="hint">Stored in this browser's localStorage; sent as an Authorization: Bearer header.</small>
+    </div>
+  </div>
+  <div class="row">
     <div style="flex: 3;">
       <label for="url-input">Job posting URL</label>
       <input type="url" id="url-input" placeholder="https://boards.greenhouse.io/acme/jobs/12345" />
@@ -242,6 +249,7 @@
   var lastUrl = null;
 
   var el = {
+    apiTokenInput: document.getElementById("api-token-input"),
     urlInput: document.getElementById("url-input"),
     systemSelect: document.getElementById("system-select"),
     investigateBtn: document.getElementById("investigate-btn"),
@@ -265,6 +273,26 @@
     outcomeBtn: document.getElementById("outcome-btn"),
     outcomeMsg: document.getElementById("outcome-msg"),
   };
+
+  var TOKEN_STORAGE_KEY = "rli_api_token";
+
+  function storedToken() {
+    try {
+      return window.localStorage.getItem(TOKEN_STORAGE_KEY) || "";
+    } catch (err) {
+      return "";
+    }
+  }
+
+  function authHeaders(base) {
+    var headers = {};
+    if (base) {
+      Object.keys(base).forEach(function (k) { headers[k] = base[k]; });
+    }
+    var token = storedToken().trim();
+    if (token) headers["Authorization"] = "Bearer " + token;
+    return headers;
+  }
 
   function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, function (c) {
@@ -374,7 +402,7 @@
       if (el.systemSelect.value) body.system = el.systemSelect.value;
       var resp = await fetch("/investigate", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify(body),
       });
       var data = await resp.json();
@@ -407,7 +435,7 @@
     try {
       var resp = await fetch("/outcomes", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({
           run_id: lastRunId,
           outcome: el.outcomeSelect.value,
@@ -438,7 +466,7 @@
     try {
       var resp = await fetch("/watch", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ url: url }),
       });
       var data = await resp.json();
@@ -458,7 +486,7 @@
   async function checkDueWatches() {
     el.watchDueBtn.disabled = true;
     try {
-      var resp = await fetch("/watch/due");
+      var resp = await fetch("/watch/due", { headers: authHeaders() });
       var data = await resp.json();
       if (!resp.ok) {
         el.watchDueList.innerHTML =
@@ -485,6 +513,19 @@
     }
   }
 
+  el.apiTokenInput.value = storedToken();
+  el.apiTokenInput.addEventListener("input", function () {
+    var token = el.apiTokenInput.value.trim();
+    try {
+      if (token) {
+        window.localStorage.setItem(TOKEN_STORAGE_KEY, token);
+      } else {
+        window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+      }
+    } catch (err) {
+      // ignore storage errors (e.g. some privacy modes)
+    }
+  });
   el.investigateBtn.addEventListener("click", investigate);
   el.outcomeBtn.addEventListener("click", saveOutcome);
   el.watchBtn.addEventListener("click", watchUrl);

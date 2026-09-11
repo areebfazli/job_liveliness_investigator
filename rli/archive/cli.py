@@ -29,6 +29,7 @@ app = typer.Typer(
     name="archive",
     help="Wayback Machine archive backfill for historical board snapshots.",
     no_args_is_help=True,
+    pretty_exceptions_show_locals=False,
 )
 
 DEFAULT_TARGETS_PATH = REPO_ROOT / "scripts" / "targets.csv"
