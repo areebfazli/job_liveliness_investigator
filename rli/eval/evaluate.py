@@ -185,7 +185,10 @@ from rli.eval.metrics import (
     agent_efficiency,
     collect_system_runs,
     data_quality,
+    era_boundary,
+    era_for,
     resolve_allowed_splits,
+    split_case_set_by_era,
     split_map_for_dataset,
 )
 from rli.eval.ranker import RankerConfig, RankerResult, evaluate_ranker
@@ -336,6 +339,21 @@ class SampleSizes(BaseModel):
     meets_companies: bool = False
     meets_closures: bool = False
 
+    #: spec.md §1's archive/live era split (see `rli.eval.metrics.era_boundary`).
+    #: `era_boundary` here is a plain field name, not the imported function of
+    #: the same name — it shadows that name only inside this class body.
+    #: `None` means this database has never recorded an own board snapshot, so
+    #: every case is archive-era.
+    era_boundary: str | None = None
+    live_era_cases: int = 0
+    archive_era_cases: int = 0
+    #: `live_era_cases / (live_era_cases + archive_era_cases)`, `None` only
+    #: when that denominator is 0 (an empty case set). With no own board
+    #: snapshot recorded yet every case is archive-era and this is a real
+    #: `0.0`, not `None`; the accompanying "no own board snapshots yet" line
+    #: is what tells the reader why, so the share stays a plain number.
+    live_era_share: float | None = None
+
     @property
     def headline_gate_met(self) -> bool:
         """All three spec.md §6 sample-size legs cleared.
@@ -360,6 +378,13 @@ class SampleSizes(BaseModel):
             f"companies={_flag(self.meets_companies)} "
             f"closures(corpus-wide)={_flag(self.meets_closures)}",
             f"  headline gate met: {_flag(self.headline_gate_met)}",
+            f"  era split: live={self.live_era_cases} archive={self.archive_era_cases} "
+            f"live-era_share={_pct(self.live_era_share)} boundary="
+            + (
+                self.era_boundary
+                if self.era_boundary is not None
+                else "(none — no own board snapshots yet, every case is archive-era)"
+            ),
         ]
         return "\n".join(lines)
 
@@ -388,8 +413,18 @@ class EvaluationReport(BaseModel):
     systems_run: dict[str, str]
     case_set: MetricsCaseSet
     efficiency: dict[str, EfficiencyMetrics]
+    #: Per-era (`"live-era"` / `"archive-era"`) copy of `efficiency`, keyed
+    #: `[era][system]`. Informational only — see `_era_split_section`; the
+    #: pooled `efficiency` above stays what every other section reads.
+    efficiency_by_era: dict[str, dict[str, EfficiencyMetrics]] = {}
     data_quality: DataQuality
     agent_gate: AgentGateResult
+    #: Informational, NON-authoritative re-run of `agent_gate` scoped to
+    #: live-era cases only (spec.md §1's era split). The pooled `agent_gate`
+    #: above remains the spec.md §6 verdict; this field never substitutes
+    #: for it. Always populated by `evaluate` (its `status` reads `not_run`
+    #: exactly when the pooled gate's does, e.g. System C absent).
+    live_era_gate: AgentGateResult
     product_gate: ProductGateResult
     ranker: RankerResult
     sample_sizes: SampleSizes
@@ -415,8 +450,16 @@ class EvaluationReport(BaseModel):
         lines.append("  " + self.case_set.describe().replace("\n", "\n  "))
         for name in _ordered_systems(self.efficiency):
             lines.append("  " + self.efficiency[name].describe().replace("\n", "\n  "))
+        for era in ("live-era", "archive-era"):
+            per_era = self.efficiency_by_era.get(era, {})
+            for name in _ordered_systems(per_era):
+                lines.append(f"  [{era}] " + per_era[name].describe().replace("\n", "\n  "))
         lines.append("  " + self.data_quality.describe().replace("\n", "\n  "))
         lines.append("  " + self.agent_gate.describe().replace("\n", "\n  "))
+        lines.append(
+            "  live-era gate (informational): "
+            + self.live_era_gate.describe().replace("\n", "\n  ")
+        )
         lines.append("  " + self.product_gate.describe().replace("\n", "\n  "))
         lines.append("  " + self.ranker.describe().replace("\n", "\n  "))
         if self.survival is None:
@@ -462,7 +505,13 @@ def _count(conn: sqlite3.Connection, sql: str, params: tuple[object, ...] = ()) 
     return int(value) if isinstance(value, int | float) else 0
 
 
-def _sample_sizes(conn: sqlite3.Connection, dataset_row: sqlite3.Row | None) -> SampleSizes:
+def _sample_sizes(
+    conn: sqlite3.Connection,
+    dataset_row: sqlite3.Row | None,
+    *,
+    case_set: MetricsCaseSet,
+    boundary: str | None,
+) -> SampleSizes:
     dataset_postings = int(dataset_row["postings"]) if dataset_row is not None else 0
     dataset_companies = int(dataset_row["companies"]) if dataset_row is not None else 0
     dataset_cases = int(dataset_row["cases"]) if dataset_row is not None else 0
@@ -477,6 +526,20 @@ def _sample_sizes(conn: sqlite3.Connection, dataset_row: sqlite3.Row | None) -> 
         conn, "SELECT COUNT(*) FROM postings WHERE first_seen_absent IS NOT NULL"
     )
 
+    # spec.md §1's archive/live era split, scoped to the same case set every
+    # other section reads (see `rli.eval.metrics.era_boundary` / `era_for`).
+    live_era_cases = sum(
+        1 for case in case_set.cases if era_for(case.replay_at, boundary) == "live-era"
+    )
+    archive_era_cases = len(case_set.cases) - live_era_cases
+    era_total = live_era_cases + archive_era_cases
+    # `None` ONLY when the denominator is 0 (an empty case set). A database
+    # with no own board snapshot yet still gets a real 0.0 here rather than
+    # `None`: "0% of these cases are live-era" is both true and the useful
+    # thing to print, and the reader is told WHY separately by the explicit
+    # "no own board snapshots yet" line that accompanies every render of it.
+    live_era_share = (live_era_cases / era_total) if era_total else None
+
     return SampleSizes(
         dataset_postings=dataset_postings,
         dataset_companies=dataset_companies,
@@ -487,6 +550,10 @@ def _sample_sizes(conn: sqlite3.Connection, dataset_row: sqlite3.Row | None) -> 
         meets_postings=dataset_postings >= SPEC_TARGET_POSTINGS,
         meets_companies=dataset_companies >= SPEC_TARGET_COMPANIES,
         meets_closures=corpus_closures >= SPEC_TARGET_CLOSURES,
+        era_boundary=boundary,
+        live_era_cases=live_era_cases,
+        archive_era_cases=archive_era_cases,
+        live_era_share=live_era_share,
     )
 
 
@@ -858,6 +925,10 @@ def evaluate(
         allowed_splits=resolved_splits,
     )
 
+    # --- era split (spec.md §1): archive-era vs. live-era, informational ---
+    boundary = era_boundary(conn)
+    era_case_sets = split_case_set_by_era(case_set, boundary)
+
     # --- the loud holdout marker -------------------------------------------
     holdout_runs_noted = 0
     holdout_cases = 0
@@ -884,6 +955,24 @@ def evaluate(
             allowed_splits=resolved_splits,
             case_set=case_set,
         )
+
+    # --- per-era, per-system efficiency (informational; see _era_split_section) --
+    efficiency_by_era: dict[str, dict[str, EfficiencyMetrics]] = {
+        "live-era": {},
+        "archive-era": {},
+    }
+    for era in ("live-era", "archive-era"):
+        for system in systems_evaluated:
+            efficiency_by_era[era][system] = agent_efficiency(
+                conn,
+                cfg,
+                dataset_id=dataset_id,
+                splits=splits,
+                system=system,
+                reference="A",
+                allowed_splits=resolved_splits,
+                case_set=era_case_sets[era],
+            )
 
     # --- data quality (scoped to A; see the module docstring) --------------
     dq_systems: tuple[str, ...] = (
@@ -927,6 +1016,22 @@ def evaluate(
     if extra_notes:
         gate = gate.model_copy(update={"notes": tuple(gate.notes) + tuple(extra_notes)})
 
+    # --- informational live-era gate (spec.md §1 era split) -----------------
+    # NOT the spec.md §6 verdict — the pooled `gate` above stays authoritative.
+    # Recomputed cleanly (no candidate_metrics/baseline_metrics passed) so it
+    # is correctly scoped to live-era cases rather than reusing pooled numbers.
+    live_era_gate = agent_gate(
+        conn,
+        cfg,
+        dataset_id=dataset_id,
+        splits=splits,
+        candidate="C",
+        baseline="B",
+        reference="A",
+        allowed_splits=resolved_splits,
+        case_set=era_case_sets["live-era"],
+    )
+
     outcomes_gate = product_gate(conn, splits=splits, system="A")
 
     # --- C2: learned probe ranking -----------------------------------------
@@ -962,7 +1067,7 @@ def evaluate(
     else:
         survival_note = "survival summary not requested (include_survival=False)"
 
-    sample_sizes = _sample_sizes(conn, dataset_row)
+    sample_sizes = _sample_sizes(conn, dataset_row, case_set=case_set, boundary=boundary)
 
     return EvaluationReport(
         dataset_id=dataset_id,
@@ -975,8 +1080,10 @@ def evaluate(
         systems_run=systems_run,
         case_set=case_set,
         efficiency=efficiency,
+        efficiency_by_era=efficiency_by_era,
         data_quality=dq,
         agent_gate=gate,
+        live_era_gate=live_era_gate,
         product_gate=outcomes_gate,
         ranker=ranker,
         sample_sizes=sample_sizes,
@@ -1027,13 +1134,31 @@ def _headline_section(report: EvaluationReport) -> list[str]:
                 _flag(sizes.meets_closures) + " (corpus-wide)",
             ],
             ["replay cases scored", str(sizes.dataset_cases), "—", "—", "—"],
+            [
+                "live-era cases (own board-snapshot coverage)",
+                str(sizes.live_era_cases),
+                "—",
+                "—",
+                "—",
+            ],
+            ["archive-era cases (Wayback-only)", str(sizes.archive_era_cases), "—", "—", "—"],
+            ["live-era share", _pct(sizes.live_era_share), "—", "—", "—"],
         ],
     )
     verdict = "**MET**" if sizes.headline_gate_met else "**NOT MET**"
+    boundary_line = (
+        f"Era boundary (own board-snapshot collection began): `{sizes.era_boundary}`. "
+        "See the 'Era split: live vs. archive' section below."
+        if sizes.era_boundary is not None
+        else "Era boundary: no own board snapshots yet — every case is archive-era. "
+        "See the 'Era split: live vs. archive' section below."
+    )
     return [
         "## Headline gate (sample sizes)",
         "",
         table,
+        "",
+        boundary_line,
         "",
         f"Headline gate: {verdict}.",
         "",
@@ -1087,6 +1212,169 @@ def _case_set_section(report: EvaluationReport) -> list[str]:
         "than defaulted into a split — an unknown split could, for all this report knows, "
         "be the holdout.",
     ]
+
+
+def _era_split_section(report: EvaluationReport) -> list[str]:
+    """spec.md §1's archive/live era split, read standalone (informational).
+
+    dev-300-v3 pools two eras: cases whose `replay_at` predates this
+    project's own board-snapshot collection rest on Wayback captures alone
+    (spec.md §1: weak evidence, no own `board_snapshots` corroboration by
+    construction — not because of anything either system under test did),
+    while cases at or after that instant also have an own
+    `board_snapshots` row available. This section shows each era on its own
+    so a reader can see how much of the pooled numbers above are carried by
+    the weaker archive-era slice. The pooled Agent gate section (rendered
+    later in this report) stays the authoritative spec.md §6 verdict;
+    nothing here overrides it.
+    """
+    sizes = report.sample_sizes
+    systems = _ordered_systems(report.efficiency)
+
+    boundary_line = (
+        f"Era boundary (own board-snapshot collection began): `{sizes.era_boundary}`."
+        if sizes.era_boundary is not None
+        else "Era boundary: no own board snapshots yet — every case is archive-era."
+    )
+    counts_line = (
+        f"Cases: live-era={sizes.live_era_cases}, archive-era={sizes.archive_era_cases}, "
+        f"live-era share={_pct(sizes.live_era_share)}."
+    )
+
+    lines = [
+        "## Era split: live vs. archive",
+        "",
+        "Archive-era cases are weak by construction, not because of anything either "
+        "system under test did. For any replay case whose `replay_at` predates this "
+        "project's own board-snapshot collection, the only observation available is a "
+        "Wayback capture, so `board_snapshot` evidence is sparse, `source_quality="
+        "'archive'`, and often absent entirely (spec.md §1 classifies Wayback-only "
+        "evidence as weak). Those cases carry no own board-snapshot corroboration by "
+        "construction — the boundary below is simply the instant this project's own "
+        "daily snapshots began, not a judgement about either system's behaviour, and "
+        "the pooled agreement figures elsewhere in this report average the two eras "
+        "together.",
+        "",
+        boundary_line,
+        "",
+        counts_line,
+        "",
+    ]
+
+    era_case_sets = split_case_set_by_era(report.case_set, sizes.era_boundary)
+
+    def _evidence_quality_distribution(era: str, system: str) -> dict[str, int]:
+        # `split_case_set_by_era` guarantees both `"live-era"` and
+        # `"archive-era"` keys are always present, so this indexes directly
+        # rather than falling back to `report.case_set` (POOLED) — a
+        # fallback to the pooled set would report pooled evidence_quality
+        # counts under an era label, exactly the bug this section exists to
+        # avoid.
+        counts: dict[str, int] = {}
+        for case in era_case_sets[era].cases:
+            run = case.runs.get(system)
+            if run is None:
+                continue
+            key = run.evidence_quality if run.evidence_quality is not None else "(missing)"
+            counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    for era, subtitle in (
+        ("live-era", " — product-relevant view"),
+        ("archive-era", ""),
+    ):
+        lines.append(f"### `{era}`{subtitle}")
+        lines.append("")
+        if not systems:
+            lines.append("(no systems evaluated)")
+            lines.append("")
+            continue
+        for system in systems:
+            metrics = report.efficiency_by_era.get(era, {}).get(system)
+            rows = [
+                [
+                    "action distribution",
+                    _render(metrics.action_distribution) if metrics is not None else "(none)",
+                ],
+                [
+                    "evidence_quality distribution",
+                    _render(_evidence_quality_distribution(era, system)),
+                ],
+                [
+                    "overall agreement with A",
+                    _pct(metrics.overall_agreement) if metrics is not None else _MISSING,
+                ],
+                [
+                    "macro agreement with A",
+                    _pct(metrics.macro_agreement) if metrics is not None else _MISSING,
+                ],
+                [
+                    "medium/high probes per run",
+                    _num(metrics.mean_medium_high_probes_per_run)
+                    if metrics is not None
+                    else _MISSING,
+                ],
+            ]
+            lines.append(f"**{system}**")
+            lines.append("")
+            lines.append(_markdown_table(["measure", "value"], rows))
+            lines.append("")
+
+    gate = report.live_era_gate
+    verdict = {
+        "pass": "**PASS**",
+        "fail": "**FAIL**",
+        "not_run": "**NOT RUN**",
+    }.get(gate.status, f"**{gate.status.upper()}**")
+
+    lines.append("### Live-era gate (informational)")
+    lines.append("")
+    lines.append(
+        "This is an INFORMATIONAL, NON-authoritative re-run of the spec.md §6 agent "
+        "gate, scoped to live-era cases only, using the same three legs and "
+        "thresholds. **The pooled 'Agent gate' section below remains the "
+        "authoritative spec.md §6 verdict** — nothing here replaces it; this exists "
+        "only to show whether that verdict would look different on the "
+        "product-relevant (live-era) slice."
+    )
+    lines.append("")
+    lines.append(
+        _markdown_table(
+            [
+                "leg",
+                f"candidate ({gate.candidate})",
+                f"baseline ({gate.baseline})",
+                "requirement",
+                "pass?",
+            ],
+            [
+                [
+                    "medium/high probes per run",
+                    _num(gate.candidate_medium_high_per_run),
+                    _num(gate.baseline_medium_high_per_run),
+                    f"ratio {_num(gate.probe_ratio)} <= {gate.probe_ratio_threshold:.2f}",
+                    _flag(gate.probe_use_pass),
+                ],
+                [
+                    "overall agreement with A",
+                    _pct(gate.candidate_overall_agreement),
+                    _pct(gate.baseline_overall_agreement),
+                    f">= {_pct(gate.overall_required)}",
+                    _flag(gate.overall_pass),
+                ],
+                [
+                    "macro agreement with A",
+                    _pct(gate.candidate_macro_agreement),
+                    _pct(gate.baseline_macro_agreement),
+                    f">= {_pct(gate.macro_required)}",
+                    _flag(gate.macro_pass),
+                ],
+            ],
+        )
+    )
+    lines.append("")
+    lines.append(f"Live-era gate verdict (informational, NON-authoritative): {verdict}.")
+    return lines
 
 
 def _action_distribution_section(report: EvaluationReport) -> list[str]:
@@ -1703,6 +1991,7 @@ def write_evaluation_report(path: str | Path, report: EvaluationReport) -> Path:
         _headline_section,
         _systems_section,
         _case_set_section,
+        _era_split_section,
         _action_distribution_section,
         _agreement_section,
         _cost_section,

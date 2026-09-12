@@ -60,6 +60,7 @@ REQUIRED_SECTIONS = (
     "## Headline gate (sample sizes)",
     "## Systems run",
     "## Case-set accounting",
+    "## Era split: live vs. archive",
     "## Action distributions",
     "## Agreement with System A",
     "### Per-class agreement",
@@ -346,6 +347,40 @@ def populated(conn: sqlite3.Connection) -> sqlite3.Connection:
     return conn
 
 
+def _add_board_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    captured_at: datetime,
+    source: str = "own",
+    coverage_status: str = "complete",
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO board_snapshots (company_id, captured_at, source, coverage_status)
+        VALUES (?, ?, ?, ?)
+        """,
+        (COMPANY, to_utc_z(captured_at), source, coverage_status),
+    )
+
+
+@pytest.fixture
+def populated_with_own_snapshots(conn: sqlite3.Connection) -> sqlite3.Connection:
+    """`populated`, plus one 'archive' and one 'own' board snapshot.
+
+    The 'archive' row is captured EARLIER than the 'own' row specifically to
+    prove `rli.eval.metrics.era_boundary`'s own-only filter matters: the
+    boundary must come from the 'own' row, never the earlier 'archive' one.
+    The 'own' row sits strictly between p1/p2's `replay_at`
+    (`CUTOFF - 20d`) and p3's (`CUTOFF + 5d`), so p1/p2 fall archive-era and
+    p3 falls live-era.
+    """
+    _populate(conn)
+    _add_board_snapshot(conn, captured_at=CUTOFF - timedelta(days=200), source="archive")
+    _add_board_snapshot(conn, captured_at=CUTOFF, source="own")
+    conn.commit()
+    return conn
+
+
 @pytest.fixture(autouse=True)
 def _no_llm_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     """System C must be unrunnable, which is the real-world state (contract §HARD).
@@ -564,6 +599,96 @@ def test_survival_path_degrades_gracefully_on_a_tiny_corpus(
 
 
 # ---------------------------------------------------------------------------
+# Era split: live vs. archive (spec.md §1)
+# ---------------------------------------------------------------------------
+
+
+def test_era_boundary_and_split_from_own_snapshots(
+    populated_with_own_snapshots: sqlite3.Connection, cfg: Config
+) -> None:
+    report = evaluate(populated_with_own_snapshots, cfg, dataset_id=DATASET, include_survival=False)
+
+    # The boundary is the OWN row's captured_at, never the earlier 'archive' row.
+    assert report.sample_sizes.era_boundary == to_utc_z(CUTOFF)
+    assert report.sample_sizes.live_era_cases == 1
+    assert report.sample_sizes.archive_era_cases == 2
+    assert report.sample_sizes.live_era_share == pytest.approx(1 / 3)
+
+    assert set(report.efficiency_by_era["live-era"]) == set(report.efficiency)
+    assert set(report.efficiency_by_era["archive-era"]) == set(report.efficiency)
+    for system in report.efficiency:
+        live = report.efficiency_by_era["live-era"][system]
+        archive = report.efficiency_by_era["archive-era"][system]
+        assert live.runs == 1
+        assert live.paired_cases == 1
+        assert archive.runs == 2
+        assert archive.paired_cases == 2
+
+    # B disagrees with A only on p2 (archive-era), so the per-era agreement
+    # figures differ from each other AND from the pooled figure.
+    pooled_b = report.efficiency["B"]
+    live_b = report.efficiency_by_era["live-era"]["B"]
+    archive_b = report.efficiency_by_era["archive-era"]["B"]
+    assert pooled_b.overall_agreement == pytest.approx(2 / 3)
+    assert live_b.overall_agreement == pytest.approx(1.0)
+    assert archive_b.overall_agreement == pytest.approx(0.5)
+    assert live_b.overall_agreement != pooled_b.overall_agreement
+    assert archive_b.overall_agreement != pooled_b.overall_agreement
+
+    # Informational only: with System C absent, it reads not_run, exactly
+    # like the pooled gate.
+    assert isinstance(report.live_era_gate, AgentGateResult)
+    assert report.live_era_gate.status == "not_run"
+    assert report.live_era_gate.passed is None
+
+
+def test_era_boundary_is_none_without_any_own_snapshot(
+    populated: sqlite3.Connection, cfg: Config, tmp_path: Path
+) -> None:
+    # An 'archive'-only row must not manufacture a boundary.
+    _add_board_snapshot(populated, captured_at=CUTOFF - timedelta(days=5), source="archive")
+    populated.commit()
+
+    report = evaluate(populated, cfg, dataset_id=DATASET, include_survival=False)
+
+    assert report.sample_sizes.era_boundary is None
+    assert report.sample_sizes.live_era_cases == 0
+    assert report.sample_sizes.archive_era_cases == len(report.case_set.cases)
+    # A real 0.0, not `None`: the denominator (every case) is non-zero, so
+    # the share is well defined and "0% live-era" is the true reading. The
+    # explicit boundary line asserted below is what explains WHY.
+    assert report.sample_sizes.live_era_share == 0.0
+
+    text = write_evaluation_report(tmp_path / "no_own.md", report).read_text(encoding="utf-8")
+    assert "no own board snapshots yet — every case is archive-era" in text
+
+
+def test_era_split_section_renders_live_before_archive_with_gate_verdict(
+    populated_with_own_snapshots: sqlite3.Connection, cfg: Config, tmp_path: Path
+) -> None:
+    report = evaluate(populated_with_own_snapshots, cfg, dataset_id=DATASET, include_survival=False)
+    text = write_evaluation_report(tmp_path / "era.md", report).read_text(encoding="utf-8")
+
+    assert "## Era split: live vs. archive" in text
+    era_section = text.split("## Era split: live vs. archive", 1)[1].split(
+        "## Action distributions", 1
+    )[0]
+
+    assert "`live-era`" in era_section
+    assert "`archive-era`" in era_section
+    assert era_section.index("`live-era`") < era_section.index("`archive-era`")
+    assert "product-relevant view" in era_section
+
+    assert "Live-era gate (informational)" in era_section
+    assert "Live-era gate verdict (informational" in era_section
+    assert "NOT RUN" in era_section
+    # The pooled gate stays authoritative and is explicitly labelled as such;
+    # this era-scoped one is explicitly labelled non-authoritative.
+    assert "authoritative spec.md §6 verdict" in era_section
+    assert "NON-authoritative" in era_section
+
+
+# ---------------------------------------------------------------------------
 # write_evaluation_report()
 # ---------------------------------------------------------------------------
 
@@ -668,6 +793,7 @@ def _empty_report() -> EvaluationReport:
             dataset_id="", allowed_splits=(), systems=(), citation=CitationSupport()
         ),
         agent_gate=AgentGateResult(dataset_id="", allowed_splits=()),
+        live_era_gate=AgentGateResult(dataset_id="", allowed_splits=()),
         product_gate=ProductGateResult(),
         ranker=RankerResult(status="insufficient_data"),
         sample_sizes=SampleSizes(),

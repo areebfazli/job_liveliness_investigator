@@ -216,8 +216,11 @@ __all__ = [
     "agent_efficiency",
     "collect_system_runs",
     "data_quality",
+    "era_boundary",
+    "era_for",
     "read_match_precision",
     "resolve_allowed_splits",
+    "split_case_set_by_era",
     "split_map_for_dataset",
 ]
 
@@ -719,6 +722,93 @@ def _case_set_for(
         systems=systems,
         allowed_splits=allowed_splits,
     )
+
+
+def era_boundary(conn: sqlite3.Connection) -> str | None:
+    """The earliest `captured_at` among own-collected board snapshots, or `None`.
+
+    dev-300-v3 pools two eras (spec.md §1): cases whose
+    `replay_at` predates this project's own board-snapshot collection rest on
+    Wayback captures alone — spec.md §1 calls that weak evidence — while
+    cases at or after it also have an own `board_snapshots` row (`source=
+    'own'`) available. This boundary is that cutover instant. `None` means
+    this database has never recorded an own capture, so every case is
+    archive-era (see `era_for`). An old database without the `board_snapshots`
+    table degrades to `None` rather than raising, matching `_dataset_row` /
+    `_count` in `rli.eval.evaluate`.
+    """
+    try:
+        row = conn.execute(
+            "SELECT MIN(captured_at) FROM board_snapshots WHERE source = 'own'"
+        ).fetchone()
+    except sqlite3.Error:  # pragma: no cover - defensive (pre-board_snapshots schema)
+        return None
+    if row is None or row[0] is None:
+        return None
+    return str(row[0])
+
+
+def era_for(replay_at: str, boundary: str | None) -> str:
+    """Which era one case's `replay_at` falls in: `"archive-era"` or `"live-era"`.
+
+    Plain lexical `<` on ISO-8601 UTC strings, exactly like `ORDER BY
+    started_at, id` and `_dataset_suffix` rely on elsewhere in this module —
+    no datetime parsing. A `boundary` of `None` (no own capture ever
+    recorded) puts everything in `"archive-era"`; a `replay_at` equal to the
+    boundary counts as `"live-era"`, since the own capture already exists as
+    of that instant.
+    """
+    if boundary is None or replay_at < boundary:
+        return "archive-era"
+    return "live-era"
+
+
+def split_case_set_by_era(
+    case_set: MetricsCaseSet, boundary: str | None
+) -> dict[str, MetricsCaseSet]:
+    """Partition a case set into `"live-era"` and `"archive-era"` halves.
+
+    Both keys are always present, even when one half is empty, so a caller
+    can index either unconditionally. `dataset_id`, `allowed_splits` and —
+    CRITICALLY — `systems` are copied VERBATIM from `case_set` onto both
+    halves, never narrowed to the systems that happen to have a run in that
+    era. `_case_set_for`'s reuse check is `all(system in case_set.systems for
+    system in systems)`; a narrowed `systems` tuple would make that check
+    fail the next time a caller passes an era-filtered set into e.g.
+    `agent_efficiency(..., case_set=split["live-era"])`, silently rebuilding
+    a POOLED case set behind the caller's back and reporting pooled numbers
+    under an era label — exactly the trap this function must not set.
+
+    `unassigned`, `excluded_holdout` and `duplicates_collapsed` are
+    pre-split-gate, whole-dataset bookkeeping concepts with no meaningful
+    per-era reading, so both halves report them as `0`; the pooled
+    `case_set` passed in already carries the real figures, so nothing is
+    lost by zeroing them here.
+    """
+    cases_by_era: dict[str, list[MetricsCase]] = {"live-era": [], "archive-era": []}
+    for case in case_set.cases:
+        cases_by_era[era_for(case.replay_at, boundary)].append(case)
+
+    result: dict[str, MetricsCaseSet] = {}
+    for era, cases in cases_by_era.items():
+        kept_run_ids_by_system: dict[str, tuple[str, ...]] = {}
+        for system in case_set.systems:
+            kept = {case.runs[system].run_id for case in cases if system in case.runs}
+            kept_run_ids_by_system[system] = tuple(
+                run_id for run_id in case_set.run_ids.get(system, ()) if run_id in kept
+            )
+        result[era] = MetricsCaseSet(
+            dataset_id=case_set.dataset_id,
+            allowed_splits=case_set.allowed_splits,
+            systems=case_set.systems,
+            cases=tuple(cases),
+            run_ids=kept_run_ids_by_system,
+            counts_by_system={system: len(ids) for system, ids in kept_run_ids_by_system.items()},
+            unassigned=0,
+            excluded_holdout=0,
+            duplicates_collapsed=0,
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
