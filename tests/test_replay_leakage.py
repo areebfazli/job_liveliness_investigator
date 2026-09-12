@@ -572,6 +572,36 @@ def test_a_branch_that_proves_a_decided_input_without_a_claim_is_caught(
     assert TEAM_SIGNAL_KEY in violation.detail
 
 
+def test_the_hiring_activity_branch_carries_the_same_obligation_from_the_other_side(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    """`P5b_hiring_activity` (spec.md §5, Amendment 2026-09-12) is the mirror
+    of `P4_repeated_repost`: P4 proves `corroborating_hiring_signal` was
+    decided `False`, P5b proves it was decided `True`, and spec.md §4 makes
+    `team_signal` the only source of either answer. Reaching the branch with
+    no surviving `corroborating_hiring_signal` claim at `T` is therefore the
+    same H4-class finding, and must be reported the same way — the
+    `posting_state` half of the obligation is already backed here, so the one
+    violation is the signal.
+
+    This is the branch's behavioural cover: the table-shape assertions below
+    derive `_BRANCH_REQUIREMENTS` from `PRECEDENCE`, so they would keep
+    passing if the `_EXTRA_REQUIREMENTS` entry were dropped and the branch
+    silently fell back to the `posting_state` obligation alone.
+    """
+    _build(conn, cfg)
+    _replay_both(conn, cfg)
+    run = _a_run_with_no_team_signal_claim(conn)
+    _plant_branch(conn, run["id"], "P5b_hiring_activity")
+
+    report = check_dataset(conn, DATASET)
+    assert report.counts == {"input_without_evidence": 1}
+    violation = report.violations[0]
+    assert violation.run_id == run["id"]
+    assert "P5b_hiring_activity" in violation.detail
+    assert TEAM_SIGNAL_KEY in violation.detail
+
+
 def test_a_supporting_claim_at_t_clears_the_branch_requirement(
     conn: sqlite3.Connection, cfg: Config
 ) -> None:

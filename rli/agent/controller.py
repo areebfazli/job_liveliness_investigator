@@ -80,20 +80,35 @@ unresolved inputs. So:
   `inputs.unpopulated()`. That is the "input is unknown" half.
 * `corroborating_hiring_signal ∈ could_change` also implies there exists a
   reachable assignment of the other unresolved inputs under which its value
-  moves the action. The ONLY branch of spec.md §5's policy that reads
-  `corroborating_hiring_signal` is the repost/long-lived `skip` branch, so
-  "some assignment makes this input matter" and "the repost/long-lived
-  branch is reachable" are the same statement about the same frozen
-  function. That is the "branch is reachable" half.
-* Conversely, if that branch is unreachable, no assignment makes the input
-  matter, and `could_change_action` excludes it — so the test is not merely
-  sufficient, it is exact in both directions.
+  moves the action. This never depended on there being exactly one branch
+  that reads the field: `could_change_action` enumerates through the real
+  `_branch`, so "some assignment makes this input matter" means "some
+  branch reading it is reachable" — whichever branches those happen to be.
+  Before spec.md §5's Amendment 2026-09-12 that was only the
+  repost/long-lived `skip` branch (`P4_repeated_repost`); since the
+  amendment `P5b_hiring_activity` reads it too (`is True`, needing no
+  partner input), and spec.md §4 was restated accordingly: `team_signal` is
+  eligible "only when `corroborating_hiring_signal` is unknown **and**
+  either the repost/long-lived skip branch **or** this hiring-activity
+  `apply_now` branch is reachable". That is the "branch is reachable" half,
+  for whichever branch(es) are live.
+* Conversely, if NO branch reading the field is reachable, no assignment
+  makes it matter, and `could_change_action` excludes it — so the test is
+  not merely sufficient, it is exact in both directions, regardless of how
+  many branches read the field or which ones they are.
 
-`rli.eval.system_b._team_signal_reachable` spells the same condition out by
-hand (`enabled` AND unknown AND `repost_pattern == "repeated_unchanged"`
-AND `long_lived is True`) because System B has no investigator and must
-route without computing `could_change_action`. C computes it, so C states
-the rule once, through the policy itself, and cannot drift from it.
+One practical consequence of the amendment: the input is now relevant on a
+much larger class of cases than before — open + strong evidence +
+not-recent + no known material negative event, with no repost history at
+all needed. System C will now propose and run `team_signal` in cases where
+it previously could not, purely because `P5b_hiring_activity` makes the
+DIRECT test (see `could_change_action`'s own docstring) succeed on its own.
+`rli.eval.system_b._team_signal_reachable` spells the same widened
+condition out by hand — R4 (the original repost/long-lived branch) OR R5
+(the amendment's hiring-activity branch) — because System B has no
+investigator and must route without computing `could_change_action`. C
+computes it, so C states the rule once, through the policy itself, and
+cannot drift from it as branches are added or removed.
 
 The remaining conjunct — `[team_signal].enabled` — is not in
 `could_change`; it is `TeamSignalProbe.eligible`'s own gate, applied by the

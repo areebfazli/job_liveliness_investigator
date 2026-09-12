@@ -34,7 +34,7 @@ import inspect
 import json
 import sqlite3
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -57,7 +57,7 @@ from test_agent_helpers import (
     steps_matching,
     template_calls,
 )
-from test_eval_helpers import COMPANY
+from test_eval_helpers import COMPANY, add_posting
 
 from rli.agent.explanation import STEP_EXPLANATION_FALLBACK
 from rli.agent.investigator import InvestigatorOutput
@@ -1050,4 +1050,105 @@ def test_an_unresolved_identity_stops_the_loop_without_a_model_call(
     assert [
         row for row in _model_rows(steps) if str(row["decision_type"]).startswith(STEP_INVESTIGATOR)
     ] == []
+
+
+# ---------------------------------------------------------------------------
+# 15. spec.md §5's Amendment 2026-09-12 (P5b hiring-activity path)
+# ---------------------------------------------------------------------------
+
+
+def _rejected_probe_names(steps: list[sqlite3.Row]) -> list[str | None]:
+    """`probe_name` of every `candidate_rejected:*` row, in trace order."""
+    return [row["probe_name"] for row in steps_matching(steps, f"{STEP_CANDIDATE_REJECTED}:")]
+
+
+@respx.mock
+def test_p5b_hiring_activity_runs_team_signal_and_reaches_apply_now(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    """spec.md §5's Amendment 2026-09-12, end to end: no repost history needed.
+
+    Before the amendment, `team_signal` was eligible only when spec.md §5's
+    repost/long-lived `skip` branch (P4) was reachable — see
+    `test_agent_helpers.seed_reposted_history`'s docstring, and
+    `tests/test_agent_controller.py`'s licence/reachability tests. This case
+    uses the PLAIN `seed_history` corpus instead: a posting with no repost
+    link at all (`repost_pattern` resolves to `'none'`, and the posting is
+    not long-lived), which made P4 — and therefore `team_signal` — permanently
+    unreachable under the old policy. `first_published_days_ago=40` also
+    keeps `publish_recency` at `'not_recent'` (over the 30-day
+    `recent_publish_days` bar), so P5's recency `apply_now` cannot fire
+    either. The only way left to `apply_now` is P5b, and the only way to
+    populate the `corroborating_hiring_signal` it reads is `team_signal` —
+    so the controller accepting and running it here is a direct consequence
+    of `rli.agent.controller`'s module docstring's amended judgment call, not
+    of anything special-cased for this test.
+
+    A second posting on the same team, first observed 5 days ago, is what
+    `team_activity` counts as a "new role on the same team in the last 30
+    days" (spec.md §5's amendment), which is what makes the real
+    `team_signal` probe (not a stub) report `corroborating_hiring_signal =
+    True`.
+    """
+    job_id = "9140"
+    posting_id = seed_history(conn, job_id, now=NOW)
+    add_posting(conn, job_id=f"{job_id}-hire", first_observed=NOW - timedelta(days=5))
+    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
+    llm = scripted_llm(
+        [
+            propose(
+                "team_signal", posting_id=posting_id, company_id=COMPANY, as_of=NOW.isoformat()
+            ),
+            InvestigatorOutput(stop=True, stop_reason="nothing left worth running"),
+        ],
+        cfg=cfg,
+    )
+
+    result = _run_c(conn, cfg, job_id, llm)
+    steps = run_steps(conn, result.run_id)
+
+    # Accepted, not rejected as ineligible.
+    assert "team_signal" not in _rejected_probe_names(steps)
+    assert steps_matching(steps, f"{STEP_CONTROLLER_DECISION}:run:") != []
+    run_rows = steps_matching(steps, f"{STEP_CONTROLLER_DECISION}:run:")
+    assert run_rows[0]["probe_name"] == "team_signal"
+
+    # Run, not merely proposed.
+    assert "team_signal" in result.probes_run
+    assert _dynamic_probe_runs(steps, "team_signal") != []
+
+    # The frozen policy fired P5b, on the strength of a `True` hiring signal.
+    assert steps_matching(steps, f"{STEP_POLICY_DECISION}:P5b_hiring_activity:strong") != []
+    assert result.decision.recommended_action == "apply_now"
+
+
+@respx.mock
+def test_the_same_case_without_a_positive_team_signal_stays_at_quick_apply(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    """Paired with the P5b test above: the probe's answer is what moves the action.
+
+    Identical evidence-producing setup (`seed_history`, the same
+    `first_published_days_ago=40`, so open + strong + not-recent + no known
+    material negative event) but no team hire seeded and no `team_signal`
+    proposal — the investigator stops immediately. With
+    `corroborating_hiring_signal` left UNKNOWN, no branch of spec.md §5's
+    policy fires before P7's `otherwise -> quick_apply`, which is exactly
+    what distinguishes this run from the one above: nothing about the case
+    changed except whether `team_signal` ran and what it said.
+    """
+    job_id = "9141"
+    seed_history(conn, job_id, now=NOW)
+    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
+    llm = scripted_llm(
+        [InvestigatorOutput(stop=True, stop_reason="nothing left worth running")],
+        cfg=cfg,
+    )
+
+    result = _run_c(conn, cfg, job_id, llm)
+    steps = run_steps(conn, result.run_id)
+
+    assert "team_signal" not in result.probes_run
+    assert steps_matching(steps, f"{STEP_POLICY_DECISION}:P7_default:strong") != []
+    assert result.decision.recommended_action == "quick_apply"
     assert Decision.model_validate(result.decision.model_dump()) == result.decision

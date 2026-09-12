@@ -15,6 +15,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
+import pytest
 import respx
 from test_eval_helpers import (
     COMPANY,
@@ -36,7 +37,9 @@ from rli.eval.system_b import (
     b_rules_hash,
     route_detail,
     run_system_b,
+    select_routed_probes,
 )
+from rli.history.features import PostingHistoryFeatures
 from rli.models.decision import Decision
 from rli.models.policy_inputs import PolicyInputs
 from rli.policy.quality import QualityVerdict
@@ -100,7 +103,7 @@ def test_system_b_fires_r2_healthy_and_runs_only_company_events(
     run_row = conn.execute("SELECT * FROM runs WHERE id = ?", (result.run_id,)).fetchone()
     assert run_row["system"] == "B"
     assert run_row["config_hash"] == b_config_hash(cfg)
-    assert "|b1:" in run_row["config_hash"]
+    assert "|b2:" in run_row["config_hash"]
 
     steps = conn.execute(
         "SELECT * FROM run_steps WHERE run_id = ? ORDER BY step_index", (result.run_id,)
@@ -158,7 +161,15 @@ def test_system_b_fires_r1_repost_suspicious_on_a_stale_publish_date(
     result = run_system_b(conn, cfg, url, now=NOW, sleep=lambda _s: None, use_tool_cache=False)
 
     assert result.route_rule == "R1_repost_suspicious"
-    assert set(result.probes_run) == {"repost_history", "requirements_drift", "company_events"}
+    # This fixture is also R5-ready (open, strong evidence, not recent, no
+    # known material negative event, hiring signal unknown), so `team_signal`
+    # is routed alongside R1's own three names.
+    assert set(result.probes_run) == {
+        "repost_history",
+        "requirements_drift",
+        "company_events",
+        "team_signal",
+    }
 
     steps = conn.execute(
         "SELECT * FROM run_steps WHERE run_id = ? ORDER BY step_index", (result.run_id,)
@@ -291,7 +302,166 @@ def test_b_rules_hash_depends_on_team_signal_enabled(cfg: Config) -> None:
 
 
 def test_b_version_label_is_frozen_string() -> None:
-    assert B_VERSION == "b1"
+    assert B_VERSION == "b2"
+
+
+# ---------------------------------------------------------------------------
+# spec.md §5 Amendment 2026-09-12: R5, the hiring-activity `team_signal`
+# eligibility branch, and the R4/R5-shared step cap.
+# ---------------------------------------------------------------------------
+
+
+def _features(**overrides) -> PostingHistoryFeatures:
+    base = {
+        "posting_id": "p1",
+        "company_id": "acme.com",
+        "as_of": NOW,
+        "history_days": 200.0,
+        "history_coverage": 0.9,
+    }
+    return PostingHistoryFeatures(**{**base, **overrides})
+
+
+def _r5_ready_case(*, inputs_overrides: dict | None = None, **overrides):
+    """A case satisfying every R5 conjunct except whatever `overrides` change.
+
+    open + strong + not_recent + material_negative_event/
+    corroborating_hiring_signal left at their PolicyInputs default (UNKNOWN).
+    """
+    from rli.eval.case import CaseState
+
+    fields = dict(
+        input_url="https://example.com/r5",
+        canonical_url="https://example.com/r5",
+        inputs=PolicyInputs(
+            posting_state="open",
+            publish_recency="not_recent",
+            **(inputs_overrides or {}),
+        ),
+        quality=QualityVerdict(quality="strong", rule="strong", detail="d"),
+        features=None,
+    )
+    fields.update(overrides)
+    return CaseState(**fields)
+
+
+def test_r5_routes_team_signal_for_an_open_strong_not_recent_case(cfg: Config) -> None:
+    case = _r5_ready_case()
+    decision = route_detail(case, cfg)
+    assert decision.rule == "R1_repost_suspicious"
+    assert "team_signal" in decision.probes
+
+
+def test_r5_routes_team_signal_when_material_negative_event_is_known_false(cfg: Config) -> None:
+    case = _r5_ready_case(inputs_overrides={"material_negative_event": False})
+    decision = route_detail(case, cfg)
+    assert "team_signal" in decision.probes
+
+
+@pytest.mark.parametrize(
+    "signal",
+    [True, False],
+)
+def test_r5_does_not_route_when_hiring_signal_already_known(cfg: Config, signal: bool) -> None:
+    case = _r5_ready_case(inputs_overrides={"corroborating_hiring_signal": signal})
+    decision = route_detail(case, cfg)
+    assert "team_signal" not in decision.probes
+
+
+@pytest.mark.parametrize("quality", ["mixed", "weak"])
+def test_r5_does_not_route_on_mixed_or_weak_quality(cfg: Config, quality: str) -> None:
+    case = _r5_ready_case(
+        quality=QualityVerdict(quality=quality, rule="no_primary_publish_evidence", detail="d")
+    )
+    decision = route_detail(case, cfg)
+    assert "team_signal" not in decision.probes
+
+
+def test_r5_does_not_route_when_publish_recency_is_recent(cfg: Config) -> None:
+    case = _r5_ready_case(
+        inputs=PolicyInputs(posting_state="open", publish_recency="recent"),
+    )
+    decision = route_detail(case, cfg)
+    # P5's own branch: strong + recent -> R2_healthy, which never routes
+    # team_signal, and the amendment's own words are that this case never
+    # needs the probe.
+    assert decision.rule == "R2_healthy"
+    assert "team_signal" not in decision.probes
+
+
+@pytest.mark.parametrize("state", ["reposted", "closed"])
+def test_r5_does_not_route_for_non_open_posting_states(cfg: Config, state: str) -> None:
+    case = _r5_ready_case(inputs=PolicyInputs(posting_state=state, publish_recency="not_recent"))
+    decision = route_detail(case, cfg)
+    assert "team_signal" not in decision.probes
+
+
+def test_r5_does_not_route_when_material_negative_event_is_true(cfg: Config) -> None:
+    case = _r5_ready_case(inputs_overrides={"material_negative_event": True})
+    decision = route_detail(case, cfg)
+    assert "team_signal" not in decision.probes
+
+
+def test_r5_does_not_route_when_team_signal_disabled(cfg: Config) -> None:
+    disabled = cfg.model_copy(
+        update={"team_signal": cfg.team_signal.model_copy(update={"enabled": False})}
+    )
+    case = _r5_ready_case()
+    decision = route_detail(case, disabled)
+    assert "team_signal" not in decision.probes
+
+
+def test_r4_still_routes_team_signal_for_the_repost_long_lived_case(cfg: Config) -> None:
+    """Regression: R4's original eligibility branch survives the R5 addition."""
+    case = _case_state(
+        inputs=PolicyInputs(
+            posting_state="open",
+            publish_recency="not_recent",
+            repost_pattern="repeated_unchanged",
+        ),
+        quality=QualityVerdict(quality="weak", rule="no_primary_publish_evidence", detail="d"),
+        features=_features(long_lived=True),
+    )
+    decision = route_detail(case, cfg)
+    assert decision.rule == "R1_repost_suspicious"
+    assert "team_signal" in decision.probes
+
+
+def test_select_routed_probes_drops_team_signal_first_over_the_cap(
+    cfg: Config, ctx_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lower cap must drop `team_signal` first — module docstring's
+    "the arithmetic": it is always the last name appended, whichever of
+    R4/R5 made it eligible."""
+    import rli.eval.system_b as system_b_module
+    from rli.probes.company_events import CompanyEventsProbe
+    from rli.probes.repost_history import RepostHistoryProbe
+    from rli.probes.requirements_drift import RequirementsDriftProbe
+    from rli.probes.team_signal import TeamSignalProbe
+
+    routed_classes = [
+        RepostHistoryProbe,
+        RequirementsDriftProbe,
+        CompanyEventsProbe,
+        TeamSignalProbe,
+    ]
+    monkeypatch.setattr(system_b_module, "eligible_probes", lambda *args, **kwargs: routed_classes)
+
+    low_cap_cfg = cfg.model_copy(
+        update={"thresholds": cfg.thresholds.model_copy(update={"max_dynamic_steps": 3})}
+    )
+    case = _case_state(posting_id="p1", company_id="acme.com")
+    ctx = ctx_factory()
+    routed = tuple(cls.name for cls in routed_classes)
+
+    selected, dropped = select_routed_probes(case, low_cap_cfg, ctx, routed)
+
+    assert [cls.name for cls in selected] == [
+        RepostHistoryProbe.name,
+        RequirementsDriftProbe.name,
+        CompanyEventsProbe.name,
+    ]
+    assert dropped == [(TeamSignalProbe.name, "step_cap")]
 
 
 # ---------------------------------------------------------------------------

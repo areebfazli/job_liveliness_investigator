@@ -10,6 +10,7 @@ disagree, `test_precedence_table_is_exhaustive_and_ordered` fails.
 
 from __future__ import annotations
 
+import inspect
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -116,6 +117,20 @@ BRANCH_CASES = [
         "apply_now",
     ),
     (
+        # spec.md §5 Amendment 2026-09-12's new row: an OLD posting, still
+        # open on strong evidence, with the team visibly hiring.
+        "P5b_hiring_activity",
+        {
+            "posting_state": "open",
+            "publish_recency": "not_recent",
+            "material_negative_event": False,
+            "corroborating_hiring_signal": True,
+        },
+        "strong",
+        UNKNOWN,
+        "apply_now",
+    ),
+    (
         "P6_active_mixed_or_weak",
         {"posting_state": "open", "publish_recency": "recent"},
         "mixed",
@@ -171,6 +186,7 @@ def test_precedence_table_is_exhaustive_and_ordered():
         "P3c_material_event_unrefreshed",
         "P4_repeated_repost",
         "P5_open_recent_strong",
+        "P5b_hiring_activity",
         "P6_active_mixed_or_weak",
         "P7_default",
     ]
@@ -386,6 +402,79 @@ CONFLICT_CASES = [
         "P3c_material_event_unrefreshed",
         "wait",
         id="material-event-beats-apply-now",
+    ),
+    pytest.param(
+        # P5 beats P5b. Both return `apply_now`, so the ACTION cannot tell
+        # them apart and the branch is what is asserted: spec.md §5's
+        # Amendment 2026-09-12 puts the new row second precisely so a recent
+        # role reaches `apply_now` without the medium-cost `team_signal`
+        # probe, and the trace has to record which of the two paths was
+        # actually taken.
+        {
+            "posting_state": "open",
+            "publish_recency": "recent",
+            "material_negative_event": False,
+            "corroborating_hiring_signal": True,
+        },
+        "strong",
+        UNKNOWN,
+        "P5_open_recent_strong",
+        "apply_now",
+        id="recency-beats-hiring-activity",
+    ),
+    pytest.param(
+        # P3a beats P5b: a dated freeze outranks observed team hiring. The
+        # team may well be hiring — for other requisitions — while this one
+        # is frozen, and `wait` is the recoverable answer.
+        {
+            "posting_state": "open",
+            "publish_recency": "not_recent",
+            "freeze_or_pause": True,
+            "material_negative_event": False,
+            "corroborating_hiring_signal": True,
+        },
+        "strong",
+        UNKNOWN,
+        "P3a_freeze_or_pause",
+        "wait",
+        id="freeze-beats-hiring-activity",
+    ),
+    pytest.param(
+        # P3c beats P5b: an unanswered layoff outranks observed team hiring.
+        # P5b's own `material_negative_event is not True` conjunct would
+        # block it here anyway; what this pins is that the branch RECORDED is
+        # the decisive `wait`, not a silent fall-through to P7.
+        {
+            "posting_state": "open",
+            "publish_recency": "not_recent",
+            "material_negative_event": True,
+            "last_material_event_at": NOW - timedelta(days=5),
+            "corroborating_hiring_signal": True,
+        },
+        "strong",
+        UNKNOWN,
+        "P3c_material_event_unrefreshed",
+        "wait",
+        id="material-event-beats-hiring-activity",
+    ),
+    pytest.param(
+        # P3b CANNOT conflict with P5b, and this is what that looks like: P3b
+        # requires the current status to be unresolved, P5b requires `open` +
+        # `strong`, which IS "resolved" — so a declared expiry never reaches
+        # the new row. Same reading as `expiry-does-not-beat-strong-open`
+        # above (spec.md §3: validThrough is not proof of a ghost job).
+        {
+            "posting_state": "open",
+            "publish_recency": "not_recent",
+            "declared_expiry": NOW + timedelta(days=5),
+            "material_negative_event": False,
+            "corroborating_hiring_signal": True,
+        },
+        "strong",
+        UNKNOWN,
+        "P5b_hiring_activity",
+        "apply_now",
+        id="expiry-does-not-beat-hiring-activity",
     ),
 ]
 
@@ -646,6 +735,159 @@ def test_p3c_never_fires_when_state_is_unresolved():
 
 
 # ---------------------------------------------------------------------------
+# P5b: the positive hiring-activity path (Amendment 2026-09-12)
+# ---------------------------------------------------------------------------
+
+
+def p5b_inputs(**overrides) -> PolicyInputs:
+    """An old-but-open posting with a corroborated hiring signal.
+
+    `publish_recency="not_recent"` is the only value a real P5b case can
+    carry: `rli.policy.quality`'s Q2 refuses `strong` without a dated primary
+    `first_published` claim, so the input is never UNKNOWN alongside
+    `strong`, and `recent` would have been taken by P5 one row above.
+    """
+    base = dict(
+        posting_state="open",
+        publish_recency="not_recent",
+        material_negative_event=False,
+        corroborating_hiring_signal=True,
+    )
+    base.update(overrides)
+    return inputs(**base)
+
+
+def test_p5b_fires_on_an_old_open_posting_with_hiring_activity():
+    """The row the amendment exists for: without it this case is capped at
+    `quick_apply` forever, whatever the employer is observably doing."""
+    outcome = decide(p5b_inputs(), "strong", NOW, THRESHOLDS)
+    assert outcome.branch == "P5b_hiring_activity"
+    assert outcome.recommended_action == "apply_now"
+    # spec.md §1 attaches recheck_after_days to `wait` alone; P5b is not a
+    # special case of that rule and must not invent one.
+    assert outcome.recheck_after_days is None
+
+
+@pytest.mark.parametrize("value", [False, UNKNOWN])
+def test_p5b_reads_material_negative_event_exactly_as_p5_does(value):
+    """`is not True`, not `is False` — the same one-token judgment call P5
+    makes, deliberately written identically so a future flip stays ONE
+    decision (module docstring's Unknown-handling section)."""
+    outcome = decide(p5b_inputs(material_negative_event=value), "strong", NOW, THRESHOLDS)
+    assert outcome.branch == "P5b_hiring_activity"
+    assert outcome.recommended_action == "apply_now"
+
+
+def test_p5b_fires_with_an_unknown_publish_recency():
+    """P5b does not read `publish_recency` at all — "regardless of publish
+    recency" (spec.md §5, Amendment 2026-09-12).
+
+    A real case cannot reach here (see `p5b_inputs`' docstring: Q2 ties
+    `strong` to a dated primary publish claim), which is exactly why this is
+    asserted rather than assumed — the branch must stand on its own
+    conjuncts, not on a quality-gate side effect it does not state.
+    """
+    outcome = decide(p5b_inputs(publish_recency=UNKNOWN), "strong", NOW, THRESHOLDS)
+    assert outcome.branch == "P5b_hiring_activity"
+
+
+def test_p5b_does_not_fire_on_a_dated_material_negative_event():
+    """A dated, unanswered layoff is P3c's `wait` — the recoverable answer
+    reached before either `apply_now` row."""
+    outcome = decide(
+        p5b_inputs(
+            material_negative_event=True,
+            last_material_event_at=NOW - timedelta(days=5),
+        ),
+        "strong",
+        NOW,
+        THRESHOLDS,
+    )
+    assert outcome.branch == "P3c_material_event_unrefreshed"
+    assert outcome.recommended_action == "wait"
+
+
+def test_p5b_does_not_fire_on_an_undated_material_negative_event():
+    """`material_negative_event is True` with no date blocks P5b without
+    reaching P3c (which needs a date to compare a refresh against), so the
+    case falls all the way through to P7 — `quick_apply`, not `apply_now`."""
+    outcome = decide(
+        p5b_inputs(material_negative_event=True, last_material_event_at=None),
+        "strong",
+        NOW,
+        THRESHOLDS,
+    )
+    assert outcome.branch == "P7_default"
+    assert outcome.recommended_action == "quick_apply"
+
+
+@pytest.mark.parametrize("signal", [False, UNKNOWN])
+@pytest.mark.parametrize(
+    ("quality", "branch"),
+    [
+        ("strong", "P7_default"),
+        ("mixed", "P6_active_mixed_or_weak"),
+        ("weak", "P6_active_mixed_or_weak"),
+    ],
+)
+def test_p5b_requires_a_positive_signal(signal, quality, branch):
+    """UNKNOWN is not a `True`: an unanswered `team_signal` is neither a skip
+    (P4 needs `is False`) nor an `apply_now` (P5b needs `is True`), so the
+    case falls through to `quick_apply` — P6 on mixed/weak evidence, P7 on
+    strong (module docstring's Unknown-handling section)."""
+    outcome = decide(p5b_inputs(corroborating_hiring_signal=signal), quality, NOW, THRESHOLDS)
+    assert outcome.branch == branch
+    assert outcome.recommended_action == "quick_apply"
+
+
+@pytest.mark.parametrize("quality", ["mixed", "weak"])
+def test_p5b_requires_strong_evidence(quality):
+    """A hiring signal cannot substitute for evidence about THIS posting."""
+    outcome = decide(p5b_inputs(), quality, NOW, THRESHOLDS)
+    assert outcome.branch == "P6_active_mixed_or_weak"
+    assert outcome.recommended_action == "quick_apply"
+
+
+@pytest.mark.parametrize(
+    ("posting_state", "branch", "action"),
+    [
+        ("reposted", "P7_default", "quick_apply"),
+        ("closed", "P1_closed", "skip"),
+    ],
+)
+def test_p5b_requires_the_literal_open_state(posting_state, branch, action):
+    """Like P5, P5b says `posting_state == "open"`, not `active`: a reposted
+    listing is not an open one, and `closed` is unconditional at P1."""
+    outcome = decide(p5b_inputs(posting_state=posting_state), "strong", NOW, THRESHOLDS)
+    assert outcome.branch == branch
+    assert outcome.recommended_action == action
+
+
+@pytest.mark.parametrize(
+    ("signal", "branch", "action"),
+    [
+        (True, "P5b_hiring_activity", "apply_now"),
+        (False, "P4_repeated_repost", "skip"),
+    ],
+)
+def test_p4_and_p5b_cannot_collide(signal, branch, action):
+    """The two branches that read `corroborating_hiring_signal` are DISJOINT:
+    P4 needs `is False`, P5b needs `is True`. Every other conjunct of P4 is
+    satisfied here, so this is the case where their relative order would show
+    up if they could overlap — and it cannot, which is why that order is not
+    load-bearing (module docstring)."""
+    outcome = decide(
+        p5b_inputs(repost_pattern="repeated_unchanged", corroborating_hiring_signal=signal),
+        "strong",
+        NOW,
+        THRESHOLDS,
+        long_lived=True,
+    )
+    assert outcome.branch == branch
+    assert outcome.recommended_action == action
+
+
+# ---------------------------------------------------------------------------
 # recheck_after_days (spec.md §1)
 # ---------------------------------------------------------------------------
 
@@ -698,6 +940,16 @@ def test_recheck_after_days_rule(expiry, expected, why):
             },
             "strong",
             True,
+        ),
+        (
+            {
+                "posting_state": "open",
+                "publish_recency": "not_recent",
+                "material_negative_event": False,
+                "corroborating_hiring_signal": True,
+            },
+            "strong",
+            UNKNOWN,
         ),
     ],
 )
@@ -828,6 +1080,29 @@ def test_policy_version_is_stable_and_threshold_sensitive():
 
     moved = THRESHOLDS.model_copy(update={"recent_publish_days": 21})
     assert policy_version(moved) != policy_version(THRESHOLDS)
+
+
+def test_policy_version_covers_the_new_hiring_activity_row():
+    """Adding P5b MUST move `policy_version()`, and the two hashed halves are
+    what guarantee it.
+
+    No golden hash is asserted, deliberately: this file has never carried
+    one, and inventing one now would pin the formatting of `_branch` rather
+    than its behaviour (the module docstring accepts that reformatting alone
+    changes the version — a false "the policy changed" is cheap, a false
+    "nothing changed" is a silent evaluation bug). What IS pinned is that the
+    new row is inside BOTH inputs the digest reads — the source of `_branch`
+    and `repr(PRECEDENCE)` — so a run recorded under the old version can
+    never be mistaken for one decided under this table, and that the version
+    is otherwise stable for fixed thresholds.
+    """
+    from rli.policy.action import _VERSIONED_FUNCTIONS, _branch
+
+    assert _branch in _VERSIONED_FUNCTIONS
+    assert "P5b_hiring_activity" in inspect.getsource(_branch)
+    assert "P5b_hiring_activity" in repr(PRECEDENCE)
+
+    assert policy_version(THRESHOLDS) == policy_version(THRESHOLDS)
 
 
 def test_policy_version_ignores_frozen_at():

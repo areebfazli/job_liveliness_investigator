@@ -14,6 +14,7 @@ from rli.events.policy_signals import CLAIM_EVENTS_SEARCHED, format_event_claim_
 from rli.models.decision import Decision
 from rli.models.evidence import EvidenceItem
 from rli.models.policy_inputs import UNKNOWN, PolicyInputs
+from rli.policy.claim_families import CLAIM_FAMILIES, classify_reason
 from rli.policy.explain_stub import _enforce_citations, reasons_from_inputs
 from rli.policy.inputs import (
     CLAIM_BOARD_ABSENT,
@@ -157,6 +158,147 @@ def test_team_signal_reason(signal, fragment):
     )
     assert fragment in reasons[0].text
     assert_every_reason_is_cited(reasons, evidence)
+
+
+# ---------------------------------------------------------------------------
+# The hiring-signal reason's two wordings (Amendment 2026-09-12)
+# ---------------------------------------------------------------------------
+
+_HIRING_FRAGMENT = "hiring activity was found for this team"
+_SPECIFIC_TAIL = "while this role remained listed"
+
+
+def _team_evidence() -> list[EvidenceItem]:
+    """The `team_signal` probe's output, in the order that probe emits it."""
+    return [
+        ev("t1", "team_new_roles", probe="team_signal", source_quality="enrichment"),
+        ev("t2", "team_closures", probe="team_signal", source_quality="enrichment"),
+        ev("t3", CLAIM_TEAM_SIGNAL, probe="team_signal", source_quality="enrichment"),
+    ]
+
+
+def test_hiring_signal_specific_wording_cites_the_team_items_and_the_state_claim():
+    """The observation behind the policy's P5b `apply_now` is a TWO-part
+    statement, so spec.md §9 requires both halves cited in the one
+    `ReasonItem` — every `team_signal` item, in evidence order, followed by
+    the `posting_state` claim (exactly as `_material_event_reason` cites its
+    "since" claim alongside the event)."""
+    evidence = [ev("e1", CLAIM_POSTING_STATE, value="open"), *_team_evidence()]
+    reasons = reasons_from_inputs(
+        PolicyInputs(posting_state="open", corroborating_hiring_signal=True), evidence, now=NOW
+    )
+    assert_every_reason_is_cited(reasons, evidence)
+
+    hiring = [r for r in reasons if _HIRING_FRAGMENT in r.text]
+    assert len(hiring) == 1, "exactly ONE hiring-signal reason, whichever wording applies"
+    assert _SPECIFIC_TAIL in hiring[0].text
+    assert hiring[0].evidence_ids == ["t1", "t2", "t3", "e1"]
+
+
+def test_hiring_signal_specific_wording_is_supported_by_the_claims_it_cites():
+    """The wording is chosen against `rli.policy.claim_families`' crude
+    classifier, not against taste: "listed" puts the sentence in the
+    `posting_state` family, so without a `posting_state` claim among the
+    cited ids spec.md §6's citation-support metric would count the reason
+    UNSUPPORTED (and `rli.agent.explanation`'s guard would drop it). The
+    real classifier output is asserted, not a guess."""
+    evidence = [ev("e1", CLAIM_POSTING_STATE, value="open"), *_team_evidence()]
+    reasons = reasons_from_inputs(
+        PolicyInputs(posting_state="open", corroborating_hiring_signal=True), evidence, now=NOW
+    )
+    hiring = next(r for r in reasons if _SPECIFIC_TAIL in r.text)
+
+    families = classify_reason(hiring.text)
+    assert families == {"posting_state"}
+
+    by_id = {item.id: item for item in evidence}
+    cited_types = {by_id[eid].claim_type for eid in hiring.evidence_ids}
+    supported = {family for family in families if cited_types & CLAIM_FAMILIES[family]}
+    assert supported == families
+
+
+def test_hiring_signal_falls_back_to_generic_without_a_posting_state_claim():
+    """No `posting_state` claim, no id for the second half of the sentence —
+    and an uncited half-sentence is worse than a coarser true one (the same
+    judgment as `_material_event_reason`'s third fallback). The generic
+    wording classifies as nothing at all, which the metric counts as
+    `reasons_unclassified` rather than unsupported."""
+    evidence = _team_evidence()
+    reasons = reasons_from_inputs(
+        PolicyInputs(posting_state="open", corroborating_hiring_signal=True), evidence, now=NOW
+    )
+    assert_every_reason_is_cited(reasons, evidence)
+
+    hiring = [r for r in reasons if _HIRING_FRAGMENT in r.text]
+    assert len(hiring) == 1
+    assert _SPECIFIC_TAIL not in hiring[0].text
+    assert hiring[0].evidence_ids == ["t1", "t2", "t3"]
+    assert classify_reason(hiring[0].text) == set()
+
+
+@pytest.mark.parametrize("posting_state", ["reposted", "closed", "unknown", UNKNOWN])
+def test_hiring_signal_specific_wording_needs_an_OPEN_posting(posting_state):
+    """ "...while this role remained listed" is only true of an `open`
+    posting. A reposted, closed or unresolved one keeps the generic wording,
+    which says nothing about the listing and cites only the team items."""
+    state_value = "unknown" if posting_state is UNKNOWN else posting_state
+    evidence = [ev("e1", CLAIM_POSTING_STATE, value=state_value), *_team_evidence()]
+    reasons = reasons_from_inputs(
+        PolicyInputs(posting_state=posting_state, corroborating_hiring_signal=True),
+        evidence,
+        now=NOW,
+    )
+    assert_every_reason_is_cited(reasons, evidence)
+
+    hiring = [r for r in reasons if _HIRING_FRAGMENT in r.text]
+    assert len(hiring) == 1
+    assert _SPECIFIC_TAIL not in hiring[0].text
+    assert hiring[0].evidence_ids == ["t1", "t2", "t3"]
+
+
+def test_negative_hiring_signal_wording_is_unchanged():
+    """The `False` case gets no second wording: "no hiring activity" says
+    nothing about whether the role is listed, so there is no second half to
+    cite — and P4, the branch that reads `is False`, is a `skip`, not the
+    `apply_now` the specific wording exists to explain."""
+    evidence = [ev("e1", CLAIM_POSTING_STATE, value="open"), *_team_evidence()]
+    reasons = reasons_from_inputs(
+        PolicyInputs(posting_state="open", corroborating_hiring_signal=False), evidence, now=NOW
+    )
+    assert_every_reason_is_cited(reasons, evidence)
+
+    hiring = [r for r in reasons if _HIRING_FRAGMENT in r.text]
+    assert len(hiring) == 1
+    assert hiring[0].text == "No recent hiring activity was found for this team."
+    assert hiring[0].evidence_ids == ["t1", "t2", "t3"]
+
+
+def test_hiring_signal_reason_does_not_cite_the_publish_claim():
+    """P5b fires REGARDLESS of publish recency, and `first_published` /
+    `refreshed_at` are `publish`-family claims that support neither half of
+    the sentence — citing one would be the unsupported-citation shape
+    spec.md §9 forbids. The publish claim still earns its OWN reason."""
+    evidence = [
+        ev("e1", CLAIM_POSTING_STATE, value="open"),
+        ev("e2", CLAIM_FIRST_PUBLISHED, source_event_at=NOW - timedelta(days=340)),
+        ev("e3", CLAIM_REFRESHED_AT, source_event_at=NOW - timedelta(days=200)),
+        *_team_evidence(),
+    ]
+    reasons = reasons_from_inputs(
+        PolicyInputs(
+            posting_state="open",
+            publish_recency="not_recent",
+            corroborating_hiring_signal=True,
+        ),
+        evidence,
+        now=NOW,
+    )
+    assert_every_reason_is_cited(reasons, evidence)
+
+    hiring = next(r for r in reasons if _SPECIFIC_TAIL in r.text)
+    assert set(hiring.evidence_ids) == {"t1", "t2", "t3", "e1"}
+    assert any(r.evidence_ids == ["e2"] for r in reasons)
+    assert any(r.evidence_ids == ["e3"] for r in reasons)
 
 
 # ---------------------------------------------------------------------------

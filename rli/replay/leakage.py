@@ -524,6 +524,21 @@ _EXTRA_REQUIREMENTS: dict[str, tuple[_InputRequirement, ...]] = {
             backing_label=f"a {CLAIM_FIRST_PUBLISHED!r} or {CLAIM_REFRESHED_AT!r}",
         ),
     ),
+    # `inputs.corroborating_hiring_signal is True` (spec.md §5, Amendment
+    # 2026-09-12). The SAME obligation as `P4_repeated_repost`'s, from the
+    # opposite side: P4 proves the input was decided `False`, P5b proves it
+    # was decided `True`, and either answer can only have come from a
+    # `corroborating_hiring_signal` claim, since spec.md §4 makes
+    # `team_signal` its only source. The `posting_state` obligation the
+    # branch also carries is added by `_BRANCH_REQUIREMENTS` below, which is
+    # derived from `PRECEDENCE`, so only this extra one is listed here.
+    "P5b_hiring_activity": (
+        _InputRequirement(
+            input_name="corroborating_hiring_signal",
+            backed_by=frozenset({CLAIM_TEAM_SIGNAL}),
+            backing_label=f"a {CLAIM_TEAM_SIGNAL!r}",
+        ),
+    ),
 }
 
 #: Branch -> the policy inputs reaching it PROVES were decided. Derived from

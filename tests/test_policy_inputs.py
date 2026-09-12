@@ -23,7 +23,7 @@ from rli.events.policy_signals import (
 from rli.history.features import PostingHistoryFeatures
 from rli.models.evidence import EvidenceItem
 from rli.models.policy_inputs import UNKNOWN, PolicyInputs
-from rli.policy.action import PolicyThresholds
+from rli.policy.action import PolicyThresholds, decide
 from rli.policy.inputs import (
     CLAIM_DECLARED_EXPIRY,
     CLAIM_FIRST_PUBLISHED,
@@ -797,6 +797,116 @@ def test_declared_expiry_question_closes_once_the_case_is_strong_and_open():
     assert ccan(inputs, "apply_now", quality="strong") == set()
     # ...but on weak evidence the same question does change the action.
     assert ccan(inputs, "quick_apply", quality="weak") == {"declared_expiry"}
+
+
+# ---------------------------------------------------------------------------
+# The hiring-activity branch: spec.md §4's eligibility rule as amended
+# 2026-09-12, computed rather than restated
+# ---------------------------------------------------------------------------
+
+
+def _old_open_strong(**overrides) -> PolicyInputs:
+    """An open, strongly-evidenced, NOT-recent posting with every other
+    question already answered — so `corroborating_hiring_signal` is the only
+    free field and the P4 `skip` branch is unreachable (`repost_pattern` is
+    known `"none"`, and callers pass `long_lived=False`).
+
+    That isolation is the point: it removes the joint
+    `repost_pattern` + `corroborating_hiring_signal` path that made the
+    signal relevant before the amendment, so anything the enumeration
+    reports here it reports because of the new row alone.
+    """
+    base = dict(
+        posting_state="open",
+        publish_recency="not_recent",
+        material_negative_event=False,
+        freeze_or_pause=False,
+        declared_expiry=None,
+        repost_pattern="none",
+        last_material_event_at=None,
+    )
+    base.update(overrides)
+    return PolicyInputs(**base)
+
+
+def test_team_signal_is_relevant_when_only_the_hiring_activity_branch_is_reachable():
+    """spec.md §5's Amendment 2026-09-12 widened §4's eligibility sentence to
+    "the repost/long-lived skip branch OR this hiring-activity apply_now
+    branch", and `could_change_action` has to produce that WITHOUT being told:
+    it enumerates the field through the real `_branch`, so the new row makes
+    the input relevant on its own.
+
+    Contrast `test_team_signal_is_pointless_when_the_repost_branch_is_unreachable`
+    directly above: same "no repost history to speak of" shape, and before
+    this amendment the answer here would have been `set()` too — the
+    controller would have stopped without ever running `team_signal`, and the
+    new `apply_now` row could never have fired.
+    """
+    inputs = _old_open_strong()
+    assert inputs.unpopulated() == {"corroborating_hiring_signal"}
+
+    before = decide(inputs, "strong", NOW, THRESHOLDS, long_lived=False)
+    assert (before.branch, before.recommended_action) == ("P7_default", "quick_apply")
+
+    assert ccan(inputs, "quick_apply", quality="strong", long_lived=False) == {
+        "corroborating_hiring_signal"
+    }
+
+    # ...and it is relevant because a `True` really does move the action.
+    answered = decide(
+        inputs.model_copy(update={"corroborating_hiring_signal": True}),
+        "strong",
+        NOW,
+        THRESHOLDS,
+        long_lived=False,
+    )
+    assert (answered.branch, answered.recommended_action) == ("P5b_hiring_activity", "apply_now")
+
+
+def test_team_signal_stays_relevant_with_the_event_questions_still_open():
+    """The same case with `material_negative_event` unresolved as well.
+
+    P5b reads it as `is not True`, so an unanswered `company_events` does not
+    close the hiring-signal question — both stay open, which is the
+    conservative direction and the one the controller needs.
+    """
+    inputs = _old_open_strong(material_negative_event=UNKNOWN, last_material_event_at=UNKNOWN)
+    relevant = ccan(inputs, "quick_apply", quality="strong", long_lived=False)
+    assert "corroborating_hiring_signal" in relevant
+    assert "material_negative_event" in relevant
+
+
+def test_team_signal_is_pointless_once_the_recency_row_already_applies():
+    """The negative control, and the reason the amendment ordered the rows
+    this way: on a RECENT open+strong posting P5 already returns `apply_now`,
+    so no value of the signal changes the action and the medium-cost
+    `team_signal` probe is not eligible. "A recent role never needs the
+    probe" (spec.md §5, Amendment 2026-09-12), asserted rather than assumed.
+
+    Both `quality` and `long_lived` are pinned, and that is load-bearing
+    rather than tidying — checked against the real enumeration before this
+    assertion was written:
+
+    * leaving `long_lived` free restores the PRE-amendment joint path
+      (`repost_pattern` is `"none"` here, but an unresolved `long_lived`
+      alone does not make P4 reachable; it is only with `repost_pattern`
+      also free that the signal returns to the set) — see
+      `test_repost_and_team_signal_are_relevant_only_together`;
+    * leaving `quality` free reports the signal as relevant for a reason
+      that has nothing to do with it: the DIRECT test compares every
+      enumerated cell against `current_action`, and the mixed/weak blocks
+      are `quick_apply` against an `apply_now` baseline, so on a free
+      quality EVERY unresolved field comes back relevant. That is the
+      documented conservative bias of the enumeration, not a statement
+      about this input.
+    """
+    inputs = _old_open_strong(publish_recency="recent")
+    assert inputs.unpopulated() == {"corroborating_hiring_signal"}
+
+    before = decide(inputs, "strong", NOW, THRESHOLDS, long_lived=False)
+    assert (before.branch, before.recommended_action) == ("P5_open_recent_strong", "apply_now")
+
+    assert ccan(inputs, "apply_now", quality="strong", long_lived=False) == set()
 
 
 def test_could_change_action_is_deterministic():

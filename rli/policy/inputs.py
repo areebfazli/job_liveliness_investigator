@@ -120,7 +120,11 @@ Judgment calls (documented because they are not forced by spec.md)
   threading, used by `rli.eval.case`; it is gone, parameter and all, because
   a `data` blob carries no `available_at` and therefore walked straight past
   replay's point-in-time gate. `rli.eval.case.extend_case_state` documents
-  what that cost.
+  what that cost. spec.md §5's Amendment 2026-09-12 does not touch this
+  bullet: it widened where the input is READ (a second branch,
+  `P5b_hiring_activity`, which needs `is True` where `P4_repeated_repost`
+  needs `is False`) and the §4 eligibility rule that follows from that, but
+  the single source and the claim-only derivation below are unchanged.
 """
 
 from __future__ import annotations
@@ -712,6 +716,21 @@ def could_change_action(
     joint test is the standard "is this variable relevant to the function"
     definition and is deliberately conservative — it keeps a question open
     whenever some reachable combination makes it matter.
+
+    That example is still the one that motivates the joint test, but since
+    spec.md §5's Amendment 2026-09-12 it is no longer the only way
+    `corroborating_hiring_signal` can matter: TWO branches now read it, from
+    opposite sides — `P4_repeated_repost` needs `is False` and
+    `P5b_hiring_activity` needs `is True`. P5b needs no partner input, so it
+    makes the signal relevant through the DIRECT test on a case with no
+    unresolved repost history at all: open + strong + `not_recent` + no
+    material negative event is `quick_apply` today and `apply_now` the moment
+    the probe answers `True`. This function needs no change to say so — it
+    enumerates the field's domain through the real `_branch`, so the new row
+    widened the set on its own, which is exactly spec.md §4's amended
+    eligibility sentence ("unknown **and either** the repost/long-lived skip
+    branch **or** this hiring-activity apply_now branch is reachable")
+    computed rather than restated.
 
     Note the asymmetry: the joint test compares two *counterfactual* worlds
     against each other, never a counterfactual against `current_action`.

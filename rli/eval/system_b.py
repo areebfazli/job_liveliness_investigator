@@ -54,7 +54,7 @@ The tree is read as a chain of `if ... return`, in this order:
     * `features.reappeared_at is not None`.
 
   -> `[repost_history, requirements_drift]`, plus `company_events` under
-  the condition below, plus `team_signal` under R4.
+  the condition below, plus `team_signal` under R4 or R5.
 
   Rationale: every one of those four is the observable shadow of the spec.md
   §5 repost branch — a stale or absent publish date, an old posting, a
@@ -121,21 +121,72 @@ The tree is read as a chain of `if ... return`, in this order:
   on the live corpus for an already-searched company with no negative
   events.
 
-* **R4 `team_signal` (an add-on to any non-terminal rule).** NEVER when
+* **R4/R5 `team_signal` (an add-on to any non-terminal rule).** NEVER when
   `[team_signal].enabled` is false. When enabled, only when
-  `corroborating_hiring_signal` is UNKNOWN **and** the spec.md §5
-  repost/long-lived branch is actually reachable — `repost_pattern ==
-  "repeated_unchanged"` AND `features.long_lived is True`. That is spec.md
-  §4's own eligibility rule for this probe, verbatim: "it is eligible only
-  when that input is unknown and the repost/long-lived branch is reachable".
+  `corroborating_hiring_signal` is UNKNOWN **and** EITHER of two branches is
+  reachable. That disjunction is spec.md §5's Amendment 2026-09-12,
+  verbatim: "it is eligible only when that input is unknown and either the
+  repost/long-lived branch or this hiring-activity branch is reachable" —
+  the amendment that also adds the policy's P5b row (`rli.policy.action`).
 
-  Note this can only ever fire inside R1, and the tree does not need a
-  special case to say so: `repost_pattern == "repeated_unchanged"` requires
-  a repost link, which `rli.history.features._classify_repost_pattern` only
-  produces for a posting with a non-null `first_seen_absent` — which is
-  itself an R1 trigger. Implementing R4 as a global add-on rather than an
-  R1-only clause is therefore equivalent today, and stays correct if the
-  classifier's preconditions ever change.
+  * **R4 — the original branch.** `repost_pattern == "repeated_unchanged"`
+    AND `features.long_lived is True`. This was spec.md §4's eligibility
+    rule for `team_signal` before the amendment, verbatim, and it is the
+    policy's P4 (`repeated_repost -> skip`) shadow, the same way R1's four
+    disjuncts are P4's shadow.
+
+    Note this can only ever fire inside R1, and the tree does not need a
+    special case to say so: `repost_pattern == "repeated_unchanged"`
+    requires a repost link, which
+    `rli.history.features._classify_repost_pattern` only produces for a
+    posting with a non-null `first_seen_absent` — which is itself an R1
+    trigger.
+
+  * **R5 — the amendment's hiring-activity branch.** All of:
+
+    * `posting_state == "open"` — the LITERAL state, not "active"
+      (`open`/`reposted`). The amendment's P5b requires `open` specifically,
+      so a `reposted` posting cannot reach it and must not route the probe
+      for it either.
+    * the always-run evidence quality is `"strong"` — the same test R2
+      uses (`case.quality is not None and case.quality.quality ==
+      "strong"`, hoisted into `_strong`).
+    * `publish_recency != "recent"` — the exact complement of P5's own
+      recency conjunct. A `"recent"` + `"strong"` case is deliberately
+      excluded: P5 already returns `apply_now` there, so the probe could
+      not change the action — the amendment's own words, "a recent role
+      never needs the probe." `strong` quality implies a dated PRIMARY
+      publish claim (`rli.policy.quality`'s Q2: no `first_published` claim
+      with a usable date fails `strong`), so in practice this conjunct
+      reads `publish_recency == "not_recent"` on every case that reaches
+      it — but it is written as the negation, not that literal, so an
+      UNKNOWN `publish_recency` (which Q2 would already have excluded from
+      `strong` in the cases that matter) is excluded by the same test
+      rather than by a second one.
+    * `material_negative_event is not True`. This input is UNKNOWN at
+      routing time for EVERY case — `rli.eval.case` no longer pre-populates
+      the event inputs (see the Eligibility section below) — so the
+      conjunct only ever excludes a case whose event store answer was
+      already known `True`. That is the same coarse `is not True` reading
+      P5 and P5b use in the policy.
+
+    **Where R5 can fire.** Only inside R1, same as R4, and for a
+    demonstrable reason rather than an assumed one: `R2_healthy` requires
+    `publish_recency == "recent"` in its own condition, which R5's
+    `!= "recent"` conjunct directly excludes. `R3_uncertain` is reached
+    only when `_repost_suspicious` returns `None` for every disjunct, and
+    that function's FIRST disjunct is `publish_recency != "recent"` — so
+    any case satisfying R5's recency conjunct has already made R1 fire and
+    never reaches the `elif`/`else` that lead to R2 or R3. R5 is therefore,
+    like R4, reachable only inside R1, and is implemented as the same kind
+    of global add-on for the same reason: today's implication is a proof
+    about the surrounding tree, not a hand-checked coincidence, and coding
+    it as an R1-only clause would just be a less general way of writing
+    the same restriction.
+
+  Implementing both R4 and R5 as a global add-on rather than rule-local
+  clauses is therefore equivalent to writing them inside R1 today, and
+  stays correct if either branch's preconditions ever change.
 
 **Overlaps and precedence.** R1, R2 and R3 partition the active cases only
 because they are read in order. A posting can be simultaneously recently
@@ -159,7 +210,7 @@ It is filtered through the SAME neutralized gate System A uses
 unpopulated set. There is now exactly ONE reason for that:
 
 * B's routing tree already encodes its own "is this question still open?"
-  logic, explicitly and visibly (R3's condition, R4's condition). Applying
+  logic, explicitly and visibly (R3's condition, R4/R5's condition). Applying
   the registry's version on top would mean the same judgment is made twice,
   in two places, with no way to tell which one dropped a probe.
 
@@ -187,9 +238,20 @@ capped** — deliberately asymmetric: A is the reference ceiling (a budget
 knob must not move the reference action), while B is a *baseline system*, in
 the same class as C, and spec.md §4's step cap is a property of a system
 that runs bounded investigations. Comparing an unbounded B against a bounded
-C would understate C. With four dynamic probes and a cap of four the cap
-does not currently bind; it exists so that lowering the cap constrains B and
-C together.
+C would understate C.
+
+The arithmetic: R1 routes at most three names — `repost_history`,
+`requirements_drift`, `company_events` — and `team_signal` is appended
+after those, at most a fourth. `config.toml` sets the cap to four, so today
+the cap does not currently bind on any routed list this tree can produce.
+It exists so that lowering the cap constrains B and C together — and
+because the list is truncated in append order, a cap lower than four drops
+`team_signal` FIRST, every time, since it is always the last name appended
+(after R1/R2/R3's own names, and after either R4 or R5 decides to add it).
+That ordering was always true; it is now load-bearing rather than
+incidental, because R5 is a second, independent way to reach `team_signal`
+and a lower cap must drop it consistently regardless of which of R4 or R5
+made it eligible.
 
 The cap is applied AFTER the eligibility filter, so an ineligible probe
 never consumes a step slot it was never going to use.
@@ -198,14 +260,33 @@ never consumes a step slot it was never going to use.
 Versioning (spec.md §6: "Freeze/version B before evaluating C")
 --------------------------------------------------------------------------
 
-`B_VERSION` is the human-readable freeze label (`"b1"`). `b_rules_hash`
-is the machine-checkable one: blake2b over the source of the routing
-functions, `B_VERSION`, and the two configuration values the routing itself
-reads (`max_dynamic_steps` and `[team_signal].enabled`). It mirrors
+`B_VERSION` is the human-readable freeze label — `"b2"` as of spec.md §5's
+Amendment 2026-09-12, bumped from `"b1"`. `b_rules_hash` is the
+machine-checkable one: blake2b over the source of the routing functions,
+`B_VERSION`, and the two configuration values the routing itself reads
+(`max_dynamic_steps` and `[team_signal].enabled`). It mirrors
 `rli.policy.action.policy_version`, including its trade-off — reformatting a
 routing function changes the hash even when behaviour is identical, because
 a false "the rules changed" is cheap to investigate and a false "nothing
 changed" is a silent evaluation bug.
+
+**Why `"b2"` is a new baseline label rather than a bug fix to `"b1"`.** R5
+makes the routing tree spend a `medium`-cost probe (`team_signal`) on a
+class of case `"b1"` never routed it for — a `"strong"`, non-recent, open
+case with an unknown hiring signal, which `"b1"` would send through R1 with
+at most `repost_history`/`requirements_drift`/`company_events` and never
+`team_signal`, because `"b1"`'s eligibility test required the repost/
+long-lived branch specifically. That is not a corrected mistake; `"b1"`
+correctly implemented the eligibility rule as it stood before the
+amendment. It means B's cost and action numbers under `"b2"` are not
+comparable to B's numbers under `"b1"` — a run recorded under one label
+answers a different question about how much B spends than a run recorded
+under the other — so the two get different labels rather than one label
+whose meaning silently shifted underneath already-recorded runs. Concretely:
+spec.md §6's agent gate, "C medium/high-cost probe use <= 70% of B", is a
+ratio against B's spend, and from this change forward that denominator is
+`"b2"`'s spend, not `"b1"`'s — any comparison against a `"b1"` run predates
+the amendment and is comparing against a different baseline.
 
 The version is recorded in the run TWICE, on purpose:
 
@@ -299,8 +380,10 @@ __all__ = [
 
 # The freeze label. Bump it (and only then) when the routing tree changes in
 # a way that should be treated as a NEW baseline rather than a bug fix to
-# this one; `b_rules_hash` detects the change either way.
-B_VERSION = "b1"
+# this one; `b_rules_hash` detects the change either way. Bumped to "b2" for
+# spec.md §5's Amendment 2026-09-12 (R5, below) — see the module docstring's
+# Versioning section for why this is a new label, not a fix to "b1".
+B_VERSION = "b2"
 
 BRule = Literal[
     "R0_terminal",
@@ -363,18 +446,39 @@ def _events_still_matter(case: CaseState) -> bool:
     return inputs.freeze_or_pause is True or inputs.material_negative_event is True
 
 
+def _strong(case: CaseState) -> bool:
+    """The always-run evidence quality is `"strong"` (R2's and R5's test)."""
+    return case.quality is not None and case.quality.quality == "strong"
+
+
 def _team_signal_reachable(case: CaseState, cfg: Config) -> bool:
-    """R4 — spec.md §4's own eligibility rule for `team_signal`."""
+    """R4 OR R5 — spec.md §5 Amendment 2026-09-12's eligibility rule for
+    `team_signal` (see the module docstring for the full rationale of each
+    branch and for where R5 can fire)."""
     if not cfg.team_signal.enabled:
         return False
     if not isinstance(case.inputs.corroborating_hiring_signal, Unknown):
         return False
     features = case.features
-    return (
+
+    # R4 — the original repost/long-lived branch (pre-amendment).
+    repost_long_lived = (
         case.inputs.repost_pattern == "repeated_unchanged"
         and features is not None
         and features.long_lived is True
     )
+
+    # R5 — the amendment's hiring-activity branch: open + strong evidence +
+    # not recent + no known material negative event. `publish_recency !=
+    # "recent"` is the exact complement of P5/R2's recency conjunct.
+    hiring_activity = (
+        case.inputs.posting_state == "open"
+        and _strong(case)
+        and case.inputs.publish_recency != "recent"
+        and case.inputs.material_negative_event is not True
+    )
+
+    return repost_long_lived or hiring_activity
 
 
 def route_detail(case: CaseState, cfg: Config) -> RouteDecision:
@@ -409,7 +513,7 @@ def route_detail(case: CaseState, cfg: Config) -> RouteDecision:
     reason: str
 
     suspicion = _repost_suspicious(case)
-    strong = case.quality is not None and case.quality.quality == "strong"
+    strong = _strong(case)
 
     if suspicion is not None:
         rule = "R1_repost_suspicious"
@@ -494,6 +598,7 @@ def select_routed_probes(
 _VERSIONED_FUNCTIONS = (
     _repost_suspicious,
     _events_still_matter,
+    _strong,
     _team_signal_reachable,
     route_detail,
     select_routed_probes,
@@ -506,7 +611,7 @@ def b_rules_hash(cfg: Config | None = None) -> str:
     Hashes `B_VERSION`, the source of every function in
     `_VERSIONED_FUNCTIONS`, and the two configuration values the routing
     itself reads: `[thresholds].max_dynamic_steps` (the cap) and
-    `[team_signal].enabled` (R4's licence gate). Nothing else from the
+    `[team_signal].enabled` (R4/R5's licence gate). Nothing else from the
     config is included — the rest is already covered by
     `rli.eval.runner.config_hash` and by
     `rli.policy.action.policy_version`, and duplicating it here would make
@@ -568,7 +673,7 @@ def run_system_b(
     stays in the middle and the dataset suffix goes LAST, because
     `rli.eval.baseline.collect_cases` identifies a dataset by a trailing
     `|dataset:<id>` match — so B's replay hash reads
-    `cfg:<hash>|b1:<rules hash>|dataset:<id>`.
+    `cfg:<hash>|b2:<rules hash>|dataset:<id>`.
     """
     moment, mode, run_config_hash, replay_at = replay_run_shape(replay, now, b_config_hash(cfg))
 

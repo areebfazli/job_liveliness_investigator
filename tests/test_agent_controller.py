@@ -505,8 +505,11 @@ def test_team_signal_runs_only_when_licensed_and_the_branch_is_reachable(
     """`corroborating_hiring_signal in could_change` IS the reachability test.
 
     See `rli.agent.controller`'s module docstring: `could_change_action` only
-    returns inputs that are unpopulated AND can still move the action, and the
-    only branch reading this input is spec.md §5's repost/long-lived `skip`.
+    returns inputs that are unpopulated AND can still move the action, and
+    (since spec.md §5's Amendment 2026-09-12) that happens whenever EITHER
+    the repost/long-lived `skip` branch (`P4_repeated_repost`) OR the
+    hiring-activity `apply_now` branch (`P5b_hiring_activity`) is reachable —
+    this test only needs one of them to be true, not both.
     """
     _seed_history(conn)
     licensed = cfg.model_copy(
@@ -534,6 +537,49 @@ def test_team_signal_runs_only_when_licensed_and_the_branch_is_reachable(
         could_change={"repost_pattern"},
     )
     assert _reasons(unreachable)["team_signal"] == "ineligible"
+
+
+def test_team_signal_runs_when_could_change_comes_from_the_hiring_activity_branch(
+    conn: sqlite3.Connection, cfg: Config, ctx: ProbeContext
+) -> None:
+    """The controller cannot tell P4 and P5b apart from `could_change` alone.
+
+    `decide` never re-derives reachability from `case.inputs` — it trusts
+    whatever `could_change` set it is handed (`could_change_action` computes
+    that upstream, in `rli.agent.loop`). So `could_change=
+    {"corroborating_hiring_signal"}` is accepted identically whether it came
+    from spec.md §5's repost/long-lived `skip` branch (`P4_repeated_repost`,
+    the previous test) or from the amendment's hiring-activity `apply_now`
+    branch (`P5b_hiring_activity`), exercised here with a case that has open
+    + not-recent + no known negative event and NO repost history at all
+    (`repost_pattern="none"`, no `PostingHistoryFeatures`) — a shape P4 could
+    never reach. That indifference is the point: the controller is
+    branch-agnostic, driven purely by the `could_change` set it is given.
+    """
+    _seed_history(conn)
+    licensed = cfg.model_copy(
+        update={"team_signal": cfg.team_signal.model_copy(update={"enabled": True})}
+    )
+    licensed_ctx = _with_config(ctx, licensed)
+    candidate = _candidate("team_signal", posting_id=POSTING_ID, company_id=COMPANY, as_of=NOW)
+
+    hiring_activity_case = _case(
+        inputs=PolicyInputs(
+            posting_state="open",
+            publish_recency="not_recent",
+            material_negative_event=False,
+            repost_pattern="none",
+        )
+    )
+
+    runs = _decide(
+        _output(candidate),
+        case=hiring_activity_case,
+        cfg=licensed,
+        ctx=licensed_ctx,
+        could_change={"corroborating_hiring_signal"},
+    )
+    assert (runs.decision, runs.chosen_probe) == ("run", "team_signal")
 
 
 # ---------------------------------------------------------------------------

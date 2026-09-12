@@ -40,6 +40,18 @@ Judgment calls:
   (the observation behind the policy's P3c `wait`) replaces the generic one
   rather than joining it; two reasons about one event would double-count in
   spec.md §6's citation-support metric and read as two findings.
+* **Exactly ONE hiring-signal reason is emitted**, on the same pattern. A
+  `True` signal on a posting observed `open` gets a stronger, two-part
+  wording — hiring activity on the team *while this role remained listed*,
+  the observation behind the policy's P5b `apply_now` branch — and it cites
+  both halves: every `team_signal` item, then the `posting_state` claim.
+  Where that second claim does not exist the generic one-part wording
+  stands instead of an uncited half-sentence, and the `False` wording is
+  untouched. The ORDER of the ids (team items first, in evidence order,
+  then the state claim) follows the order of the sentence's clauses, which
+  is the same convention `_material_event_reason` uses and is what keeps
+  the output diffable across runs. See `_hiring_signal_reason` for why the
+  publish claim is deliberately not among them.
 * **The P3c wording avoids the word "unchanged"** and says "has not changed
   since" instead. `rli.eval.metrics.FAMILY_KEYWORDS` classifies reason text
   by crude substring, and "unchanged" is a `requirements`-family keyword; a
@@ -254,16 +266,7 @@ def reasons_from_inputs(
     team_evidence = _by_probe(evidence, _TEAM_SIGNAL_PROBE)
     signal = inputs.corroborating_hiring_signal
     if team_evidence and not isinstance(signal, Unknown):
-        reasons.append(
-            ReasonItem(
-                text=(
-                    "Recent hiring activity was found for this team."
-                    if signal
-                    else "No recent hiring activity was found for this team."
-                ),
-                evidence_ids=_ids(team_evidence),
-            )
-        )
+        reasons.append(_hiring_signal_reason(inputs, evidence, team_evidence))
 
     # 8. Board absence (a fact the user should see even when it contradicts
     #    the resolver — spec.md §1 shows contradictions as `mixed`, and hiding
@@ -348,6 +351,75 @@ def _material_event_reason(
             "changed since then."
         ),
         evidence_ids=_ids([*event_evidence, cited]),
+    )
+
+
+def _hiring_signal_reason(
+    inputs: PolicyInputs,
+    evidence: Sequence[EvidenceItem],
+    team_evidence: Sequence[EvidenceItem],
+) -> ReasonItem:
+    """The one reason emitted when `corroborating_hiring_signal` is known.
+
+    `team_evidence` is every item the `team_signal` probe produced — the
+    `team_new_roles`, `team_closures` and `corroborating_hiring_signal`
+    claims — cited as a block, by probe rather than by claim type, for the
+    reason the module docstring gives ("some inputs are cited by probe").
+
+    Two wordings, one reason, exactly as `_material_event_reason` does it.
+    The SPECIFIC wording states the observation behind the policy's P5b
+    `apply_now` branch (spec.md §5, Amendment 2026-09-12) — hiring activity
+    on this team *while this role is still listed* — and it is used only when
+    all three of its parts are in hand: the signal is `True`, the observed
+    `posting_state` is `open`, and there is a `posting_state` claim to cite.
+    Otherwise the generic wording stands, citing only the team items.
+
+    **Why it cites the `posting_state` claim too, and why it falls back
+    without one.** The specific wording is a TWO-PART statement — hiring
+    activity, and the posting still being listed — and spec.md §9 requires
+    both halves to map to evidence, which is the same rule that makes
+    `_material_event_reason` cite its "since" claim alongside the event.
+    `rli.policy.claim_families.classify_reason` files the word "listed" in
+    the `posting_state` family, so a reason carrying that half while citing
+    only `team_signal` ids would be counted UNSUPPORTED by spec.md §6's
+    citation-support metric (and would be dropped outright by
+    `rli.agent.explanation`'s support guard on the model path). With no
+    `posting_state` claim available there is no id for that half, and — the
+    same judgment as `_material_event_reason`'s third fallback — an uncited
+    half-sentence is worse than a coarser true one.
+
+    **What is deliberately NOT cited, and not said.** The publish/refresh
+    claim is not cited: P5b fires *regardless* of publish recency, and
+    `first_published` / `refreshed_at` are `publish`-family claims, so
+    attaching one would add an id that supports neither half of the
+    sentence. And the wording avoids every substring that crude classifier
+    reads as another family — "unchanged", "requirement", "closing",
+    "layoff", "freeze", "published", "posted", "days ago", "updated",
+    "refreshed", "repost", "previously" — so the reason classifies as
+    `posting_state` alone and is scored against the claims it actually
+    cites. The classifier is documented as crude; this module works around
+    it rather than widening it.
+    """
+    signal = inputs.corroborating_hiring_signal
+    generic = ReasonItem(
+        text=(
+            "Recent hiring activity was found for this team."
+            if signal
+            else "No recent hiring activity was found for this team."
+        ),
+        evidence_ids=_ids(team_evidence),
+    )
+
+    if signal is not True or inputs.posting_state != "open":
+        return generic
+
+    state_evidence = _by_claim(evidence, CLAIM_POSTING_STATE)
+    if not state_evidence:
+        return generic
+
+    return ReasonItem(
+        text="Recent hiring activity was found for this team while this role remained listed.",
+        evidence_ids=_ids([*team_evidence, *state_evidence]),
     )
 
 

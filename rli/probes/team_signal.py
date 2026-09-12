@@ -156,23 +156,29 @@ probe, so `rli.probes.registry.eligible_probes` applies the generic
 convention, and it means calling `TeamSignalProbe.eligible` directly is as
 safe as going through the registry.
 
-RESOLVED (was a KNOWN GAP): spec.md §4 says `team_signal` "is eligible only
-when that input is unknown **and the repost/long-lived branch is
-reachable**". Both halves are now enforced:
+RESOLVED (was a KNOWN GAP): spec.md §4, as amended on 2026-09-12, says
+`team_signal` "is eligible only when that input is unknown **and** either
+the repost/long-lived branch **or** this hiring-activity `apply_now` branch
+is reachable". Both halves are enforced:
 `rli.policy.inputs.could_change_action` computes the unresolved inputs that
 could still move the action by running the real `rli.policy.action._branch`
 over an enumeration, and `rli.agent.controller` passes ITS output — not the
-raw `unpopulated()` set — as `eligible_probes`' `unpopulated_inputs`. Since
-the `skip` branch is the only branch reading `corroborating_hiring_signal`,
-"this input could change the action" and "the repost/long-lived branch is
-reachable" are the same statement about the same frozen function; see
+raw `unpopulated()` set — as `eligible_probes`' `unpopulated_inputs`. Note
+what that argument does NOT rest on: it never needed
+`corroborating_hiring_signal` to be read by exactly one branch. TWO branches
+read it now, from opposite sides (`P4_repeated_repost` needs `is False`,
+`P5b_hiring_activity` needs `is True`), and "this input could change the
+action" still means precisely "some branch reading it is reachable" —
+whichever branches those are — because the enumeration runs the frozen
+function itself rather than a restatement of it; see
 `rli.agent.controller`'s docstring for the argument in both directions. The
 evaluation systems bypass it deliberately and knowingly, not accidentally:
 System A passes `ALL_DYNAMIC_INPUTS` to make the gate vacuous (that is its
 definition — every available probe), and System B hand-codes the same
-condition in `rli.eval.system_b._team_signal_reachable` because it has no
-investigator. With `enabled` no longer defaulting to `False`, this matters
-in practice rather than in theory.
+condition — now the R4/R5 disjunction — in
+`rli.eval.system_b._team_signal_reachable` because it has no investigator.
+With `enabled` no longer defaulting to `False`, this matters in practice
+rather than in theory.
 """
 
 from __future__ import annotations

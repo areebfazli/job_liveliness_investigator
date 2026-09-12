@@ -1,18 +1,20 @@
 """The fixed v1 action policy (spec.md §5) and its frozen thresholds.
 
-spec.md §5, as amended on 2026-09-10 (policy tuning, before freeze), states
-the policy as a seven-line table plus an "otherwise":
+spec.md §5, as amended on 2026-09-12 (positive hiring-activity path, before
+freeze), states the policy as an eight-line table plus an "otherwise":
 
 ```text
 closed                                             -> skip
 open + unresolved posting state                    -> wait
 open + explicit freeze/pause or declared expiry
      + unresolved current status                   -> wait
-open + material negative event after last refresh  -> wait      (new)
+open + material negative event after last refresh  -> wait
 repeated unchanged repost + long-lived history
      + corroborating hiring signal = false         -> skip
 open + recent (see table) + strong evidence
      + no material negative event                  -> apply_now
+open + strong evidence + no material negative event
+     + corroborating hiring signal = true          -> apply_now  (new)
 open + mixed/weak evidence                         -> quick_apply
 otherwise                                          -> quick_apply
 ```
@@ -48,6 +50,10 @@ Read as a chain of `if ... return`, in this order:
 * **P5 `open_recent_strong`** — `posting_state == "open"` AND
   `publish_recency == "recent"` AND `material_negative_event is not True`
   AND `evidence_quality == "strong"`
+  -> `apply_now`, `recheck_after_days = null`
+* **P5b `hiring_activity`** — `posting_state == "open"` AND
+  `evidence_quality == "strong"` AND `material_negative_event is not True`
+  AND `corroborating_hiring_signal is True`
   -> `apply_now`, `recheck_after_days = null`
 * **P6 `active_mixed_or_weak`** — active AND
   `evidence_quality in {"mixed", "weak"}`
@@ -120,6 +126,48 @@ Why that order, and what each overlap costs
   clock), so without this ordering the §5 repost row could never fire — the
   posting would always take the `apply_now` row first. P4 is precisely the
   guard against a fresh publish date that means nothing.
+* **P5b AFTER P5, although both yield `apply_now`.** spec.md §5's
+  Amendment 2026-09-12 is explicit: "the new row sits after the recency
+  `apply_now` row so a recent role never needs the probe". The two rows
+  differ in what they COST, not in what they return. P5 reads
+  `publish_recency`, which comes free from the always-run resolver; P5b
+  reads `corroborating_hiring_signal`, whose single source (`team_signal`,
+  spec.md §4) sits in the medium/high cost tier. Putting P5b first would
+  make the probe reachable — and therefore, under spec.md §4's eligibility
+  rule, worth running — on cases the recency row already answers for
+  nothing. Ordering it second means a recent+strong posting reaches
+  `apply_now` without ever paying for the probe. The two paths stay
+  distinguishable afterwards because `PolicyOutcome.branch` records WHICH
+  row fired, so "applied because it is fresh" and "applied because the team
+  is visibly hiring" are two different lines in the trace even though the
+  user-facing action is the same.
+* **P4 and P5b cannot conflict.** P4 requires
+  `corroborating_hiring_signal is False` and P5b requires `is True`, so the
+  two are disjoint on that conjunct alone and no input assignment reaches
+  both. Their relative order is therefore NOT load-bearing — unlike P4 vs
+  P5, which genuinely overlap. P4 nevertheless stays above, in the position
+  the §5 table gives it and for the reason already documented above (a fresh
+  publish date that means nothing must not out-rank the repost row); nothing
+  about the new row changes that argument, and moving P4 now would be a
+  change with no justification behind it.
+* **P3a/P3b/P3c still outrank P5b.** An explicit freeze, an unresolved
+  declared expiry, or a dated layoff the posting has not answered all beat
+  observed team hiring, for the same asymmetry that puts them above P5:
+  `wait` is recoverable — the user rechecks and can still apply — whereas
+  `apply_now` has already spent the effort the policy exists to allocate.
+  Hiring elsewhere on a team is also the weaker observation of the pair: a
+  company can be filling three roles on a team while this particular
+  requisition is frozen or dead, so a positive team signal is corroboration
+  that the team is active, never proof that this posting is.
+* **P5b re-uses `material_negative_event is not True`, not `is False`.**
+  Deliberately identical to P5's conjunct, character for character. The
+  judgment behind it (UNKNOWN counts as "no material negative event") is
+  documented once, under Unknown handling below, and is the same judgment
+  in both rows; writing `is False` here would silently make the two
+  `apply_now` paths disagree about what an unchecked company means. Keeping
+  the conjuncts identical also keeps the documented escape hatch honest:
+  flipping the policy to "require a checked `False`" stays ONE decision
+  applied in two places, not two decisions that can drift apart.
 * **P6 before P7** is only a labelling distinction: both yield
   `quick_apply`. It is kept separate so the trace records *why*
   (`active_mixed_or_weak` vs a genuine fall-through) and so a future policy
@@ -131,7 +179,8 @@ Unknown handling (the sentinel is not a value)
 
 * `posting_state` UNKNOWN -> P2 `wait` (above).
 * `material_negative_event` UNKNOWN counts as "no material negative event"
-  for P5. **Judgment call, and the one most worth revisiting.** The
+  for P5 and, identically, for P5b. **Judgment call, and the one most worth
+  revisiting.** The
   alternative — requiring `company_events` to have run and returned `False`
   before `apply_now` is ever reachable — was rejected because event
   collection covers a minority of target companies, so it would make
@@ -140,10 +189,12 @@ Unknown handling (the sentinel is not a value)
   ("reported with the action distribution so a default-heavy policy cannot
   pass trivially"). The risk is bounded by the conjunct that P5 also
   requires `evidence_quality == "strong"`, i.e. a primary publish date and a
-  confirmed open state. Note that unknown event coverage does **not** by
-  itself make the evidence weak: `rli.policy.quality` scores the evidence
-  about *the posting*, not about the company. To flip this decision, change
-  `is not True` to `is False` on the P5 branch — one token — and the tests
+  confirmed open state (P5b requires the same `strong`). Note that unknown
+  event coverage does **not** by itself make the evidence weak:
+  `rli.policy.quality` scores the evidence about *the posting*, not about
+  the company. To flip this decision, change `is not True` to `is False` on
+  the P5 **and** P5b branches — one token each, and the same token, which is
+  why the two conjuncts are written identically — and the tests
   parametrized over `material_negative_event` will show the effect.
 * `freeze_or_pause` UNKNOWN is NOT a freeze (P3a requires `is True`). A
   freeze is a positive claim; not having looked is not a reason to wait.
@@ -168,11 +219,34 @@ Unknown handling (the sentinel is not a value)
   (comparing dates) would discard the only ordering information we have.
 * `declared_expiry` UNKNOWN is not an expiry (P3b requires a real datetime),
   and it makes `recheck_after_days` fall back to the default.
-* `corroborating_hiring_signal` UNKNOWN blocks P4, which requires `is False`
-  ("checked, and no corroborating signal"). This matches spec.md §4's rule
-  that `team_signal` is eligible "only when that input is unknown and the
-  repost/long-lived branch is reachable": the branch is designed to wait for
-  a real answer.
+* `corroborating_hiring_signal` UNKNOWN blocks **both** branches that read
+  it: P4 requires `is False` ("checked, and no corroborating signal") and
+  P5b requires `is True` ("checked, and the team is visibly hiring"). So an
+  unknown signal is neither a skip nor an `apply_now` — it is not a
+  tie-breaker in either direction — and the case falls through to P6/P7
+  `quick_apply`. Both branches are designed to wait for a real answer;
+  neither reads silence as an answer.
+
+  spec.md §4's eligibility sentence is the amended one as of 2026-09-12:
+  `team_signal` is eligible only when the input is unknown **and either**
+  the repost/long-lived `skip` branch **or** this hiring-activity
+  `apply_now` branch is reachable. Nothing here has to encode that rule:
+  `rli.policy.inputs.could_change_action` computes it by enumerating this
+  input's domain through the real `_branch`, so adding P5b made the input
+  relevant on open/strong/not-recent cases automatically, with no
+  special-casing in the enumeration and no hand-maintained branch table to
+  keep in step.
+* **`publish_recency` is never UNKNOWN on a case that reaches P5b** — it is
+  always `not_recent` there. Not a conjunct, and deliberately not written as
+  one: it is a consequence of the QUALITY gate the branch already has.
+  `rli.policy.quality`'s Q2 makes `strong` impossible without a dated
+  primary `first_published` claim, and `rli.policy.inputs` derives
+  `publish_recency` from exactly that claim (plus any corroborated
+  `refreshed_at`), so `quality == "strong"` already implies the input is
+  answered; `recent` would have been taken by P5 one row above. Adding
+  `publish_recency == "not_recent"` to the condition would restate a
+  property of Q2 inside the action policy, where it would silently become
+  false the day the quality rules move.
 * `repost_pattern` UNKNOWN and `long_lived` UNKNOWN both block P4 — spec.md
   §4: "missing history never means flat hiring", and it certainly never
   means a repost.
@@ -276,6 +350,7 @@ PolicyBranch = Literal[
     "P3c_material_event_unrefreshed",
     "P4_repeated_repost",
     "P5_open_recent_strong",
+    "P5b_hiring_activity",
     "P6_active_mixed_or_weak",
     "P7_default",
 ]
@@ -291,6 +366,7 @@ PRECEDENCE: tuple[tuple[PolicyBranch, RecommendedAction], ...] = (
     ("P3c_material_event_unrefreshed", "wait"),
     ("P4_repeated_repost", "skip"),
     ("P5_open_recent_strong", "apply_now"),
+    ("P5b_hiring_activity", "apply_now"),
     ("P6_active_mixed_or_weak", "quick_apply"),
     ("P7_default", "quick_apply"),
 )
@@ -507,6 +583,16 @@ def _branch(
         and quality == "strong"
     ):
         return "P5_open_recent_strong", "apply_now"
+
+    # P5b — open + strong + observed hiring activity, whatever the publish
+    # date says (spec.md §5, Amendment 2026-09-12).
+    if (
+        resolved_state == "open"
+        and quality == "strong"
+        and inputs.material_negative_event is not True
+        and inputs.corroborating_hiring_signal is True
+    ):
+        return "P5b_hiring_activity", "apply_now"
 
     # P6 — open/reposted with mixed or weak evidence.
     if active and quality in ("mixed", "weak"):
