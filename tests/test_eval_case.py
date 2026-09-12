@@ -869,10 +869,16 @@ def test_material_event_after_last_refresh_forces_wait_on_p3c(
 # and `rli.replay.build`, which writes the same contract down.
 # ---------------------------------------------------------------------------
 
-#: When the replay dataset's `team_signal` record was built. `TeamSignalArgs`
-#: carries no `as_of`, so ONE record serves every `T`, and every claim on it
-#: is stamped `available_at = BUILD_TIME` — months after the archive-era
-#: `NOW` the first test below replays it at.
+#: When the replay dataset's `team_signal` record was built. The record below
+#: is collected with `as_of=BUILD_TIME`, so every claim on it is stamped from
+#: a capture at or before BUILD_TIME and AFTER the archive-era `NOW` the
+#: first test replays it at — which is the shape the gate has to reject,
+#: however the record came to exist. (`rli.replay.build` no longer produces
+#: one such record per posting: `TeamSignalArgs` now carries an `as_of` and
+#: the probe is re-run per `T`. These two tests are about `rli.eval.case`'s
+#: own contract — inputs come from gated claims, never from a blob — which
+#: has to hold for ANY record served to it, so they keep building the
+#: hostile one deliberately.)
 BUILD_TIME = NOW + timedelta(days=90)
 
 
@@ -948,13 +954,21 @@ def _build_time_team_signal_record(probes: ProbeRunner, posting_id: str) -> Prob
     genuine `bool` in `data` and claims stamped after `NOW`.
     """
     ctx = replace(probes.ctx, now=lambda: BUILD_TIME)
-    result = TeamSignalProbe().run(TeamSignalArgs(posting_id=posting_id, company_id=COMPANY), ctx)
+    result = TeamSignalProbe().run(
+        TeamSignalArgs(posting_id=posting_id, company_id=COMPANY, as_of=BUILD_TIME), ctx
+    )
 
     assert result.ok is True
     assert result.data is not None
     assert result.data["corroborating_hiring_signal"] is True
     assert result.data["evidence"]
-    assert all(claim.available_at == BUILD_TIME for claim in result.data["evidence"])
+    # Stamped from the capture that supports each claim (`rli.probes.
+    # team_signal`'s availability rule), which for this fixture is the
+    # post-`NOW` sibling posting's `first_observed`. What the two tests below
+    # need is only that every stamp is after `NOW` and at or before
+    # `BUILD_TIME`; asserting the exact instant would pin the test to the
+    # attribution rule rather than to the gate it is about.
+    assert all(NOW < claim.available_at <= BUILD_TIME for claim in result.data["evidence"])
     return result
 
 

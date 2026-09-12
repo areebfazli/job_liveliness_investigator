@@ -31,16 +31,39 @@ guarantees the record covers every probe any system could later select: A is
 defined as the maximal selection, and B (and any future C) can only ever
 choose a subset.
 
-**The one exception is `company_events`, and it is not an exception to the
-principle.** Its arguments include `as_of`, which
-`rli.probes.registry.build_args` fills from the run clock — so at replay time
-its `args_hash` is a function of `T`, and a record stored under the build
-clock's hash would never be found. It is therefore re-run once per `T` with
-`as_of=T`. That costs nothing and changes nothing: the probe makes no network
-call at all (spec.md §4: "pre-collect dated events and replay by
-`available_at`; do not live-search during benchmark replay"), it reads the
-same local store, and running it per `T` is what makes its answer honest at
-each `T` rather than a single answer smeared across the grid.
+**Two probes are collected per `T` instead, and they are not exceptions to
+the principle.** `company_events` and `team_signal` both take an `as_of`
+argument, which `rli.probes.registry.build_args` fills from the run clock —
+so at replay time each one's `args_hash` is a function of `T`, and a record
+stored under the build clock's hash would never be found. Both are therefore
+re-run once per `T` with `as_of=T`, by `_company_events_at` and
+`_team_signal_at`, and the build-clock execution System A already made is
+deliberately not stored (`_PER_T_PROBES`).
+
+Neither re-run costs anything: neither probe makes a network call at all
+(`[allowlists].company_events` and `[allowlists].team_signal` are both
+empty), and both read only local tables. What each one BUYS is different,
+and worth stating separately:
+
+* `company_events` reads the pre-collected event store, which
+  `rli.events.store.events_for` already filters by `available_at <= as_of`
+  (spec.md §4: "pre-collect dated events and replay by `available_at`; do
+  not live-search during benchmark replay"). Running it per `T` is what
+  makes its answer honest at each `T` rather than one answer smeared across
+  the grid.
+* `team_signal` derives its claims from BOARD CAPTURES. Re-running it at `T`
+  is what makes each claim's `available_at` a capture time at or before `T`
+  — the `first_observed` of the latest new role, the latest
+  `first_seen_absent`, or the last capture in the watched window for a
+  negative — instead of the build instant. That is the difference between a
+  claim the `available_at <= T` gate can judge on its merits and one it must
+  drop at every archive-era `T`, which is precisely what security review H4
+  turned out to be: `TeamSignalArgs` had no `as_of`, one build-clock record
+  served every `T`, every claim in it was stamped at the build instant, and
+  `corroborating_hiring_signal` was therefore UNKNOWN at every pre-build `T`
+  in every dataset built before this change. Unlike `company_events`, this
+  probe reads the capture corpus, so its per-`T` run also happens inside
+  `rli.replay.pit.point_in_time` — see the judgment call below.
 
 --------------------------------------------------------------------------
 Archive-era `T`: the resolver's answer is NOT available, and that is the point
@@ -126,6 +149,46 @@ Judgment calls
   reintroduce leakage that no test would catch, and the fix at that point is
   to re-run the probe per `T` the way `company_events` already is.
 
+  `team_signal` USED to be in this category and has now taken exactly that
+  fix. Its blob (`new_roles_30d`, `closures_60d`, `open_roles_now`,
+  `corroborating_hiring_signal`) was build-time like `repost_history`'s, but
+  one of those keys is a policy-input name, which made it the live half of
+  the hazard rather than the inert half — see `rli.replay.leakage`'s
+  `blob_input_exposures`. It is now re-run per `T`, so its blob and its
+  claims describe the same instant and the same corpus, and a freshly built
+  dataset should report 0 `team_signal` exposures. `repost_history` remains
+  in this category: its blob keys are
+  `rli.history.features.PostingHistoryFeatures` fields rather than policy
+  inputs, nothing decides from them, and the same fix is still available if
+  that ever changes.
+
+* **The per-`T` `team_signal` run happens inside a point-in-time corpus;
+  the per-`T` `company_events` run does not need one.** The difference is
+  what each probe reads. `company_events` reads `company_events` through
+  `rli.events.store.events_for`, whose `available_at <= as_of` filter is the
+  same restriction `rli.replay.pit` would impose on that table, so a context
+  would be a second copy of one rule. `team_signal` reads `postings` and
+  `board_snapshots` — lifecycle aggregates over the whole capture history —
+  and those are exactly what `point_in_time` re-derives.
+
+  `rli.history.features.team_activity` is now `as_of`-bounded on its own
+  (its module docstring proves why the monotonicity of `first_observed` and
+  `first_seen_absent` makes that sound), so the context is the BELT to those
+  BRACES rather than the only defence: with both in place, a future edit
+  that loosened either one is caught by the other. The helper composes with
+  an already-installed context via `rli.replay.pit.installed_shadows` and
+  `contextlib.nullcontext`, the same way `case_state_at` does, because
+  `point_in_time` refuses to nest; and the probe runs INSIDE the context
+  while `ReplayProbeStore.save` runs after it has exited, so no write to
+  `replay_probe_results` is made while the shadows are installed.
+
+  The cost is affordable and was checked rather than assumed:
+  `_install_postings` copies the whole `postings` table (~15k rows on the
+  real database) and re-derives one company's lifecycle per call, which is
+  milliseconds — against a build that is already making LIVE network calls
+  per posting. Per-`T` point-in-time is therefore lost in the noise of the
+  thing it is protecting.
+
 * **A probe result is stored for every `T`, including results for probes a
   system will never select at that `T`.** Storage is cheap and the exposure
   rule is enforced on the READ side (`rli.replay.mode.ReplayProbeStore` logs
@@ -164,6 +227,7 @@ from rli.probes.company_events import CompanyEventsProbe
 from rli.probes.lookups import posting_row
 from rli.probes.registry import build_args, eligible_probes
 from rli.probes.repost_history import BOARD_HISTORY_URL_PLACEHOLDER
+from rli.probes.team_signal import TeamSignalProbe
 from rli.replay.mode import (
     ARCHIVE_BOARD_STATE_PROBE,
     ReplayContext,
@@ -199,6 +263,13 @@ DEFAULT_GRID_STEP_DAYS = 30
 # restated so the archive-era claims are read by the SAME policy code that
 # reads the live ones.
 _CLAIM_BOARD_PRESENT = "board_present"
+
+#: Probes whose `args` carry an `as_of` and whose record is therefore
+#: collected ONCE PER `T` (`_company_events_at`, `_team_signal_at`) rather
+#: than taken from the build-clock System A run. See the module docstring's
+#: "Two probes are collected per `T`" section. A set, not a chain of
+#: `if`s, so adding a third such probe is one edit in one place.
+_PER_T_PROBES = frozenset({CompanyEventsProbe.name, TeamSignalProbe.name})
 
 
 # ---------------------------------------------------------------------------
@@ -887,11 +958,90 @@ def _company_events_at(
     )
 
 
+def _team_signal_at(
+    conn: sqlite3.Connection,
+    cfg: Config,
+    case: CaseState,
+    replay_at: datetime,
+    *,
+    company_id: str,
+) -> _Observation | None:
+    """Run `team_signal` with `as_of=T`, inside the point-in-time corpus.
+
+    Sibling of `_company_events_at`, and for the same first reason: this
+    probe's `args` carry an `as_of`, so its `args_hash` is a function of `T`
+    and a record stored under the build clock could never be found at replay.
+    Arguments come from `rli.probes.registry.build_args` with a context whose
+    clock is `T` — the same call the replayed controller makes — rather than
+    from a hand-built `TeamSignalArgs`, so the builder and the controller can
+    never disagree about the question, and therefore never about the hash.
+
+    Unlike `company_events`, this probe reads the CAPTURE CORPUS (`postings`
+    lifecycle columns and `board_snapshots`), so it runs inside
+    `rli.replay.pit.point_in_time`. `rli.history.features.team_activity` is
+    `as_of`-bounded on its own — the context is the belt to those braces, not
+    the only defence — and the module docstring's judgment call explains why
+    both are kept and what the per-`T` context costs.
+
+    The context is entered only when one is not already installed
+    (`installed_shadows` / `nullcontext`, the composition `case_state_at`
+    uses), because `point_in_time` refuses to nest: this helper is then safe
+    if a future caller ever wraps a whole build in a context. The probe runs
+    INSIDE it and the returned `_Observation` is handed back for the caller
+    to `store.save` AFTER it has exited, so no write to
+    `replay_probe_results` happens while the shadows are installed and the
+    context can never be left holding a half-open transaction.
+
+    `company_id` is the CASE's company, used to scope the lifecycle
+    re-derivation (`rli.replay.pit`'s scoping judgment call). The case file's
+    own `company_id` is included alongside it: the two are the same company
+    for every posting a build plans, and taking the union means a
+    disagreement would cost one extra re-derivation rather than silently
+    handing the probe a company whose lifecycle was left NULL — which would
+    read as "no postings" and could manufacture a negative hiring signal.
+    """
+    case_file = case.case_file()
+    if case_file is None:
+        return None
+
+    company_ids = sorted({company_id, case_file.company_id})
+    pit = (
+        nullcontext(conn)
+        if installed_shadows(conn)
+        else point_in_time(conn, replay_at, company_ids=company_ids)
+    )
+    with pit:
+        ctx = ProbeContext(
+            conn=conn,
+            config=cfg,
+            # `[allowlists].team_signal` is empty: this probe makes no network
+            # call at all, so the factory exists to satisfy the dataclass and
+            # must never be reached.
+            net_client_factory=_no_network,
+            now=lambda: replay_at,
+        )
+        args = build_args(TeamSignalProbe, case_file, ctx)
+        result = TeamSignalProbe().run(args, ctx)  # type: ignore[arg-type]
+        args_hash_value = hash_args(TeamSignalProbe.name, **args.model_dump(mode="json"))
+
+    return _Observation(
+        probe_name=TeamSignalProbe.name,
+        args_hash=args_hash_value,
+        # The observation is a read of the local capture corpus AS RESTRICTED
+        # TO `T`; its claims carry the capture timestamps they were derived
+        # from (`rli.probes.team_signal`'s availability rule).
+        observed_at=replay_at,
+        result=result,
+    )
+
+
 def _no_network(probe_name: str) -> None:  # pragma: no cover - defensive
     raise AssertionError(
-        f"{probe_name!r} attempted a network call while building the replay dataset's "
-        "company_events record; spec.md §4 requires that probe to read only the "
-        "pre-collected local store"
+        f"{probe_name!r} attempted a network call while building a per-T replay "
+        "dataset record. Every probe collected per T reads only local data — "
+        "`company_events` the pre-collected event store (spec.md §4), `team_signal` "
+        "the board-capture history — and their `[allowlists]` entries are empty, so "
+        "a reached factory is a bug rather than a policy question"
     )
 
 
@@ -1017,7 +1167,7 @@ def build_dataset(
             cases += 1
 
             for observation in observations.values():
-                if observation.probe_name == CompanyEventsProbe.name:
+                if observation.probe_name in _PER_T_PROBES:
                     # Re-run per T below, under the args_hash replay will ask
                     # for. The build-clock execution System A already made is
                     # deliberately NOT stored: its hash carries `as_of=<build
@@ -1052,6 +1202,26 @@ def build_dataset(
                     args_hash=events.args_hash,
                     observed_at=events.observed_at,
                     result=events.result,
+                    created_at=moment,
+                )
+                probe_records += 1
+
+            # `_team_signal_at` opens (and closes) its own point-in-time
+            # context; the save is deliberately out here, after it has exited,
+            # so `replay_probe_results` is never written while the temp
+            # shadows are installed. See `rli.replay.pit`'s "The connection
+            # must never hold a read snapshot across the `yield`".
+            team = _team_signal_at(conn, cfg, case, replay_at, company_id=plan.company_id)
+            if team is not None:
+                store.save(
+                    conn,
+                    dataset_id=dataset_id,
+                    posting_id=plan.posting_id,
+                    replay_at=replay_at,
+                    probe_name=team.probe_name,
+                    args_hash=team.args_hash,
+                    observed_at=team.observed_at,
+                    result=team.result,
                     created_at=moment,
                 )
                 probe_records += 1

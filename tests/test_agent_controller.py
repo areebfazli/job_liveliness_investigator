@@ -489,7 +489,7 @@ def test_team_signal_is_ineligible_while_the_licence_flag_is_false(
     )
     disabled_ctx = _with_config(ctx, disabled)
     decision = _decide(
-        _output(_candidate("team_signal", posting_id=POSTING_ID, company_id=COMPANY)),
+        _output(_candidate("team_signal", posting_id=POSTING_ID, company_id=COMPANY, as_of=NOW)),
         case=_case(),
         cfg=disabled,
         ctx=disabled_ctx,
@@ -513,7 +513,7 @@ def test_team_signal_runs_only_when_licensed_and_the_branch_is_reachable(
         update={"team_signal": cfg.team_signal.model_copy(update={"enabled": True})}
     )
     licensed_ctx = _with_config(ctx, licensed)
-    candidate = _candidate("team_signal", posting_id=POSTING_ID, company_id=COMPANY)
+    candidate = _candidate("team_signal", posting_id=POSTING_ID, company_id=COMPANY, as_of=NOW)
 
     runs = _decide(
         _output(candidate),

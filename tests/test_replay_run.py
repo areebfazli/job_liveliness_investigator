@@ -45,7 +45,7 @@ from rli.eval.system_b import run_system_b
 from rli.events.policy_signals import CLAIM_EVENTS_SEARCHED
 from rli.models.decision import Decision
 from rli.models.time import parse_utc, to_utc_z
-from rli.policy.inputs import CLAIM_POSTING_STATE
+from rli.policy.inputs import CLAIM_POSTING_STATE, CLAIM_TEAM_SIGNAL
 from rli.probes.registry import DYNAMIC_PROBES
 from rli.replay.build import archive_state_args_hash, build_dataset, case_state_at
 from rli.replay.mode import (
@@ -531,6 +531,99 @@ def test_company_events_produces_evidence_in_a_replay_run(
     # claim that makes a "checked, none found" answer citable at all.
     assert by_type.get("layoff")
     assert by_type.get(CLAIM_EVENTS_SEARCHED)
+
+
+# ---------------------------------------------------------------------------
+# H4 (security review): `team_signal` must contribute EVIDENCE at an
+# ARCHIVE-ERA `T`, not only at the build instant.
+#
+# Root cause, briefly: `team_signal`'s probe args now require `as_of`, its
+# `available_at` claim stamps are bounded observation timestamps rather than
+# future-leaking ones, and `rli.replay.build` stores a per-`T` `team_signal`
+# record for each grid time (`_PER_T_PROBES`). Before that fix an
+# archive-era `T` had no `team_signal` record to read at all, so
+# `corroborating_hiring_signal` evidence at such a `T` was structurally
+# always 0 — this section is the end-to-end proof that it no longer is.
+# ---------------------------------------------------------------------------
+
+# `T = NOW - 30d`: the EARLIEST archive-era grid point at which `team_signal`
+# is eligible at all. `thresholds.min_history_days` is 30
+# (tests/test_replay_helpers.py's `seed_corpus` gives ACME's postings a
+# `first_observed` of `NOW - 60d`), so `NOW - 60d` has zero usable history
+# and would prove nothing; `NOW - 30d` is both archive-era (strictly before
+# the build instant `NOW`) and the first `T` the probe can answer at all.
+TEAM_SIGNAL_ARCHIVE_T = NOW - timedelta(days=30)
+
+
+def test_replaying_system_a_and_b_over_a_fresh_dataset_has_zero_violations(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    """The prerequisite the `team_signal` assertion below leans on: a full
+    System A and System B replay over a freshly built dataset must come back
+    completely clean — in particular no `missing_probe_result` violation,
+    which is exactly what an archive-era `team_signal` record going missing
+    would raise (`rli.replay.mode`'s `save_evidence` gate).
+    """
+    _build(conn, cfg)
+
+    a_summary = run_replay(conn, cfg, dataset_id=DATASET, system="A")
+    b_summary = run_replay(conn, cfg, dataset_id=DATASET, system="B")
+
+    assert a_summary.errors == 0, a_summary.describe()
+    assert b_summary.errors == 0, b_summary.describe()
+    assert a_summary.violations == 0, a_summary.describe()
+    assert b_summary.violations == 0, b_summary.describe()
+
+    # Directly against `run_steps`, rather than trusting `violations` alone
+    # to have counted the right thing: no step of either run was ever
+    # recorded as a `missing_probe_result` replay violation.
+    missing = conn.execute(
+        """
+        SELECT COUNT(*) FROM run_steps s JOIN runs r ON r.id = s.run_id
+        WHERE r.mode = 'replay' AND r.id IN (
+            SELECT id FROM runs WHERE mode = 'replay' AND system IN ('A', 'B')
+        ) AND s.decision_type = 'replay_violation:missing_probe_result'
+        """
+    ).fetchone()[0]
+    assert missing == 0
+
+
+def test_team_signal_claims_reach_evidence_at_an_archive_era_t(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    """`team_signal`'s claims must survive the build/replay round trip.
+
+    This is the H4 assertion itself: replay System A (the full-probe
+    reference, so `team_signal` runs unconditionally — see
+    `rli.eval.system_a`'s module docstring) at `TEAM_SIGNAL_ARCHIVE_T`, an
+    archive-era `T`, and confirm at least one `corroborating_hiring_signal`
+    evidence row exists on that run. Before H4's fix this was structurally
+    impossible: an archive-era `T` had no per-`T` `team_signal` record to
+    expose evidence from in the first place.
+    """
+    _build(conn, cfg)
+    assert TEAM_SIGNAL_ARCHIVE_T < NOW  # archive-era: strictly before the build instant
+
+    summary = run_replay(conn, cfg, dataset_id=DATASET, system="A")
+    assert summary.errors == 0, summary.describe()
+    assert summary.violations == 0, summary.describe()
+    assert summary.probe_counts.get("team_signal")
+
+    rows = conn.execute(
+        """
+        SELECT e.claim_type, COUNT(*) AS n
+        FROM evidence e JOIN runs r ON r.id = e.run_id
+        WHERE r.mode = 'replay' AND r.system = 'A' AND r.replay_at = ?
+          AND e.probe = 'team_signal'
+        GROUP BY e.claim_type
+        """,
+        (to_utc_z(TEAM_SIGNAL_ARCHIVE_T),),
+    ).fetchall()
+    by_type = {row["claim_type"]: row["n"] for row in rows}
+
+    # The precise proof H4 asked for: a `corroborating_hiring_signal`
+    # evidence row on a run whose `replay_at` is archive-era.
+    assert by_type.get(CLAIM_TEAM_SIGNAL)
 
 
 # ---------------------------------------------------------------------------

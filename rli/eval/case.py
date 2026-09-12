@@ -70,6 +70,15 @@ docstring has the full account; the rule that falls out of it is that this
 module derives inputs from `EvidenceItem`s and history features and from
 nothing else.
 
+That rule is unchanged, and the reason the blob read looked attractive is
+now gone as well: `rli.probes.team_signal.TeamSignalArgs` carries an `as_of`
+(filled here, as for every probe, by `rli.probes.registry.build_args` from
+`probes.ctx.now()`), `rli.replay.build` re-runs the probe once per `T`, and
+its claims are stamped with the board capture that supports them. So the
+claim path no longer comes back UNKNOWN at every archive-era `T`, and the
+input is populated the way every other evidence-backed input is. The blob is
+still there, and is still read by nothing.
+
 **Why a same-instant `posting_state` + `board_absent` pair is NOT a
 contradiction, and why that is correct.** `rli.policy.quality`'s C2 rule
 fires only when a `board_absent` claim's `available_at` is *strictly later*
@@ -1082,14 +1091,14 @@ def extend_case_state(
     without emitting a claim. Both the read and the keyword are deleted.
 
     The fallback bypassed the point-in-time gate, and in replay that was not
-    a theoretical hole but the normal case. `TeamSignalArgs` carries no
+    a theoretical hole but the normal case. `TeamSignalArgs` carried no
     `as_of`, so ONE cached `team_signal` record — built at dataset-build
-    time — serves every T, and its claims are stamped `available_at = <build
-    time>`. At an archive-era T the gate therefore drops every one of those
-    claims, correctly: nothing the probe said was knowable at T. The `data`
-    blob, however, has no `available_at` to gate on, so the build-time
-    boolean survived and filled the input anyway — a post-T value deciding a
-    pre-T case, with no evidence row behind it, absent from
+    time — served every T, and its claims were stamped `available_at =
+    <build time>`. At an archive-era T the gate therefore dropped every one
+    of those claims, correctly: nothing the probe said was knowable at T.
+    The `data` blob, however, has no `available_at` to gate on, so the
+    build-time boolean survived and filled the input anyway — a post-T value
+    deciding a pre-T case, with no evidence row behind it, absent from
     `case.unpopulated`, and invisible to `rli replay check`, which audits
     `evidence` and `run_steps` rather than policy inputs. This was measured,
     not feared: 830 archive-era replay runs executed `team_signal` with zero
@@ -1097,14 +1106,30 @@ def extend_case_state(
     leaked value was the INVERSE of the honest at-T answer — hiring activity
     that had not happened yet at T had happened by build time.
 
-    If the licensed-adapter path is ever wanted again, the fix is not to
-    re-add a keyword: it is to give `TeamSignalArgs` an `as_of` field and
-    re-run the probe per T, exactly as `company_events` already does, so the
-    value is PRODUCED at T instead of reused across every T — and to emit it
-    as a claim, whose `available_at` the gate can then judge like any other.
-    (`NullTeamSignalSource` returning `ok=False` was never the safeguard it
-    looked like: it only governed whether a blob existed, not whether the
-    blob was knowable at T.)
+    **The `as_of` half of that fix has now landed**, and it is what makes the
+    deletion above cost nothing. `TeamSignalArgs` carries an `as_of`;
+    `rli.probes.registry.build_args` fills it from `probes.ctx.now()`, which
+    is T in replay, so the args this function builds are already the
+    point-in-time question; `rli.probes.team_signal` bounds every window by
+    it and stamps each claim's `available_at` with the board capture that
+    supports the claim; and `rli.replay.build` re-runs the probe per T inside
+    `rli.replay.pit.point_in_time` instead of storing one build-clock record
+    under every T. So at an archive-era T the claim now passes the gate on
+    its own merits and populates the input through the ordinary evidence
+    path. (Datasets BUILT BEFORE that change still hold the one-record-per-
+    posting form and still need a rebuild —
+    `rli.replay.leakage.blob_input_exposures` is how an operator sees which.)
+
+    None of that re-opens the keyword. The rule this function obeys is
+    unchanged and is the durable one: inputs come from `EvidenceItem`s and
+    `rli.history.features`, never from a `ProbeResult.data` blob. A licensed
+    adapter that reports the boolean only in `data` is still unsupported, and
+    still for the right reason — the value must be PRODUCED at T and emitted
+    as a claim whose `available_at` the gate can judge, which is exactly what
+    `rli.probes.team_signal.TeamSignalSource`'s docstring now requires of any
+    alternate source. (`NullTeamSignalSource` returning `ok=False` was never
+    the safeguard it looked like: it only governed whether a blob existed,
+    not whether the blob was knowable at T.)
     """
     case_file = case.case_file()
     if case_file is None:

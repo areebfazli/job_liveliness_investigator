@@ -14,8 +14,9 @@ because it is the kind of denominator that quietly flatters a dataset):
 
 * The window is `[first capture day, last capture day]` in UTC calendar
   days, over ALL `board_snapshots` for the company (own + archive, any
-  `coverage_status`). `history_days` is the span between the first and last
-  capture TIMESTAMPS, in days.
+  `coverage_status`) — or, when `coverage_window` is given an `as_of`, over
+  those captured at or before it. `history_days` is the span between the
+  first and last capture TIMESTAMPS, in days.
 * `complete_capture_days` (the numerator) = distinct UTC days in that window
   carrying at least one `coverage_status='complete'` capture. A `'partial'`
   or `'gap'` day is explicitly NOT counted as covered.
@@ -115,6 +116,36 @@ Other GUESSED / judgment calls:
   before our first capture counts as "new" on the day we first saw it, which
   can overstate recent hiring on a young dataset. That is what
   `history_days`/`history_coverage` are reported alongside the counts for.
+* **`team_activity` is EXPLICITLY `as_of`-bounded, and is correct with or
+  without a point-in-time corpus.** Every quantity it returns is a function
+  of captures and postings observed at or before its `now`: the coverage
+  window is computed with `coverage_window(..., as_of=now)`, the posting
+  scan is restricted to `first_observed IS NOT NULL AND first_observed <=
+  now`, and `open_roles_now` means "still open AS OF `now`"
+  (`first_seen_absent IS NULL OR first_seen_absent > now`).
+
+  This used to rely on the caller being inside
+  `rli.replay.pit.point_in_time` for anything but the two event windows,
+  which was true of replay and of nothing else. It is now a property of the
+  function, and that matters because `rli.probes.team_signal` carries its
+  own `as_of` and must date its claims from it (security review H4).
+
+  **Why `first_observed` and `first_seen_absent` need no re-derivation, and
+  this is the load-bearing argument for the whole arrangement.** Both are
+  MONOTONE in the capture set. `first_observed` is the earliest capture that
+  listed the job and `first_seen_absent` the first observed disappearance —
+  each is a minimum over a growing set, so adding captures taken after `now`
+  can only ever leave an existing value alone or introduce one that is
+  itself after `now`. Concretely: if the stored value is `<= now`, no later
+  capture can have produced it and no later capture can move it earlier, so
+  the stored value IS the at-`now` value; if it is `> now`, the `<= now`
+  bounds above exclude it, which is the correct at-`now` reading ("not yet
+  observed" / "not yet gone"). That is precisely what
+  `rli.replay.pit._install_postings` achieves by re-deriving the lifecycle
+  from the filtered captures, so inside a point-in-time corpus the two
+  agree; outside one, these bounds are what make the answer honest on their
+  own. The aggregates that are NOT monotone in this way — `last_seen_open`,
+  `reappeared_at`, `replacement_job_id` — are deliberately not read here.
 """
 
 from __future__ import annotations
@@ -247,21 +278,48 @@ def _day(value: datetime) -> date:
     return value.astimezone(UTC).date()
 
 
-def coverage_window(conn: sqlite3.Connection, company_id: str) -> CoverageWindow:
+def coverage_window(
+    conn: sqlite3.Connection, company_id: str, as_of: datetime | None = None
+) -> CoverageWindow:
     """Compute `history_days` / `history_coverage` and their inputs.
 
     See the module docstring for the exact definition of "expected daily
     captures" (the `history_coverage` denominator).
+
+    `as_of` bounds the window to captures taken at or before that instant
+    (`captured_at <= as_of`, inclusive, matching spec.md §3's
+    `available_at <= T`). It exists because `team_activity` must be honest
+    about a historical `as_of` even when it is NOT running inside
+    `rli.replay.pit.point_in_time` — the probe that calls it now carries its
+    own `as_of`, and an answer that silently mixed in later captures would be
+    wrong in exactly the way a caller reading it outside a point-in-time
+    corpus could not detect. The default `None` is today's behaviour (every
+    capture we hold), so the ~8 other call sites are unaffected.
+
+    The comparison is lexical on the stored `to_utc_z` string, the
+    fixed-width-microsecond convention `rli.models.time` exists to guarantee
+    and that the `capture_attempts` sub-query below already relies on.
     """
-    rows = conn.execute(
-        """
-        SELECT captured_at, coverage_status
-        FROM board_snapshots
-        WHERE company_id = ?
-        ORDER BY captured_at
-        """,
-        (company_id,),
-    ).fetchall()
+    if as_of is None:
+        rows = conn.execute(
+            """
+            SELECT captured_at, coverage_status
+            FROM board_snapshots
+            WHERE company_id = ?
+            ORDER BY captured_at
+            """,
+            (company_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT captured_at, coverage_status
+            FROM board_snapshots
+            WHERE company_id = ? AND captured_at <= ?
+            ORDER BY captured_at
+            """,
+            (company_id, to_utc_z(as_of)),
+        ).fetchall()
     if not rows:
         return CoverageWindow(company_id=company_id)
 
@@ -277,6 +335,12 @@ def coverage_window(conn: sqlite3.Connection, company_id: str) -> CoverageWindow
 
     # Own-source attempts only: archive attempts are stamped with the
     # backfill run time, not the historical capture date (module docstring).
+    #
+    # No separate `as_of` bound is needed here: the sub-query is already
+    # bracketed by `first_capture_at..last_capture_at`, and under an `as_of`
+    # both of those are themselves `<= as_of`. Adding `AND attempted_at <=
+    # :as_of` would be a redundant clause that a reader would have to prove
+    # harmless.
     attempt_days = {
         _day(parse_utc(row["attempted_at"]))
         for row in conn.execute(
@@ -685,6 +749,10 @@ class TeamActivity(BaseModel):
     them here rather than in the consumer keeps one definition of "in scope"
     (the team-normalization rule above); re-deriving the scope filter in a
     probe would be a second source of truth that could silently disagree.
+
+    EVERY field is a function of captures and postings observed at or before
+    `as_of`, and of nothing later — see the module docstring's judgment call
+    on why that is computable without a point-in-time corpus.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -700,6 +768,16 @@ class TeamActivity(BaseModel):
     # Company-wide, for BOTH scopes — see the module docstring.
     history_days: float
     history_coverage: float
+
+    # The latest board capture taken at or before `as_of`, or None when we
+    # hold no capture for this company that early. It is the timestamp a
+    # NEGATIVE answer rests on: "no activity" is an assertion about the whole
+    # watched window, and the observation that closes that window is the last
+    # capture in it. `rli.probes.team_signal` stamps a `false`
+    # `corroborating_hiring_signal` claim's `available_at` with exactly this,
+    # so the claim is dated by the capture that supports it rather than by a
+    # clock. Company-wide for both scopes, like the two coverage fields above.
+    last_capture_at: datetime | None = None
 
     new_roles_30d: int
     # Newest first (ties by posting_id ascending), for raw_excerpt building.
@@ -738,17 +816,36 @@ def team_activity(
     `now` is required (not defaulted): every caller is either a probe with an
     injected clock or a replay, and a hidden `now_utc()` here would make the
     windows non-reproducible (spec.md §6).
+
+    `now` is also the AS-OF BOUND, not only the window end. Captures taken
+    after it are excluded (`coverage_window(..., as_of=now)`), and so are
+    postings we had not observed by then — see the module docstring's
+    judgment call, which is what makes this function's answer correct
+    outside a point-in-time corpus as well as inside one.
     """
     target = _normalize_team(team)
     scope: Literal["team", "company"] = "company" if target is None else "team"
 
     # Company-wide coverage, reused verbatim for a team-scoped question:
-    # board captures have no per-team cadence (module docstring).
-    coverage = coverage_window(conn, company_id)
+    # board captures have no per-team cadence (module docstring). Bounded by
+    # `now`, so `history_days` / `history_coverage` / `last_capture_at`
+    # describe the window we had actually watched by then.
+    coverage = coverage_window(conn, company_id, as_of=now)
 
     new_roles_from = now - timedelta(days=cfg.team_signal.new_roles_window_days)
     closures_from = now - timedelta(days=cfg.team_signal.closures_window_days)
 
+    # `first_observed IS NOT NULL AND first_observed <= now` is the as-of
+    # bound on the posting set itself, not just on the event windows: a
+    # posting we had not seen by `now` was not on the board we had observed
+    # at `now`, so it must contribute to no count here — not to
+    # `in_scope_postings`, not to `archive_only_postings`, and not to
+    # `open_roles_now`. A NULL `first_observed` is the same case (we have no
+    # evidence we ever saw it), and it is exactly what
+    # `rli.replay.pit._install_postings` leaves behind for a posting unseen
+    # at `T`. The comparison is lexical on `to_utc_z` strings
+    # (`rli.models.time`).
+    #
     # ORDER BY posting_id makes the pre-sort order total, so the stable
     # newest-first sorts below break `at` ties by posting_id ascending.
     rows = conn.execute(
@@ -756,9 +853,11 @@ def team_activity(
         SELECT posting_id, title, team, first_observed, first_seen_absent
         FROM postings
         WHERE company_id = ?
+          AND first_observed IS NOT NULL
+          AND first_observed <= ?
         ORDER BY posting_id
         """,
-        (company_id,),
+        (company_id, to_utc_z(now)),
     ).fetchall()
 
     new_roles: list[TeamActivityEvent] = []
@@ -775,32 +874,35 @@ def team_activity(
         archive_only = row["posting_id"].startswith(_ARCHIVE_ONLY_POSTING_PREFIX)
         if archive_only:
             archive_only_postings += 1
-        if row["first_seen_absent"] is None:
+
+        first_seen_absent = (
+            parse_utc(row["first_seen_absent"]) if row["first_seen_absent"] is not None else None
+        )
+        # "Open AS OF `now`", not "open today": a disappearance first observed
+        # after `now` had not happened yet at `now`.
+        if first_seen_absent is None or first_seen_absent > now:
             open_roles_now += 1
 
-        if row["first_observed"] is not None:
-            first_observed = parse_utc(row["first_observed"])
-            if new_roles_from <= first_observed <= now:
-                new_roles.append(
-                    TeamActivityEvent(
-                        posting_id=row["posting_id"],
-                        title=row["title"],
-                        at=first_observed,
-                        archive_only=archive_only,
-                    )
+        first_observed = parse_utc(row["first_observed"])
+        if new_roles_from <= first_observed <= now:
+            new_roles.append(
+                TeamActivityEvent(
+                    posting_id=row["posting_id"],
+                    title=row["title"],
+                    at=first_observed,
+                    archive_only=archive_only,
                 )
+            )
 
-        if row["first_seen_absent"] is not None:
-            first_seen_absent = parse_utc(row["first_seen_absent"])
-            if closures_from <= first_seen_absent <= now:
-                closures.append(
-                    TeamActivityEvent(
-                        posting_id=row["posting_id"],
-                        title=row["title"],
-                        at=first_seen_absent,
-                        archive_only=archive_only,
-                    )
+        if first_seen_absent is not None and closures_from <= first_seen_absent <= now:
+            closures.append(
+                TeamActivityEvent(
+                    posting_id=row["posting_id"],
+                    title=row["title"],
+                    at=first_seen_absent,
+                    archive_only=archive_only,
                 )
+            )
 
     # Stable sort over a posting_id-ordered list: newest first, ties by
     # posting_id ascending. Deterministic, which is what replay requires.
@@ -814,6 +916,7 @@ def team_activity(
         as_of=now,
         history_days=coverage.history_days,
         history_coverage=coverage.history_coverage,
+        last_capture_at=coverage.last_capture_at,
         new_roles_30d=len(new_roles),
         new_roles=tuple(new_roles),
         closures_60d=len(closures),

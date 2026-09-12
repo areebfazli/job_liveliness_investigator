@@ -432,7 +432,8 @@ def test_an_ineligible_probe_is_rejected_even_with_valid_arguments(
     posting_id = seed_reposted_history(conn, job_id, now=NOW)
     mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
     llm = scripted_llm(
-        [propose("team_signal", posting_id=posting_id, company_id=COMPANY)], cfg=disabled_cfg
+        [propose("team_signal", posting_id=posting_id, company_id=COMPANY, as_of=NOW.isoformat())],
+        cfg=disabled_cfg,
     )
 
     result = _run_c(conn, disabled_cfg, job_id, llm)
@@ -757,7 +758,9 @@ def test_c_agrees_with_a_when_it_chooses_the_same_probes(
             propose("repost_history", posting_id=posting_id),
             propose("company_events", company_id=COMPANY, as_of=NOW.isoformat()),
             propose("requirements_drift", posting_id=posting_id),
-            propose("team_signal", posting_id=posting_id, company_id=COMPANY),
+            propose(
+                "team_signal", posting_id=posting_id, company_id=COMPANY, as_of=NOW.isoformat()
+            ),
         ],
         cfg=cfg,
     )

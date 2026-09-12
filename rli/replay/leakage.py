@@ -116,20 +116,51 @@ violation above asks "did a run DECIDE from an unbacked input?", which the
 H4 code fix answers permanently: with `rli.eval.case` no longer reading the
 blob and `derive_policy_inputs`'s `team_signal=` keyword gone, the input can
 only be populated by a claim, so the rule is structurally unreachable and
-`0` is attainable. This counter asks "is the dataset still CAPABLE of it?",
-and the answer stays yes no matter what the code does:
-`rli.probes.team_signal.TeamSignalArgs` carries no `as_of`, so one
-build-time record serves every `T`, its claims are stamped at the build
-instant and correctly gated out at an archive-era `T`, and its blob goes on
-reporting the boolean for the trace and the codec. Clearing it needs a
-rebuild: give `TeamSignalArgs` an `as_of` and re-run the probe per `T` "the
-way `company_events` already is" — that phrase is `rli.replay.build`'s, said
-there about `repost_history`'s blob; applying it to `team_signal` is this
-module's inference and the security review's recommendation, not a
-quotation. Gating spec.md §6's `0` target on a number no code change can
-move would make the target permanently unreachable and therefore
-meaningless; reporting it as a number keeps every bit of its value — it is
-how an operator sees which datasets are contaminated and must be rebuilt.
+`0` is attainable. This counter asks a different question — "is the DATASET
+still CAPABLE of it?" — and it is a property of the stored records, not of
+the code that reads them. That is why it stays a counter even now that the
+records themselves have been fixed.
+
+**What has changed: `team_signal` should report 0 on a FRESHLY BUILT
+dataset.** `rli.probes.team_signal.TeamSignalArgs` now carries an `as_of`
+(`rli.probes.registry.build_args` fills it from the run clock) and
+`rli.replay.build` re-runs the probe once per `T` inside
+`rli.replay.pit.point_in_time`, exactly the fix this section used to
+prescribe. The consequence for this counter is structural rather than
+statistical: the per-`T` record's `corroborating_hiring_signal` blob key is
+non-null EXACTLY when `rli.probes.team_signal._decide` returned a verdict,
+and that is the same condition under which the probe emits a
+`corroborating_hiring_signal` CLAIM — one `if`, both outputs. That claim's
+`available_at` is now a board-capture time at or before `T`, so it survives
+the gate, lands in `supported`, and the blob key is backed. When `_decide`
+returns Unknown the probe emits no claim AND writes `null`, which
+`_is_decided` reads as "not decided". Neither branch can produce an
+exposure, so the only remaining source of `team_signal` exposures is a
+dataset built before the change.
+
+**Why it remains a COUNTER and not a violation**, for two independent
+reasons:
+
+  (i) Datasets built BEFORE this change are still contaminated — one
+  build-clock record under every `T`, its claims gated out at every
+  archive-era `T`, its blob still answering the input — and an operator
+  needs to see WHICH, by dataset, in order to decide what to rebuild.
+  Turning the number into a violation would make every such dataset fail a
+  check that no code change can fix, which is the failure mode described
+  below.
+
+  (ii) The hazard CLASS outlives the one probe. `company_events`' three
+  keys are covered by this counter today and are expected to stay silent
+  for the same structural reason (its claim and its blob collapse together
+  on `searched_at > as_of`); they are here as a regression guard against
+  its `as_of` ever being dropped, and `team_signal` is now in exactly that
+  position too. Any future probe that writes a policy-input name into
+  `ProbeResult.data` re-arms the counter without touching this module.
+
+Gating spec.md §6's `0` target on this number is therefore still the wrong
+design: reporting it as a number keeps every bit of its value — it is how an
+operator sees which datasets are contaminated and must be rebuilt — while
+the VIOLATION beside it is what the `0` target belongs on.
 
 --------------------------------------------------------------------------
 Judgment calls
@@ -213,18 +244,29 @@ Judgment calls
   1,186 are the failed runs that never reached a decision at all. 0 of the
   6,636 lacked a backing claim at `<= T`.
 
-  The counter cannot reach 0 by any code change, because the exposure is
-  baked into the stored records: `TeamSignalArgs` has no `as_of`, so one
-  build-time record serves every `T` while its claims are gated out at an
-  archive-era `T`. It needs the rebuild described above. Making THAT a
-  violation was considered and rejected: a gate that no code change can
-  satisfy stops being a gate, and a permanently-red `0` target teaches a
-  reader to ignore it — the same failure, in the opposite direction, as the
-  silent CLEAN that let the H4 runs through. Two counts of that population
-  are in circulation and they measure different things: the security
-  review's **830** is the archive-era subset across two datasets, while this
-  counter reports **645** on `dev-300-v2` and **380** on `company-150-v2`
-  (1,025 together), being every served exposure regardless of era.
+  The counter could not reach 0 on an EXISTING dataset by any code change,
+  because the exposure is baked into the stored records: when those datasets
+  were built, `TeamSignalArgs` had no `as_of`, so one build-time record
+  serves every `T` while its claims are gated out at an archive-era `T`. It
+  needs the rebuild described above, which the `as_of` change has since made
+  possible — but a rebuild is an operator action, not a code path, and that
+  is precisely the asymmetry. Making the counter a violation was considered
+  and rejected: a gate that no code change can satisfy stops being a gate,
+  and a permanently-red `0` target teaches a reader to ignore it — the same
+  failure, in the opposite direction, as the silent CLEAN that let the H4
+  runs through.
+
+  All of the figures in this section are PRE-FIX measurements, and are kept
+  as the record of what the hazard cost rather than as a prediction. Two
+  counts of that population are in circulation and they measure different
+  things: the security review's **830** is the archive-era subset across two
+  datasets, while this counter reported **645** on `dev-300-v2` and **380**
+  on `company-150-v2` (1,025 together), being every served exposure
+  regardless of era. The 7,954-run measurement above is from the same era —
+  after the H4 CODE fix (the blob read and the `team_signal=` keyword), and
+  before the `as_of` fix. Rebuilding either dataset against the current
+  builder is what should take its `team_signal` component to 0; the numbers
+  are not re-stated here for a rebuilt dataset until one exists to measure.
 
 * **(c) False positives, and what is deliberately not implemented.** The
   violation admits none by construction: every branch in the table is one
@@ -258,7 +300,10 @@ Judgment calls
   stay silent: its args carry `as_of`, `rli.replay.build` re-runs it per
   `T`, and both its blob triple and its `company_events_searched` claim
   collapse together on `searched_at > as_of` — it is there as a regression
-  guard against that `as_of` ever being dropped. The one read path the
+  guard against that `as_of` ever being dropped. `team_signal` is now in the
+  same position and is expected to be silent on any dataset built after its
+  `as_of` change, for the structural reason given above; on an older dataset
+  it is the thing this counter is reporting. The one read path the
   counter misses is `ReplayProbeStore.claims`, which serves a record without
   writing a `run_steps` row; it is used only for `archive_board_state`,
   whose payload carries no policy-input key.
@@ -588,7 +633,7 @@ class LeakageReport(BaseModel):
             "spec.md §6 allows live LLM calls on cache miss)",
             f"  blob input exposures={self.blob_input_exposures} (not a violation: "
             "a served `data` blob answers a policy input no claim backs at T; "
-            "clearing it needs a dataset rebuild)",
+            "a NONZERO count needs a dataset rebuild to clear)",
         ]
         if self.counts:
             lines.append(

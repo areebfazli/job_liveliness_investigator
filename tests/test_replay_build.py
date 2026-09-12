@@ -30,6 +30,7 @@ from rli.models.time import parse_utc
 from rli.net import hash_args
 from rli.policy.inputs import CLAIM_BOARD_ABSENT, CLAIM_POSTING_STATE
 from rli.probes.company_events import CompanyEventsArgs, CompanyEventsProbe
+from rli.probes.team_signal import TeamSignalArgs, TeamSignalProbe
 from rli.replay.build import (
     archive_state_args_hash,
     archive_state_claims,
@@ -37,7 +38,7 @@ from rli.replay.build import (
     grid_times,
     plan_cases,
 )
-from rli.replay.mode import ARCHIVE_BOARD_STATE_PROBE
+from rli.replay.mode import ARCHIVE_BOARD_STATE_PROBE, decode_probe_data
 
 DATASET = "ds-build"
 OPEN_POSTING = f"greenhouse:{TENANT}:{OPEN_JOB}"
@@ -340,6 +341,141 @@ def test_build_stores_company_events_under_the_args_hash_replay_will_ask_for(
         args = CompanyEventsArgs(company_id=COMPANY, as_of=parse_utc(row["replay_at"]))
         expected = hash_args(CompanyEventsProbe.name, **args.model_dump(mode="json"))
         assert row["args_hash"] == expected
+
+
+@respx.mock
+def test_build_stores_team_signal_under_the_args_hash_replay_will_ask_for(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    """`team_signal`'s args now carry `as_of` too (security review H4's fix),
+    so its hash is a function of T exactly like `company_events`'.
+
+    Unlike `company_events`, `_team_signal_at` runs unconditionally for every
+    `(posting, T)` — there is no eligibility gate on STORAGE, only on
+    exposure at read time (the module docstring: "storage is cheap") — so
+    this must hold for every grid point with no config loosening needed.
+    """
+    seed_corpus(conn)
+    mock_ats()
+    _build(conn, cfg)
+
+    case_times = {
+        parse_utc(row["replay_at"])
+        for row in conn.execute(
+            "SELECT replay_at FROM replay_cases WHERE dataset_id = ? AND posting_id = ?",
+            (DATASET, OPEN_POSTING),
+        )
+    }
+    assert len(case_times) >= 2  # exercise more than a single T, like company_events' test
+
+    rows = conn.execute(
+        """
+        SELECT replay_at, args_hash FROM replay_probe_results
+        WHERE dataset_id = ? AND posting_id = ? AND probe_name = ?
+        ORDER BY replay_at
+        """,
+        (DATASET, OPEN_POSTING, TeamSignalProbe.name),
+    ).fetchall()
+
+    # One record per grid point ...
+    assert {parse_utc(row["replay_at"]) for row in rows} == case_times
+    # ... under a DISTINCT hash per T (that is what "per T" means) ...
+    assert len({row["args_hash"] for row in rows}) == len(rows)
+    # ... and exactly the hash replay will ask for at that T.
+    for row in rows:
+        args = TeamSignalArgs(
+            posting_id=OPEN_POSTING, company_id=COMPANY, as_of=parse_utc(row["replay_at"])
+        )
+        expected = hash_args(TeamSignalProbe.name, **args.model_dump(mode="json"))
+        assert row["args_hash"] == expected
+
+
+@respx.mock
+def test_build_does_not_store_the_build_clock_team_signal_record(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    """The build-clock execution (`as_of=<build instant>`) must never be
+    stored for a T that is not the build instant -- that is precisely the
+    shape security review H4 took: one record collected once at the build
+    clock, stamped `available_at` at the build instant, and served at every
+    archive-era T where it could only ever fail the `available_at <= T` gate.
+
+    `CLOSED_POSTING`'s grid stops at its own closure and never reaches `NOW`
+    (see `test_plan_bounds_a_closed_posting_at_its_first_observed_absence`),
+    so its build-clock hash is guaranteed to differ from every one of its
+    legitimate per-T hashes -- unlike `OPEN_POSTING`, whose grid ends AT
+    `NOW`, where the two would coincide and the assertion would prove
+    nothing.
+    """
+    seed_corpus(conn)
+    mock_ats()
+    _build(conn, cfg)
+
+    case_times = {
+        parse_utc(row["replay_at"])
+        for row in conn.execute(
+            "SELECT replay_at FROM replay_cases WHERE dataset_id = ? AND posting_id = ?",
+            (DATASET, CLOSED_POSTING),
+        )
+    }
+    assert NOW not in case_times  # the build instant is off this posting's own grid
+
+    build_clock_args = TeamSignalArgs(posting_id=CLOSED_POSTING, company_id=COMPANY, as_of=NOW)
+    build_clock_hash = hash_args(TeamSignalProbe.name, **build_clock_args.model_dump(mode="json"))
+
+    rows = conn.execute(
+        """
+        SELECT args_hash FROM replay_probe_results
+        WHERE dataset_id = ? AND posting_id = ? AND probe_name = ?
+        """,
+        (DATASET, CLOSED_POSTING, TeamSignalProbe.name),
+    ).fetchall()
+    stored_hashes = {row["args_hash"] for row in rows}
+    assert stored_hashes  # sanity: team_signal was actually collected for this posting
+    assert build_clock_hash not in stored_hashes
+    # Equivalently: the stored hash set is EXACTLY what the grid computes --
+    # no stray build-clock record hiding alongside the legitimate ones.
+    assert stored_hashes == {
+        hash_args(
+            TeamSignalProbe.name,
+            **TeamSignalArgs(posting_id=CLOSED_POSTING, company_id=COMPANY, as_of=t).model_dump(
+                mode="json"
+            ),
+        )
+        for t in case_times
+    }
+
+
+@respx.mock
+def test_team_signal_claims_never_carry_an_available_at_after_t(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    """Every claim `team_signal` stores must satisfy `available_at <= T` --
+    the `rli.replay.mode.ReplayProbeStore` / policy gate's whole basis, and
+    the reason this probe is now re-run per `T` instead of once at the build
+    instant (security review H4).
+    """
+    seed_corpus(conn)
+    mock_ats()
+    _build(conn, cfg)
+
+    rows = conn.execute(
+        """
+        SELECT replay_at, data FROM replay_probe_results
+        WHERE dataset_id = ? AND probe_name = ?
+        """,
+        (DATASET, TeamSignalProbe.name),
+    ).fetchall()
+    assert rows
+
+    checked_claims = 0
+    for row in rows:
+        t = parse_utc(row["replay_at"])
+        payload = decode_probe_data(row["data"])
+        for claim in payload["evidence"]:
+            assert claim.available_at <= t
+            checked_claims += 1
+    assert checked_claims > 0  # the corpus must actually exercise a non-empty claim set
 
 
 @respx.mock

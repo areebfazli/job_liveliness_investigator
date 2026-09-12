@@ -5,15 +5,28 @@ it). Each violation kind is then PLANTED into that same trace, one at a time,
 so the checker is shown to catch a thing that is genuinely there rather than
 to agree with itself.
 
-`blob_input_exposures` is the one figure the fixture produces WITHOUT
-planting: it reproduces security review H4's dataset hazard for real.
-`team_signal`'s args carry no `as_of`, so one build-time record serves every
-`T`; its claims are stamped at the build instant and the point-in-time gate
-correctly drops them at an archive-era `T`; and its `data` blob goes on
-carrying the boolean for the `corroborating_hiring_signal` policy input.
-`_unexpose_team_signal` blanks that key the way the security review's own
-control did, so the counter can be shown to go to zero on a dataset that no
-longer carries the hazard.
+`blob_input_exposures` USED to be the one figure the fixture produced
+without planting: security review H4's dataset hazard reproduced for real,
+because `TeamSignalArgs` carried no `as_of`, one build-time record served
+every `T`, the point-in-time gate correctly dropped its build-instant claims
+at an archive-era `T`, and its `data` blob went on carrying the boolean for
+the `corroborating_hiring_signal` policy input.
+
+That is fixed at the source: the probe now takes an `as_of`,
+`rli.replay.build` re-runs it per `T` inside `rli.replay.pit.point_in_time`,
+and each claim is stamped with the board capture that supports it — so a
+FRESHLY BUILT dataset reports 0 exposures, which is what
+`test_a_clean_replay_reports_zero_violations` now asserts.
+
+The counter itself is unchanged and still matters, for the two reasons
+`rli.replay.leakage`'s docstring gives: datasets built before the fix are
+still contaminated, and the hazard class outlives the one probe. So the
+pre-fix dataset shape is now PLANTED like every other hazard here, by
+`_plant_the_pre_as_of_dataset_shape`, which rewrites every stored
+`team_signal` record to the build-clock observation — exactly the dataset
+the old builder wrote. `_unexpose_team_signal` then blanks the blob key the
+way the security review's own control did, so the counter can still be shown
+to go to zero on a record that declines to answer.
 """
 
 from __future__ import annotations
@@ -86,6 +99,39 @@ def _a_replay_run(conn: sqlite3.Connection) -> sqlite3.Row:
     return row
 
 
+def _plant_the_pre_as_of_dataset_shape(conn: sqlite3.Connection) -> None:
+    """Rewrite every stored `team_signal` record to the build-clock observation.
+
+    This reproduces the dataset the builder wrote BEFORE `TeamSignalArgs`
+    gained an `as_of`: one live observation, made at the build instant,
+    stored under every grid `T`. The current builder re-runs the probe per
+    `T` (`rli.replay.build._team_signal_at`), so a fresh dataset no longer
+    has this shape and the H4 hazard has to be planted to be tested — which
+    is how every other hazard in this file is shown to be caught.
+
+    Only `data` is rewritten; `args_hash` is left alone, so each run still
+    finds the record it asks `ReplayProbeStore.get` for. The build-clock
+    observation is the one stored at the LAST `T`, which `rli.replay.build`
+    guarantees is the build instant itself (its "the grid endpoint is always
+    included" judgment call).
+    """
+    rows = conn.execute(
+        """
+        SELECT rowid, data FROM replay_probe_results
+        WHERE probe_name = 'team_signal'
+        ORDER BY replay_at
+        """
+    ).fetchall()
+    assert rows, "fixture no longer stores team_signal records"
+    build_clock = rows[-1]["data"]
+    for row in rows:
+        conn.execute(
+            "UPDATE replay_probe_results SET data = ? WHERE rowid = ?",
+            (build_clock, row["rowid"]),
+        )
+    conn.commit()
+
+
 def _unexpose_team_signal(conn: sqlite3.Connection) -> None:
     """Blank the `team_signal` blob's policy-input key in every stored record.
 
@@ -129,10 +175,96 @@ def test_a_clean_replay_reports_zero_violations(conn: sqlite3.Connection, cfg: C
     assert report.failed_runs == 0
     assert report.systems == ("A", "B")
     assert "CLEAN (0 violations)" in report.describe()
-    # Clean is not silent: the dataset hazard is still on the report.
+    # Clean is not silent: the dataset hazard is still ON the report, as a
+    # number, even now that a freshly built dataset carries none of it. The
+    # `as_of` fix took `team_signal` out of the exposed set at the source
+    # (per-`T` collection, claims stamped at the supporting capture), so this
+    # is 0 by construction rather than by luck — see the module docstring.
     assert report.model_cache_misses == 0
-    assert report.blob_input_exposures > 0
+    assert report.blob_input_exposures == 0
     assert "blob input exposures=" in report.describe()
+
+
+def test_every_served_team_signal_blob_that_answers_is_backed_by_a_claim(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    """WHY `blob_input_exposures == 0` holds on a freshly built dataset.
+
+    `test_a_clean_replay_reports_zero_violations` asserts the number; this
+    test re-derives it from the raw trace so a future regression fails on
+    the SPECIFIC served record that stopped being backed, rather than on a
+    count going from 0 to something. Per the module docstring, the fix makes
+    this true by construction — "the per-`T` record's
+    `corroborating_hiring_signal` blob key is non-null EXACTLY when
+    ... the probe emits a `corroborating_hiring_signal` CLAIM ... one `if`,
+    both outputs" — so every replay run that actually EXECUTED `team_signal`
+    (a `run_steps` probe row with an `args_hash`) and was served the record
+    that `args_hash` names, and whose blob decides
+    `corroborating_hiring_signal` (a non-null value), must also hold an
+    `evidence` row of that claim type with `available_at <= replay_at`: the
+    same claim the probe emitted alongside the blob, surviving the
+    point-in-time gate.
+
+    This re-implements `rli.replay.leakage`'s own
+    `(canonical_url, replay_at) -> posting_id` and
+    `(posting_id, replay_at, probe_name, args_hash) -> data` lookups against
+    `replay_cases` / `replay_probe_results` directly, rather than reading
+    `report.blob_input_exposures`, so it fails on a broken INVARIANT even if
+    the counter that reports it were ever miscomputed.
+    """
+    _build(conn, cfg)
+    _replay_both(conn, cfg)
+
+    served_steps = conn.execute(
+        """
+        SELECT DISTINCT rs.run_id, rs.args_hash, r.replay_at, r.input_url
+        FROM run_steps AS rs
+        JOIN runs AS r ON r.id = rs.run_id
+        WHERE rs.component = 'probe' AND rs.probe_name = 'team_signal'
+          AND rs.args_hash IS NOT NULL
+          AND r.mode = 'replay' AND r.replay_at IS NOT NULL
+        """
+    ).fetchall()
+    assert served_steps, "fixture no longer executes team_signal in replay"
+
+    decided_claims_checked = 0
+    for step in served_steps:
+        case = conn.execute(
+            """
+            SELECT posting_id FROM replay_cases
+            WHERE dataset_id = ? AND canonical_url = ? AND replay_at = ?
+            """,
+            (DATASET, step["input_url"], step["replay_at"]),
+        ).fetchone()
+        if case is None:
+            continue
+        record = conn.execute(
+            """
+            SELECT data FROM replay_probe_results
+            WHERE dataset_id = ? AND posting_id = ? AND replay_at = ?
+              AND probe_name = 'team_signal' AND args_hash = ? AND ok = 1
+            """,
+            (DATASET, case["posting_id"], step["replay_at"], step["args_hash"]),
+        ).fetchone()
+        if record is None:
+            continue
+        payload = json.loads(record["data"])
+        if payload.get(TEAM_SIGNAL_KEY) is None:
+            continue
+        decided_claims_checked += 1
+        backing = conn.execute(
+            """
+            SELECT 1 FROM evidence
+            WHERE run_id = ? AND claim_type = ? AND available_at <= ?
+            """,
+            (step["run_id"], TEAM_SIGNAL_KEY, step["replay_at"]),
+        ).fetchone()
+        assert backing is not None, (
+            f"run {step['run_id']} was served a team_signal blob deciding "
+            f"{TEAM_SIGNAL_KEY!r} with no backing claim at available_at <= "
+            f"T={step['replay_at']}"
+        )
+    assert decided_claims_checked > 0, "fixture never served a decided team_signal blob"
 
 
 def test_the_checker_writes_nothing(conn: sqlite3.Connection, cfg: Config) -> None:
@@ -622,15 +754,17 @@ def test_every_branch_requirement_is_a_real_branch_and_a_real_policy_input() -> 
 def test_the_team_signal_blob_exposure_is_counted_without_failing_the_check(
     conn: sqlite3.Connection, cfg: Config
 ) -> None:
-    """H4's DATASET half, reproduced by an ordinary build + replay.
+    """H4's DATASET half, on a dataset built the way datasets were built then.
 
-    Nothing is planted. `team_signal`'s record is built once and served at
-    every `T`; at an archive-era `T` the gate correctly drops its claims and
-    the blob keeps answering `corroborating_hiring_signal` anyway. No code
-    change can clear this — only a rebuild with `as_of` on `TeamSignalArgs` —
-    so it is a number, not a gate.
+    `_plant_the_pre_as_of_dataset_shape` puts the build-clock `team_signal`
+    observation under every `T`, which is what the builder did before
+    `TeamSignalArgs` gained an `as_of`. At an archive-era `T` the gate
+    correctly drops that record's claims and the blob keeps answering
+    `corroborating_hiring_signal` anyway. No CODE change clears it — only a
+    rebuild — which is why it is a number and not a gate.
     """
     _build(conn, cfg)
+    _plant_the_pre_as_of_dataset_shape(conn)
     _replay_both(conn, cfg)
 
     report = check_dataset(conn, DATASET)
@@ -647,6 +781,7 @@ def test_an_exposure_a_run_never_executed_is_not_counted(
     """The dataset stores a record for every probe at every `T`, including ones
     a system never selects (`rli.replay.build`). Only a SERVED record counts."""
     _build(conn, cfg)
+    _plant_the_pre_as_of_dataset_shape(conn)
     _replay_both(conn, cfg)
     assert check_dataset(conn, DATASET).blob_input_exposures > 0
 
@@ -659,6 +794,7 @@ def test_a_blank_blob_value_is_not_a_decided_input(conn: sqlite3.Connection, cfg
     """`None` is the probe's own "Unknown"; a blob that declines to answer is
     not an exposure."""
     _build(conn, cfg)
+    _plant_the_pre_as_of_dataset_shape(conn)
     _replay_both(conn, cfg)
     assert check_dataset(conn, DATASET).blob_input_exposures > 0
 
@@ -696,6 +832,7 @@ def test_a_supporting_claim_at_t_clears_the_exposure(conn: sqlite3.Connection, c
     """A run whose `team_signal` claim survives the gate is not exposed: the
     blob agrees with evidence it was allowed to see."""
     _build(conn, cfg)
+    _plant_the_pre_as_of_dataset_shape(conn)
     _replay_both(conn, cfg)
     before = check_dataset(conn, DATASET)
     assert before.blob_input_exposures > 0

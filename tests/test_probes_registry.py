@@ -136,7 +136,7 @@ def test_build_args_uses_only_the_case_state_and_the_clock(
         company_id=COMPANY, as_of=NOW
     )
     assert build_args(TeamSignalProbe, case, ctx) == TeamSignalArgs(
-        posting_id=POSTING, company_id=COMPANY
+        posting_id=POSTING, company_id=COMPANY, as_of=NOW
     )
 
 

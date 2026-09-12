@@ -96,11 +96,24 @@ def latency_estimate_s(probe_cls: type[Probe], config: Config) -> float:
 def build_args(probe_cls: type[Probe], case_state: CaseFile, ctx: ProbeContext) -> BaseModel:
     """Construct `probe_cls.ArgsModel` from the current case state.
 
-    Every dynamic probe's arguments are fully determined by the case file
-    (plus the clock, for `company_events`' replay boundary), so the
-    controller never has to trust LLM-proposed argument values to run a
-    probe — it validates the proposal and rebuilds the args itself
-    (spec.md §2: "Pydantic-validate probe arguments").
+    Every dynamic probe's arguments are fully determined by the case file,
+    plus the clock for the TWO probes whose answer is a function of a replay
+    boundary: `company_events` (`available_at <= as_of` over the pre-collected
+    event store) and `team_signal` (the board-history windows and the
+    `available_at` its claims carry). So the controller never has to trust
+    LLM-proposed argument values to run a probe — it validates the proposal
+    and rebuilds the args itself (spec.md §2: "Pydantic-validate probe
+    arguments").
+
+    `ctx.now()` is the RUN clock, which under `rli.replay` is `T`. That is
+    what makes this the single place `as_of` is decided: every caller —
+    `rli.eval.system_a`, `rli.eval.system_b`, `rli.agent.controller`,
+    `rli.agent.loop`, `rli.eval.case.extend_case_state` and
+    `rli.replay.build`'s per-`T` helpers — goes through this function, so
+    the builder and the replayed controller cannot disagree about the
+    question being asked (and therefore about `args_hash`). `team_signal`
+    joined `company_events` here as the fix for security review H4; see
+    `rli.probes.team_signal`'s `TeamSignalSource` docstring.
     """
     if probe_cls is RepostHistoryProbe:
         return RepostHistoryArgs(posting_id=case_state.posting_id)
@@ -109,7 +122,11 @@ def build_args(probe_cls: type[Probe], case_state: CaseFile, ctx: ProbeContext) 
     if probe_cls is CompanyEventsProbe:
         return CompanyEventsArgs(company_id=case_state.company_id, as_of=ctx.now())
     if probe_cls is TeamSignalProbe:
-        return TeamSignalArgs(posting_id=case_state.posting_id, company_id=case_state.company_id)
+        return TeamSignalArgs(
+            posting_id=case_state.posting_id,
+            company_id=case_state.company_id,
+            as_of=ctx.now(),
+        )
     # Defensive: unreachable for anything in DYNAMIC_PROBES. Raising beats
     # returning a plausible-looking default, which would run a probe with
     # arguments nobody chose.

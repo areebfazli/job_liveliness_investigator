@@ -865,7 +865,7 @@ class DataQuality(BaseModel):
             f"model cache misses={self.leakage_model_cache_misses} (spec.md §6 allows "
             f"live LLM calls on cache miss), blob input exposures="
             f"{self.leakage_blob_input_exposures} (a served `data` blob answers a policy "
-            f"input no claim backs at T; clearing it needs a dataset rebuild)",
+            f"input no claim backs at T; a nonzero count needs a dataset rebuild to clear)",
         ]
         return "\n".join(lines)
 

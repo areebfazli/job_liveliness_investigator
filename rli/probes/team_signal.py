@@ -92,6 +92,46 @@ GUESSED / judgment calls made in this module
   window, not single dated events; stamping one with the newest contributing
   posting's timestamp would let a downstream "freshest claim wins" ordering
   treat a 30-day aggregate as a point observation.
+* **`available_at` is the CAPTURE that supports the claim — never the wall
+  clock, and never `as_of` itself.** This is the second half of the fix for
+  security review H4 (`TeamSignalArgs.as_of` is the first), and the rule is
+  per claim type:
+
+  - `team_new_roles` -> `max(event.at)` over `activity.new_roles`, i.e. the
+    latest contributing role's `first_observed`, which IS a capture
+    timestamp;
+  - `team_closures` -> `max(event.at)` over `activity.closures`, the latest
+    contributing `first_seen_absent`;
+  - `corroborating_hiring_signal = true` -> `max(event.at)` over the SAME
+    driving event set the quality attribution picks (`new_roles` when they
+    met `min_new_roles`, else `closures`). One rule decides both the label
+    and the stamp, deliberately: two notions of "which count drove this"
+    could disagree, and then a claim would be dated by evidence it was not
+    attributed to;
+  - `corroborating_hiring_signal = false` -> `activity.last_capture_at`, the
+    last board capture at or before `as_of`. A negative rests on the whole
+    watched window, so the observation that supports it is the one that
+    closes that window.
+
+  Both defensive fallbacks are `args.as_of`: an empty driving set (reachable
+  only if a future config sets a `[team_signal]` minimum to 0) and a
+  `last_capture_at` of `None`. Every stamp is clamped to `args.as_of`, so no
+  claim is ever emitted from the future.
+
+  **Why `as_of` itself would be the WRONG stamp**, even though it satisfies
+  the gate. It would be indistinguishable in SHAPE from the wall-clock stamp
+  that caused H4 — one clock-derived instant on every claim, carrying no
+  information about what was observed — so the next reader could not tell a
+  fixed probe from a broken one, and the next regression would be invisible.
+  And it would be a false statement about the world: it would say the fact
+  became knowable at `T`, when a capture days or weeks earlier had already
+  established it. That matters to `rli.policy.quality`'s C2 staleness rule
+  and to any future freshness ordering, both of which read `available_at` as
+  "when we could first have known this", not as "when we asked".
+
+  `fetched_at` stays `ctx.now()`: that is genuinely when this probe read the
+  database, and it is the one thing on a claim that is about the reader
+  rather than about the world.
 * **`source_url` is a self-describing, deliberately non-fetchable
   placeholder** (`TEAM_HISTORY_URL_PLACEHOLDER`), in the style of
   `rli.probes.repost_history.BOARD_HISTORY_URL_PLACEHOLDER` and
@@ -137,14 +177,15 @@ in practice rather than in theory.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import ClassVar, Literal, Protocol
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from rli.config import Config
 from rli.history.features import TeamActivity, TeamActivityEvent, team_activity
 from rli.models.probe import ProbeResult
-from rli.models.time import to_utc_z
+from rli.models.time import ensure_aware, to_utc_z
 from rli.probes.base import Probe, ProbeClaim, ProbeContext
 from rli.probes.lookups import posting_row
 
@@ -185,6 +226,19 @@ SourceQuality = Literal["ats_native", "archive"]
 class TeamSignalArgs(BaseModel):
     posting_id: str
     company_id: str
+    # The run clock, filled by `rli.probes.registry.build_args` from
+    # `ctx.now()` — `T` under replay. Every window this probe applies and
+    # every `available_at` it stamps is bounded by it; see the module
+    # docstring's judgment call on the availability rule.
+    as_of: datetime
+
+    @field_validator("as_of")
+    @classmethod
+    def _as_of_tz_aware_utc(cls, value: datetime) -> datetime:
+        # A naive `as_of` cannot be placed on the `available_at <= T`
+        # timeline (rli.models.time). Same validator, and the same reason, as
+        # `rli.probes.company_events.CompanyEventsArgs`.
+        return ensure_aware(value, "as_of")
 
 
 class TeamSignalSource(Protocol):
@@ -209,14 +263,35 @@ class TeamSignalSource(Protocol):
     and `rli.replay.mode`'s codec want it — but it decides nothing, and an
     implementation that sets ONLY the blob leaves the input UNKNOWN.
 
-    That asymmetry is deliberate and is the fix for security review H4.
-    `rli.eval.case.extend_case_state` used to read the blob whenever the
-    claim path came back UNKNOWN, which is exactly what replay's
-    `available_at <= T` gate produces at an archive-era `T` — so a
+    That asymmetry is deliberate and was the first half of the fix for
+    security review H4. `rli.eval.case.extend_case_state` used to read the
+    blob whenever the claim path came back UNKNOWN, which is exactly what
+    replay's `available_at <= T` gate produced at an archive-era `T` — so a
     build-time boolean decided pre-`T` cases with no evidence behind it. A
-    claim carries `available_at` and can be gated; a blob cannot. A licensed
-    source should additionally use `source_quality="enrichment"` (spec.md
-    §3's source ordering).
+    claim carries `available_at` and can be gated; a blob cannot.
+
+    H4's ROOT CAUSE is now fixed too, and this Protocol is where the
+    obligation lands for anyone else implementing it. The claim path came
+    back UNKNOWN at every archive-era `T` because `TeamSignalArgs` had no
+    `as_of`: `rli.replay.build` collected this probe ONCE, at the build
+    instant, stored that one record under every grid `T`, and stamped its
+    claims `available_at = <build instant>` — so the gate correctly dropped
+    all of them, always. `TeamSignalArgs` now carries `as_of`
+    (`rli.probes.registry.build_args` fills it from the run clock), and
+    `rli.replay.build` re-runs the probe per `T` inside
+    `rli.replay.pit.point_in_time`, exactly as it already did for
+    `company_events`.
+
+    So an alternate source must now do three things, not one: ACCEPT
+    `args.as_of` and treat it as authoritative; BOUND every window and every
+    corpus read by it (`ctx.now()` is for `fetched_at` and nothing else); and
+    stamp each claim's `available_at` at or before it, ideally with the
+    observation that actually supports the claim rather than with `as_of`
+    (see the module docstring's rule and why `as_of` is the wrong stamp). A
+    source that ignores `as_of` reintroduces H4 in its own implementation
+    while every gate around it still reports clean. A licensed source should
+    additionally use `source_quality="enrichment"` (spec.md §3's source
+    ordering).
     """
 
     def fetch(self, args: TeamSignalArgs, ctx: ProbeContext) -> ProbeResult: ...
@@ -347,16 +422,53 @@ def _decision_excerpt(activity: TeamActivity, cfg: Config, hiring_signal: bool) 
     )
 
 
+def _latest_event_at(events: tuple[TeamActivityEvent, ...], as_of: datetime) -> datetime:
+    """The newest capture timestamp behind `events`, or `as_of` when empty.
+
+    `TeamActivityEvent.at` is a capture timestamp by construction — a
+    `first_observed` for a new role, a `first_seen_absent` for a closure —
+    and `team_activity` guarantees every one of them is `<= as_of`. The
+    `default=` is defensive: a count claim is only emitted for a non-zero
+    count, and the positive decision's driving set can be empty only if a
+    future config sets one of the `[team_signal]` minimums to 0.
+    """
+    return max((event.at for event in events), default=as_of)
+
+
+def _at_or_before(stamp: datetime, as_of: datetime) -> datetime:
+    """Clamp an `available_at` to `as_of`. Never emit a claim from the future.
+
+    Explicit rather than asserted: this probe reads a corpus it does not
+    control (and, in `rli.replay.build`, one restricted by
+    `rli.replay.pit.point_in_time`), and the one thing that must hold for
+    every claim it emits is `available_at <= args.as_of` — that is the gate
+    `rli.replay.mode.ReplayProbeRunner.save_evidence` applies. Raising here
+    would turn a corpus oddity into a probe crash, which
+    `rli.probes.base` forbids; clamping degrades to the stamp the caller
+    asked about, which is the conservative direction.
+    """
+    return min(stamp, as_of)
+
+
 class BoardHistoryTeamSignalSource:
     """The default source: spec.md §5's amendment, from own + archive snapshots.
 
     Reads `rli.history.features.team_activity` and turns it into claims. No
     network access, no writes, and no failure mode beyond a `posting_id`
     that does not exist.
+
+    The WINDOWS come from `args.as_of`, never from `ctx.now()`; `ctx.now()`
+    is only what `fetched_at` records, because that is genuinely when this
+    probe read the database. See the module docstring on `available_at`.
     """
 
     def fetch(self, args: TeamSignalArgs, ctx: ProbeContext) -> ProbeResult:
+        # When this probe READ the database. Deliberately not the windows'
+        # clock: under replay `ctx.now()` is `T` too, but under
+        # `rli.replay.build`'s per-`T` collection the two are different
+        # questions and only one of them is `as_of`.
         now = ctx.now()
+        as_of = args.as_of
 
         row = posting_row(ctx.conn, args.posting_id)
         if row is None:
@@ -373,7 +485,7 @@ class BoardHistoryTeamSignalSource:
                 },
             )
 
-        activity = team_activity(ctx.conn, args.company_id, row["team"], now, ctx.config)
+        activity = team_activity(ctx.conn, args.company_id, row["team"], as_of, ctx.config)
         source_url = TEAM_HISTORY_URL_PLACEHOLDER.format(
             company_id=args.company_id,
             team=activity.team or COMPANY_SCOPE_TEAM_SEGMENT,
@@ -382,6 +494,11 @@ class BoardHistoryTeamSignalSource:
         new_roles_quality = _events_quality(activity.new_roles)
         closures_quality = _events_quality(activity.closures)
 
+        # Every `available_at` below is a CAPTURE time (or, for a negative,
+        # the last capture in the watched window) clamped to `args.as_of` by
+        # `_at_or_before`, so the guarantee "no claim this probe emits has
+        # `available_at > args.as_of`" holds by construction at each of the
+        # three call sites rather than by review.
         claims: list[ProbeClaim] = []
         if activity.new_roles_30d > 0:
             claims.append(
@@ -393,7 +510,9 @@ class BoardHistoryTeamSignalSource:
                     source_quality=new_roles_quality,
                     # An aggregate over a window has no single event date.
                     source_event_at=None,
-                    available_at=now,
+                    # The latest contributing role's `first_observed`: the
+                    # capture at which this count became true.
+                    available_at=_at_or_before(_latest_event_at(activity.new_roles, as_of), as_of),
                     fetched_at=now,
                 )
             )
@@ -406,7 +525,8 @@ class BoardHistoryTeamSignalSource:
                     raw_excerpt=_events_excerpt(activity.closures),
                     source_quality=closures_quality,
                     source_event_at=None,
-                    available_at=now,
+                    # The latest contributing `first_seen_absent`.
+                    available_at=_at_or_before(_latest_event_at(activity.closures, as_of), as_of),
                     fetched_at=now,
                 )
             )
@@ -416,14 +536,24 @@ class BoardHistoryTeamSignalSource:
             if hiring_signal:
                 # Attribute the positive to whichever count actually drove it;
                 # if new roles met their minimum they are the evidence, else
-                # the closures are.
-                quality = (
-                    new_roles_quality
+                # the closures are. ONE rule serves both the quality label and
+                # the availability stamp — a second notion of "which count
+                # drove this" could disagree with the first.
+                driving = (
+                    activity.new_roles
                     if activity.new_roles_30d >= ctx.config.team_signal.min_new_roles
-                    else closures_quality
+                    else activity.closures
                 )
+                quality = _events_quality(driving)
+                available_at = _at_or_before(_latest_event_at(driving, as_of), as_of)
             else:
                 quality = _scope_quality(activity)
+                # A negative rests on the WHOLE watched window, not on any
+                # event, so the observation that supports it is the last
+                # capture we took at or before `as_of`. `None` (no capture at
+                # all) is only reachable if a future config sets
+                # `min_history_days` to 0, and falls back to `as_of`.
+                available_at = _at_or_before(activity.last_capture_at or as_of, as_of)
             claims.append(
                 ProbeClaim(
                     claim_type=CORROBORATING_HIRING_SIGNAL_CLAIM_TYPE,
@@ -432,7 +562,7 @@ class BoardHistoryTeamSignalSource:
                     raw_excerpt=_decision_excerpt(activity, ctx.config, hiring_signal),
                     source_quality=quality,
                     source_event_at=None,
-                    available_at=now,
+                    available_at=available_at,
                     fetched_at=now,
                 )
             )
@@ -498,13 +628,21 @@ class TeamSignalProbe(Probe):
         this check already knows. Mirrors `RepostHistoryProbe.eligible`'s
         re-statement of the generic history gate — both gates run
         (`rli.probes.registry`), which is harmless and is the convention here.
+
+        The history is measured at `args.as_of`, NOT at `ctx.now()`, so
+        eligibility is judged on the same clock the run itself uses and on
+        the same window `fetch` will apply. Asking "is there enough history?"
+        of a wider window than the probe will actually read would let a probe
+        be admitted at an archive-era `T` on the strength of captures taken
+        after it — the same class of mistake as security review H4, one step
+        earlier in the pipeline.
         """
         if not ctx.config.team_signal.enabled:
             return False
         row = posting_row(ctx.conn, args.posting_id)
         if row is None:
             return False
-        activity = team_activity(ctx.conn, args.company_id, row["team"], ctx.now(), ctx.config)
+        activity = team_activity(ctx.conn, args.company_id, row["team"], args.as_of, ctx.config)
         return activity.history_days >= ctx.config.thresholds.min_history_days
 
     def run(self, args: TeamSignalArgs, ctx: ProbeContext) -> ProbeResult:

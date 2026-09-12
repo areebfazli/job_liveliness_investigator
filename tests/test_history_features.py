@@ -143,6 +143,33 @@ def test_partial_capture_day_is_attempted_but_not_covered(conn: sqlite3.Connecti
     assert coverage.history_coverage == pytest.approx(2 / 3)
 
 
+def test_as_of_excludes_later_captures_but_none_still_sees_everything(
+    conn: sqlite3.Connection,
+) -> None:
+    """`as_of` bounds `board_snapshots` by `captured_at <= as_of`; default is unbounded.
+
+    Day 100 is "in the future" relative to day 50: with `as_of=at(50)` it must
+    not exist as far as the window is concerned (last capture is day 10, and
+    the day-100 capture contributes to neither `history_days` nor the
+    complete-day count), while the default `as_of=None` must still see it —
+    proving the new parameter changed nothing about today's behaviour.
+    """
+    add_capture(conn, at(0), [job("j1")])
+    add_capture(conn, at(10), [job("j1")])
+    add_capture(conn, at(100), [job("j1")])
+
+    unbounded = coverage_window(conn, COMPANY)
+    assert unbounded.last_capture_at == at(100)
+    assert unbounded.history_days == 100.0
+    assert unbounded.complete_capture_days == 3
+
+    bounded = coverage_window(conn, COMPANY, as_of=at(50))
+    assert bounded.last_capture_at == at(10)
+    assert bounded.history_days == 10.0
+    assert bounded.complete_capture_days == 2
+    assert bounded.calendar_days == 11
+
+
 # ---------------------------------------------------------------------------
 # Thin history must never become a guess (spec.md §4)
 # ---------------------------------------------------------------------------
