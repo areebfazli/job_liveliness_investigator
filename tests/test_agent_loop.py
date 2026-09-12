@@ -90,12 +90,12 @@ from rli.models.decision import Decision
 NOW = datetime(2026, 9, 7, tzinfo=UTC)
 
 # `scripted_llm`'s defaults, restated so the token/cost assertions below read
-# as arithmetic rather than as magic. At `[llm.prices."gemini-2.5-pro"]`
-# (1.25 usd/Mtok in, 10 usd/Mtok out) one scripted call costs
-# 8000/1e6*1.25 + 1000/1e6*10 = 0.02 usd.
+# as arithmetic rather than as magic. At `[llm.prices."mistral-medium-latest"]`
+# (0.40 usd/Mtok in, 2.00 usd/Mtok out) one scripted call costs
+# 8000/1e6*0.40 + 1000/1e6*2.00 = 0.0052 usd.
 INPUT_TOKENS = 8_000
 OUTPUT_TOKENS = 1_000
-CALL_USD = 0.02
+CALL_USD = 0.0052
 
 
 def _run_c(
@@ -223,11 +223,14 @@ def test_cost_cap_stops_the_loop_and_bounds_what_the_loop_spends(
     """`[agent].max_cost_usd` binds the loop, and the loop's spend is real dollars.
 
     The ledger is loaded deliberately: `[agent].max_cost_usd` is cut to
-    0.05 usd and each scripted call is billed 0.02 usd from
-    `[llm.prices]`, so two investigator calls (0.04) fit and the third
-    `company_events` probe (0.017 usd from `[probe_costs]` + `[agent]`) does
-    not. The run must therefore end at a cost-capped controller decision
-    rather than at the step cap, which is four steps away.
+    0.018 usd and each scripted call is billed 0.0052 usd from
+    `[llm.prices]` (see `CALL_USD`), so two investigator calls (0.0104) plus
+    the `repost_history` probe (0.007 usd, low tier: 1*0.002 + 2.0*0.002 +
+    0.1*0.01 from `[probe_costs]` + `[agent]`) fit — 0.0174 spent, 0.0006
+    left — but the third `company_events` probe (0.017 usd, medium tier:
+    3*0.002 + 5.0*0.002 + 0.1*0.01) does not. The run must therefore end at a
+    cost-capped controller decision rather than at the step cap, which is
+    four steps away.
 
     The assertion is made over `component='model'` rows only, because
     `run_steps.cost_usd` mixes two units: `rli.eval.runner` documents a probe
@@ -245,7 +248,7 @@ def test_cost_cap_stops_the_loop_and_bounds_what_the_loop_spends(
     to the deterministic reasons when it will not fit — leaving an
     `explanation_fallback:cost_cap` row instead of a third billed call.
     """
-    capped = cfg.model_copy(update={"agent": cfg.agent.model_copy(update={"max_cost_usd": 0.05})})
+    capped = cfg.model_copy(update={"agent": cfg.agent.model_copy(update={"max_cost_usd": 0.018})})
     job_id = "9103"
     posting_id = seed_reposted_history(conn, job_id, now=NOW)
     mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
@@ -276,8 +279,9 @@ def test_cost_cap_stops_the_loop_and_bounds_what_the_loop_spends(
     assert loop_spend <= cap
 
     # The cap binds the RUN, so the explanation is gated on the same ledger.
-    # Here the two investigator calls (0.04) leave 0.01 against an estimator
-    # of 0.02, so the explanation call is skipped rather than billed.
+    # Here the two investigator calls (0.0104) plus repost_history (0.007)
+    # leave 0.0006 against an estimator of 0.0052, so the explanation call is
+    # skipped rather than billed.
     total_model_spend = sum(row["cost_usd"] for row in _model_rows(steps))
     assert total_model_spend == pytest.approx(2 * CALL_USD)
     assert total_model_spend <= cap
@@ -305,17 +309,18 @@ def test_the_loop_refuses_an_investigator_call_it_cannot_afford(
     `max_llm_cost_seen` — the largest call this run has actually been billed
     for — and stops when the remainder could not cover another one.
 
-    The cap is tuned to land between the two gates: at 0.05 usd the run has
-    0.023 left after one call plus `repost_history`, enough for a second call,
-    and it is the CONTROLLER that then refuses the next probe (the case
+    The cap is tuned to land between the two gates: at 0.018 usd the run has
+    0.0058 left after one call (0.0052) plus `repost_history` (0.007), enough
+    for a second call, and it is the CONTROLLER that then refuses the next
+    probe (the case
     `test_cost_cap_stops_the_loop_and_bounds_what_the_loop_spends` covers). At
-    0.04 the remainder is 0.013 — less than the 0.02 a call has cost — and the
-    loop must stop first, without a second call and therefore without any
-    candidate to reject. The absence of a `candidate_rejected:budget_cost` row
-    is what tells the two stops apart: they share a `decision_type`, so
+    0.014 the remainder is 0.0018 — less than the 0.0052 a call has cost —
+    and the loop must stop first, without a second call and therefore without
+    any candidate to reject. The absence of a `candidate_rejected:budget_cost`
+    row is what tells the two stops apart: they share a `decision_type`, so
     asserting the reason alone would not distinguish them.
     """
-    capped = cfg.model_copy(update={"agent": cfg.agent.model_copy(update={"max_cost_usd": 0.04})})
+    capped = cfg.model_copy(update={"agent": cfg.agent.model_copy(update={"max_cost_usd": 0.014})})
     job_id = "9116"
     posting_id = seed_reposted_history(conn, job_id, now=NOW)
     mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))

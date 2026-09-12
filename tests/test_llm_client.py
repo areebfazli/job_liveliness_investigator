@@ -151,21 +151,21 @@ def sent_body(route: respx.Route, index: int = 0) -> dict[str, Any]:
 
 
 def test_cost_uses_the_config_price_table(cfg: Config) -> None:
-    price = cfg.llm.price_for("gemini-2.5-flash")
+    price = cfg.llm.price_for("mistral-small-latest")
     assert price is not None and (price.input_usd_per_mtok, price.output_usd_per_mtok) == (
+        0.10,
         0.30,
-        2.50,
     )
-    # 1M in @ $0.30 + 0.5M out @ $2.50.
-    assert compute_cost_usd(cfg, "gemini-2.5-flash", 1_000_000, 500_000) == pytest.approx(1.55)
-    assert compute_cost_usd(cfg, "gemini-2.5-flash", 1000, 500) == pytest.approx(0.00155)
+    # 1M in @ $0.10 + 0.5M out @ $0.30.
+    assert compute_cost_usd(cfg, "mistral-small-latest", 1_000_000, 500_000) == pytest.approx(0.25)
+    assert compute_cost_usd(cfg, "mistral-small-latest", 1000, 500) == pytest.approx(0.00025)
 
 
 def test_cost_differs_per_model(cfg: Config) -> None:
-    pro = compute_cost_usd(cfg, "gemini-2.5-pro", 1_000_000, 0)
-    flash = compute_cost_usd(cfg, "gemini-2.5-flash", 1_000_000, 0)
-    assert pro == pytest.approx(1.25)
-    assert flash == pytest.approx(0.30)
+    medium = compute_cost_usd(cfg, "mistral-medium-latest", 1_000_000, 0)
+    ministral_8b = compute_cost_usd(cfg, "ministral-8b-latest", 1_000_000, 0)
+    assert medium == pytest.approx(0.40)
+    assert ministral_8b == pytest.approx(0.10)
 
 
 def test_a_local_model_is_priced_at_zero_explicitly(cfg: Config) -> None:
@@ -183,7 +183,7 @@ def test_unknown_model_costs_zero_and_does_not_raise(cfg: Config) -> None:
 
 
 def test_zero_tokens_cost_zero(cfg: Config) -> None:
-    assert compute_cost_usd(cfg, "gemini-2.5-flash", 0, 0) == 0.0
+    assert compute_cost_usd(cfg, "mistral-small-latest", 0, 0) == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -868,10 +868,11 @@ def test_from_config_model_id_override_is_used_for_the_call_and_the_price(
     cfg: Config, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv(cfg.llm.api_key_env, raising=False)
-    client = OpenAICompatibleClient.from_config(cfg, model_id="gemini-2.5-pro")
+    client = OpenAICompatibleClient.from_config(cfg, model_id="mistral-medium-latest")
     try:
-        assert client.model_id == "gemini-2.5-pro"
-        assert client._cost_usd("gemini-2.5-pro", 1_000_000, 0) == pytest.approx(1.25)
+        assert client.model_id == "mistral-medium-latest"
+        # 1M in @ $0.40/Mtok, 0 out.
+        assert client._cost_usd("mistral-medium-latest", 1_000_000, 0) == pytest.approx(0.40)
     finally:
         client.close()
 
@@ -992,12 +993,13 @@ def test_scripted_client_rejects_a_mismatched_schema() -> None:
 def test_scripted_client_prices_against_config_when_given_one(cfg: Config) -> None:
     client = ScriptedClient(
         [Answer(verdict="a")],
-        model_id="gemini-2.5-flash",
+        model_id="mistral-small-latest",
         input_tokens=1000,
         output_tokens=500,
         cfg=cfg,
     )
-    assert client.complete_structured(make_prompt(), Answer).cost_usd == pytest.approx(0.00155)
+    # 1000 in @ $0.10/Mtok + 500 out @ $0.30/Mtok = (100 + 150) / 1e6.
+    assert client.complete_structured(make_prompt(), Answer).cost_usd == pytest.approx(0.00025)
 
 
 # ---------------------------------------------------------------------------
@@ -1191,8 +1193,8 @@ def test_an_inner_failure_writes_nothing(conn: sqlite3.Connection) -> None:
 
 
 def test_model_id_delegates_to_the_inner_client(conn: sqlite3.Connection) -> None:
-    inner = ScriptedClient([], model_id="gemini-2.5-pro")
-    assert CachedClient(inner, conn).model_id == "gemini-2.5-pro"
+    inner = ScriptedClient([], model_id="mistral-medium-latest")
+    assert CachedClient(inner, conn).model_id == "mistral-medium-latest"
 
 
 @respx.mock

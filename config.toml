@@ -414,13 +414,13 @@ max_retries = 3
 # Client-side throttle: minimum spacing (in requests/minute) the client
 # imposes on its OWN outgoing calls, independent of and in addition to
 # max_retries. Measured 2026-09-11 from Mistral's x-ratelimit headers:
-# ministral-14b-latest allows 30 RPM (ministral-8b 188, ministral-3b 750;
-# Google Gemini flash-lite is 15 RPM and 500/day). Staying under the limit
-# means most calls never see a 429 at all, rather than retrying into one. Set to 0 to disable (unthrottled). This costs nothing on
-# replay: CachedClient serves a hit for every previously-answered case
-# without going anywhere near the network, so a conservative cap here only
-# ever slows down cache MISSES (a changed prompt, a new case), never a replay
-# of an already-cached run.
+# ministral-14b-latest (the default model) allows 30 RPM (ministral-8b 188,
+# ministral-3b 750). Staying under that measured 30 RPM limit means most
+# calls never see a 429 at all, rather than retrying into one. Set to 0 to
+# disable (unthrottled). This costs nothing on replay: CachedClient serves a
+# hit for every previously-answered case without going anywhere near the
+# network, so a conservative cap here only ever slows down cache MISSES (a
+# changed prompt, a new case), never a replay of an already-cached run.
 requests_per_minute = 25
 
 # Ceiling on how long one 429 retry may wait (seconds), overriding both the
@@ -448,15 +448,22 @@ output_usd_per_mtok = 0.0
 input_usd_per_mtok = 0.0
 output_usd_per_mtok = 0.0
 
-# Paid-tier list prices. Gemini's free tier bills nothing but is rate
-# limited; over-reporting cost is the safe direction for a budget ledger.
-[llm.prices."gemini-2.5-flash"]
-input_usd_per_mtok = 0.30
-output_usd_per_mtok = 2.50
+# Paid-tier list prices; over-reporting cost is the safe direction for a
+# budget ledger.
+# ministral-8b-latest: list price for reference; free Experiment tier bills $0.
+[llm.prices."ministral-8b-latest"]
+input_usd_per_mtok = 0.10
+output_usd_per_mtok = 0.10
 
-[llm.prices."gemini-2.5-pro"]
-input_usd_per_mtok = 1.25
-output_usd_per_mtok = 10.00
+# mistral-small-latest: list price for reference; free Experiment tier bills $0.
+[llm.prices."mistral-small-latest"]
+input_usd_per_mtok = 0.10
+output_usd_per_mtok = 0.30
+
+# mistral-medium-latest: list price for reference; free Experiment tier bills $0.
+[llm.prices."mistral-medium-latest"]
+input_usd_per_mtok = 0.40
+output_usd_per_mtok = 2.00
 
 # System C (LLM investigator + deterministic controller, spec.md §4/§6;
 # PLAN.md M5). spec.md §2: "Never rely on the LLM alone for budgets,
@@ -523,11 +530,6 @@ min_accuracy_gain = 0.0
 seed = 20260607
 max_iter = 1000
 c = 1.0
-
-# Free tier bills $0 (paid tier list price: $0.30 in / $2.50 out per MTok).
-[llm.prices."gemini-3.5-flash-lite"]
-input_usd_per_mtok = 0.0
-output_usd_per_mtok = 0.0
 
 # Mistral Experiment tier bills $0 (paid list price ~$0.20 in / $0.20 out per MTok).
 [llm.prices."ministral-14b-latest"]

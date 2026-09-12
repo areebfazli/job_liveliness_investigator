@@ -544,8 +544,9 @@ class Llm(BaseModel):
             "llama3.2:3b": ModelPrice(input_usd_per_mtok=0.0, output_usd_per_mtok=0.0),
             # Paid-tier list prices; the free tier bills 0.0 but is rate
             # limited, so over-reporting cost is the safe direction here.
-            "gemini-2.5-flash": ModelPrice(input_usd_per_mtok=0.30, output_usd_per_mtok=2.50),
-            "gemini-2.5-pro": ModelPrice(input_usd_per_mtok=1.25, output_usd_per_mtok=10.00),
+            "ministral-8b-latest": ModelPrice(input_usd_per_mtok=0.10, output_usd_per_mtok=0.10),
+            "mistral-small-latest": ModelPrice(input_usd_per_mtok=0.10, output_usd_per_mtok=0.30),
+            "mistral-medium-latest": ModelPrice(input_usd_per_mtok=0.40, output_usd_per_mtok=2.00),
         }
     )
 

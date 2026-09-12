@@ -75,7 +75,7 @@ NO_COLLECTION_STATUS = Path(__file__).with_name("_no_collection_status.csv")
 # therefore use a PRICED id, or every cost-cap assertion would pass vacuously
 # against a run that spent nothing — which rules out the default local model,
 # whose price is legitimately 0.0.
-MODEL_ID = "gemini-2.5-pro"
+MODEL_ID = "mistral-medium-latest"
 
 # What `scripted_llm` answers with once its investigator script runs out; see
 # that function's docstring for why exhaustion is a STOP and not an error.
