@@ -310,21 +310,23 @@ steps; no report anywhere quotes one combined "total cost" figure.
 
 ## Agent go/no-go
 
-**Status (2026-09-12): GO — the agent gate passes on both holdout-style datasets.** See `reports/evaluation.md` (temporal dev split, 300 postings / 78 companies / 1,287 replay cases) and `reports/evaluation_company_split.md` (150 postings / 33 companies / 693 cases). System C ran on Mistral `ministral-14b-latest` (free tier); leakage checks are clean on both datasets.
+**Status (2026-09-13): GO — the agent gate passes on both datasets under the amended policy (spec §5 amendments of 2026-09-10 and 2026-09-12).** See `reports/evaluation.md` (temporal dev split, 300 postings / 78 companies / 1,287 replay cases) and `reports/evaluation_company_split.md` (150 postings / 33 companies / 693 cases). System C ran on Mistral `ministral-14b-latest` (free Experiment tier); leakage checks are clean on both datasets, blob exposures 0.
 
-| measure | A (full probes) | B (rules) | C (agent) |
+| measure | A (full probes) | B (rules, b2) | C (agent) |
 |---|---|---|---|
-| paired runs, temporal | 1,192 | 1,192 | 1,192 |
-| action distribution, temporal | apply_now 29 · quick_apply 1,026 · skip 123 · wait 14 | identical | identical |
-| agreement with A, overall / macro | — | 100% / 100% | 100% / 100% |
-| medium/high probes per run, temporal | — | 1.42 | 0.90 (ratio 0.63, gate ≤ 0.70) |
-| medium/high probes per run, company split | — | 1.45 | 0.89 (ratio 0.61) |
-| probe cost points per run, temporal | 7.5 | 6.77 | 4.69 |
-| model calls, temporal | 0 | 0 | 3,188 (free tier, $0) |
+| paired runs, temporal / company | 1,192 / 636 | 1,192 / 636 | 1,192 / 636 |
+| action distribution, temporal (pooled) | apply_now 94 · quick_apply 961 · skip 123 · wait 14 | identical | identical |
+| action distribution, company (pooled) | apply_now 48 · quick_apply 511 · skip 72 · wait 5 | identical | apply_now 47 · quick_apply 512 (one case differs) |
+| agreement with A, overall / macro | — | 100% / 100% both sets | 100% / 100% temporal; 99.2% / 99.5% company |
+| medium/high probes per run, temporal | 2.27 | 1.48 | 0.96 (ratio 0.65, gate ≤ 0.70) |
+| medium/high probes per run, company | — | 1.52 | 0.94 (ratio 0.62) |
+| model calls | 0 | 0 | ~2.5 per case, $0 on the free tier |
 
-**Reading it honestly.** Both legs of the spec §6 gate pass: C uses about 37% fewer medium/high-cost probes than the rules baseline while reproducing System A's decisions exactly, overall and per action class. But the agreement leg is easy on this corpus: most cases are archive-era and route to `quick_apply`, and B also matches A perfectly. The agent earns its place on investigation cost, not on accuracy. Whether that saving is worth the model dependency is a product call; the spec's rule ("if rules are equally good and simpler, remove the agent") does not apply because C is materially cheaper in probes, at the price of ~2.7 model calls per case.
+**Live-era view (the product-relevant slice; 295 of the 1,192 temporal cases fall after own collection began on 2026-09-07):** apply_now 94 · quick_apply 126 · skip 61 · wait 14, identical across A, B and C; C vs B probe ratio 0.68 (informational gate: pass). The remaining 897 cases are archive-era: their only evidence is Wayback captures, which spec §1 defines as weak, so they route to `quick_apply` or `skip` by construction. That block, not the policy, is what makes the pooled distribution look default-heavy.
 
-**Caveats that still stand:** System A is not a neutral upper bound (it runs every eligible probe, so probe-count comparisons flatter leaner systems by construction; that is why the gate measures against B). The policy is tuned but not yet frozen on live-era evidence. Product value is unproven (see below).
+**Reading it honestly.** Both legs of the spec §6 gate pass: C reproduces the reference decisions while running about 35–38% fewer medium/high-cost probes than the rules baseline. Under the 2026-09-12 amendment, an open, strong-evidence role with observed team hiring activity now gets `apply_now` regardless of age; the agent reached all 94 such answers on the temporal set by choosing to run the team probe itself. The rules baseline (re-versioned to b2) reaches them too, so the agent still wins on cost, not on accuracy.
+
+**Caveats that still stand:** System A is not a neutral upper bound (it runs every eligible probe, which is why the gate measures against B). The policy is tuned but not yet frozen on live-era evidence, and the untouched `test` split has not been evaluated. Product value is unproven (see below).
 ## Product gate
 
 **UNPROVEN.** The `outcomes` table is empty. No claim about job-search outcomes is made. Record outcomes via `POST /outcomes` and re-run `rli eval gates`.

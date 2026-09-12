@@ -689,6 +689,223 @@ def test_era_split_section_renders_live_before_archive_with_gate_verdict(
 
 
 # ---------------------------------------------------------------------------
+# Regression: the pooled `## Agent gate` must never leak live-era numbers.
+#
+# `rli.eval.metrics.split_case_set_by_era`'s docstring explains the hazard
+# directly: it hands back a `MetricsCaseSet` whose `systems` tuple is copied
+# VERBATIM from the pooled input, never narrowed to the systems that happen
+# to have a run in that era, because `_case_set_for` only reuses a supplied
+# `case_set` when `all(system in case_set.systems for system in systems)` —
+# a narrowed `systems` fails that check and silently rebuilds a POOLED case
+# set behind an era label. `evaluate` leans on that same fragility from the
+# other side: its pooled `agent_gate(...)` call passes `case_set=case_set`
+# (the pooled set) plus precomputed pooled `candidate_metrics` /
+# `baseline_metrics`, while its `live_era_gate` call passes
+# `case_set=era_case_sets["live-era"]` and no precomputed metrics. Swap
+# either call's `case_set=` (or drop the pooled call's precomputed metrics,
+# or narrow `era_case_sets["live-era"].systems`) and the pooled section
+# would start printing live-era-scoped medium/high-probe numbers with
+# nothing today to catch it.
+# ---------------------------------------------------------------------------
+
+GATE_ERA_DATASET = "ds-m6-gate-era"
+GATE_ERA_CONFIG_HASH = f"policy:v1|probes:v1|dataset:{GATE_ERA_DATASET}"
+GATE_ERA_ARCHIVE_REPLAY_AT = CUTOFF - timedelta(days=20)
+GATE_ERA_LIVE_REPLAY_AT = CUTOFF + timedelta(days=5)
+
+
+def _populate_pooled_vs_live_era_gate(conn: sqlite3.Connection) -> None:
+    """Two archive-era and two live-era cases with OPPOSITE probe profiles.
+
+    Candidate C runs the expensive `A_PROBES` set (2 medium/high steps) in
+    archive-era cases and the cheap `B_PROBES` set (0 medium/high steps) in
+    live-era cases; baseline B runs the exact opposite. That makes the
+    pooled (all 4 cases) and live-era-only (2 cases) medium/high-per-run
+    figures different for BOTH the candidate and the baseline, so a
+    pooled/live-era mixup on either side of the gate cannot land on a number
+    that happens to match by coincidence.
+    """
+    conn.execute(
+        "INSERT INTO companies (company_id, name, website_domain, created_at) "
+        "VALUES (?, 'Acme', ?, ?)",
+        (COMPANY, COMPANY, to_utc_z(CUTOFF)),
+    )
+
+    postings = ("ga1", "ga2", "gl1", "gl2")
+    for posting_id in postings:
+        _add_posting(conn, posting_id, first_observed=CUTOFF - timedelta(days=100))
+
+    conn.execute(
+        """
+        INSERT INTO replay_datasets
+            (dataset_id, created_at, split_kind, split_name, grid_step_days,
+             postings, companies, cases, notes)
+        VALUES (?, ?, 'temporal', 'dev', 30, 4, 1, 4, 'pooled-vs-live-era gate fixture')
+        """,
+        (GATE_ERA_DATASET, to_utc_z(CUTOFF)),
+    )
+
+    cases = (
+        ("ga1", GATE_ERA_ARCHIVE_REPLAY_AT),
+        ("ga2", GATE_ERA_ARCHIVE_REPLAY_AT),
+        ("gl1", GATE_ERA_LIVE_REPLAY_AT),
+        ("gl2", GATE_ERA_LIVE_REPLAY_AT),
+    )
+    for posting_id, replay_at in cases:
+        conn.execute(
+            """
+            INSERT INTO replay_cases
+                (dataset_id, posting_id, replay_at, company_id, canonical_url, built_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                GATE_ERA_DATASET,
+                posting_id,
+                to_utc_z(replay_at),
+                COMPANY,
+                f"https://boards.greenhouse.io/acme/jobs/{posting_id}",
+                to_utc_z(CUTOFF),
+            ),
+        )
+
+    for posting_id, replay_at in cases:
+        is_archive = posting_id.startswith("ga")
+        _add_run(
+            conn,
+            run_id=f"run-a-{posting_id}",
+            posting_id=posting_id,
+            system="A",
+            replay_at=replay_at,
+            action="apply_now",
+            probes=A_PROBES,
+            config_hash=GATE_ERA_CONFIG_HASH,
+        )
+        _add_run(
+            conn,
+            run_id=f"run-b-{posting_id}",
+            posting_id=posting_id,
+            system="B",
+            replay_at=replay_at,
+            action="apply_now",
+            probes=B_PROBES if is_archive else A_PROBES,
+            config_hash=GATE_ERA_CONFIG_HASH,
+        )
+        _add_run(
+            conn,
+            run_id=f"run-c-{posting_id}",
+            posting_id=posting_id,
+            system="C",
+            replay_at=replay_at,
+            action="apply_now",
+            probes=A_PROBES if is_archive else B_PROBES,
+            config_hash=GATE_ERA_CONFIG_HASH,
+        )
+
+    # The own snapshot sits strictly between the archive-era and live-era
+    # `replay_at` values, exactly like `populated_with_own_snapshots` above.
+    _add_board_snapshot(conn, captured_at=CUTOFF, source="own")
+    conn.commit()
+
+
+@pytest.fixture
+def gate_era_split_populated(conn: sqlite3.Connection) -> sqlite3.Connection:
+    _populate_pooled_vs_live_era_gate(conn)
+    return conn
+
+
+def _table_row_cells(section: str, row_label: str) -> list[str]:
+    """The cells of the Markdown table row starting with `| row_label |`.
+
+    Anchored on the literal row prefix (not a loose substring search) so a
+    match only fires on the actual table row, never on prose elsewhere in
+    the section that happens to mention the same words.
+    """
+    prefix = f"| {row_label} |"
+    for line in section.splitlines():
+        if line.startswith(prefix):
+            return [cell.strip() for cell in line.strip().strip("|").split("|")]
+    raise AssertionError(f"no {prefix!r} row found in section:\n{section}")
+
+
+def test_agent_gate_reports_pooled_numbers_not_live_era_numbers(
+    gate_era_split_populated: sqlite3.Connection, cfg: Config, tmp_path: Path
+) -> None:
+    """Pins `evaluate`'s pooled `agent_gate` to POOLED medium/high-probe
+    numbers and its `live_era_gate` to live-era-only numbers — see the block
+    comment above `_populate_pooled_vs_live_era_gate` for the exact
+    `split_case_set_by_era` / `_case_set_for` trap this guards against.
+    """
+    report = evaluate(
+        gate_era_split_populated, cfg, dataset_id=GATE_ERA_DATASET, include_survival=False
+    )
+
+    # --- guard: both eras are actually populated ---------------------------
+    assert report.sample_sizes.archive_era_cases > 0
+    assert report.sample_sizes.live_era_cases > 0
+
+    pooled_c = report.efficiency["C"]
+    pooled_b = report.efficiency["B"]
+    live_c = report.efficiency_by_era["live-era"]["C"]
+    live_b = report.efficiency_by_era["live-era"]["B"]
+
+    # --- guard: the fixture actually discriminates pooled from live-era ----
+    assert pooled_c.mean_medium_high_probes_per_run != live_c.mean_medium_high_probes_per_run, (
+        "fixture is degenerate: pooled and live-era candidate (C) medium/high-per-run "
+        "rates are equal, so this test cannot distinguish a pooled/live-era mixup from "
+        "correct behaviour"
+    )
+    assert pooled_b.mean_medium_high_probes_per_run != live_b.mean_medium_high_probes_per_run, (
+        "fixture is degenerate: pooled and live-era baseline (B) medium/high-per-run "
+        "rates are equal, so this test cannot distinguish a pooled/live-era mixup from "
+        "correct behaviour"
+    )
+
+    # --- the pooled gate must be scoped to ALL cases, not a live-era slice -
+    gate = report.agent_gate
+    assert gate.candidate_medium_high_per_run == pooled_c.mean_medium_high_probes_per_run
+    assert gate.baseline_medium_high_per_run == pooled_b.mean_medium_high_probes_per_run
+    assert gate.candidate_runs == pooled_c.runs
+    assert gate.baseline_runs == pooled_b.runs
+
+    # --- the informational live-era gate must be scoped to live-era only ---
+    live_gate = report.live_era_gate
+    assert live_gate.candidate_medium_high_per_run == live_c.mean_medium_high_probes_per_run
+    assert live_gate.baseline_medium_high_per_run == live_b.mean_medium_high_probes_per_run
+    assert live_gate.candidate_runs == live_c.runs
+    assert live_gate.baseline_runs == live_b.runs
+
+    # --- and the rendered report shows each number in the right section ----
+    text = write_evaluation_report(tmp_path / "gate_era.md", report).read_text(encoding="utf-8")
+
+    pooled_section = text.split("## Agent gate", 1)[1].split("## Product gate", 1)[0]
+    era_section = text.split("## Era split: live vs. archive", 1)[1].split(
+        "## Action distributions", 1
+    )[0]
+    live_gate_section = era_section.split("### Live-era gate (informational)", 1)[1]
+
+    pooled_row = _table_row_cells(pooled_section, "medium/high probes per run")
+    live_row = _table_row_cells(live_gate_section, "medium/high probes per run")
+
+    assert pooled_row[1] == f"{gate.candidate_medium_high_per_run:.2f}"
+    assert pooled_row[2] == f"{gate.baseline_medium_high_per_run:.2f}"
+    assert live_row[1] == f"{live_gate.candidate_medium_high_per_run:.2f}"
+    assert live_row[2] == f"{live_gate.baseline_medium_high_per_run:.2f}"
+    assert pooled_row[1] != live_row[1]
+    assert pooled_row[2] != live_row[2]
+
+    # --- and the console output must not echo BOTH under the spec banner --
+    # `rli eval run` prints `report.describe()`; the live-era re-run sits
+    # directly below the pooled verdict, so an identical "agent gate
+    # (spec.md §6)" banner on both is how a reader ends up quoting the
+    # informational numbers as the spec.md §6 result.
+    described = report.describe()
+    assert described.count("agent gate (spec.md §6)") == 1
+    assert gate.scope == "pooled"
+    assert live_gate.scope == "live-era"
+    assert "agent gate (live-era slice, INFORMATIONAL" in described
+
+
+# ---------------------------------------------------------------------------
 # write_evaluation_report()
 # ---------------------------------------------------------------------------
 

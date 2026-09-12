@@ -197,6 +197,17 @@ class AgentGateResult(BaseModel):
     baseline: str = "B"
     reference: str = "A"
 
+    #: Which slice of the case set this verdict was computed over.
+    #: `"pooled"` — the default — is the authoritative spec.md §6 verdict
+    #: over every scoped case. Any other value (`"live-era"`) marks an
+    #: INFORMATIONAL re-run over a subset, whose numbers are NOT the spec
+    #: verdict. Only `describe()` reads this, but it has to exist: without
+    #: it every gate announces itself as "agent gate (spec.md §6)", so the
+    #: console output of `rli eval run` prints the live-era re-run under
+    #: the spec's own name, one line below the real one, and the two are
+    #: then distinguishable only by their run counts.
+    scope: str = "pooled"
+
     status: Literal["pass", "fail", "not_run"] = "not_run"
     passed: bool | None = None
 
@@ -236,8 +247,18 @@ class AgentGateResult(BaseModel):
             "fail": f"FAIL — {self.candidate} is not kept",
             "not_run": f"NOT RUN — {self.candidate} has no runs in scope; nothing was measured",
         }[self.status]
+        # The scope has to be in the headline, not merely implied by the run
+        # counts below it: `rli eval run` echoes the pooled gate and the
+        # live-era re-run back to back, and an identical "agent gate
+        # (spec.md §6)" banner on both invites reading the second block's
+        # numbers as the spec verdict.
+        title = (
+            "agent gate (spec.md §6)"
+            if self.scope == "pooled"
+            else f"agent gate ({self.scope} slice, INFORMATIONAL - NOT the spec.md §6 verdict)"
+        )
         lines = [
-            f"agent gate (spec.md §6): {headline}",
+            f"{title}: {headline}",
             f"  dataset={self.dataset_id!r} "
             f"splits=[{', '.join(self.allowed_splits) or 'none'}] "
             f"candidate={self.candidate} baseline={self.baseline} "
@@ -286,6 +307,7 @@ def agent_gate(
     candidate_metrics: EfficiencyMetrics | None = None,
     baseline_metrics: EfficiencyMetrics | None = None,
     case_set: MetricsCaseSet | None = None,
+    scope: str = "pooled",
 ) -> AgentGateResult:
     """Evaluate spec.md §6's agent gate for `candidate` against `baseline`.
 
@@ -295,6 +317,11 @@ def agent_gate(
     computed them (`rli.eval.evaluate` does) to avoid re-querying; they are
     recomputed otherwise. See the module docstring for the arithmetic and for
     why an unevidenced sub-check resolves against the candidate.
+
+    `scope` labels which slice of the case set the caller passed in. Leave it
+    at `"pooled"` for the spec.md §6 verdict; pass the era name when
+    `case_set` is an era-filtered subset, so the result announces itself as
+    informational rather than as the spec verdict.
     """
     systems = tuple(dict.fromkeys((candidate, baseline, reference)))
     resolved_case_set = case_set
@@ -347,6 +374,7 @@ def agent_gate(
     base = AgentGateResult(
         dataset_id=dataset_id,
         allowed_splits=tuple(allowed_splits),
+        scope=scope,
         candidate=candidate,
         baseline=baseline,
         reference=reference,

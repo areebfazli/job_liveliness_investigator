@@ -1030,6 +1030,10 @@ def evaluate(
         reference="A",
         allowed_splits=resolved_splits,
         case_set=era_case_sets["live-era"],
+        # Labels the result so `describe()` cannot echo this re-run under the
+        # spec.md §6 banner — `rli eval run` prints it directly below the
+        # pooled verdict, where an identical banner reads as a contradiction.
+        scope="live-era",
     )
 
     outcomes_gate = product_gate(conn, splits=splits, system="A")

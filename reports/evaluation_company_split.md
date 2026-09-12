@@ -1,6 +1,6 @@
 # Evaluation report (spec.md §6 / PLAN.md M6)
 
-Dataset: `company-150-v3` (`split_name=dev`, `split_kind=company`) · Splits read: `dev, validation, test` · `allow_test=True` · Policy version: `policy-v1:8497bfa5fb715679dcc99f693a393b55` · Generated: `2026-09-12T18:33:55.288424Z`
+Dataset: `company-150-v3` (`split_name=dev`, `split_kind=company`) · Splits read: `dev, validation, test` · `allow_test=True` · Policy version: `policy-v1:b500d9ccad04f7a201e43e435f666a59` · Generated: `2026-09-12T23:07:40.521653Z`
 
 ## Headline gate (sample sizes)
 
@@ -10,6 +10,11 @@ Dataset: `company-150-v3` (`split_name=dev`, `split_kind=company`) · Splits rea
 | companies | 33 | 78 | >= 40 | NO |
 | closure events | n/a (a replay case is a (posting, T) grid point, not a closure) | 7183 | >= 100 | yes (corpus-wide) |
 | replay cases scored | 693 | — | — | — |
+| live-era cases (own board-snapshot coverage) | 118 | — | — | — |
+| archive-era cases (Wayback-only) | 518 | — | — | — |
+| live-era share | 18.6% | — | — | — |
+
+Era boundary (own board-snapshot collection began): `2026-09-07T17:43:51.713871Z`. See the 'Era split: live vs. archive' section below.
 
 Headline gate: **NOT MET**.
 
@@ -39,12 +44,96 @@ The two size columns are NOT interchangeable. The collection corpus may clear sp
 
 A case is `(input_url, replay_at)`. An unassignable posting is EXCLUDED rather than defaulted into a split — an unknown split could, for all this report knows, be the holdout.
 
+## Era split: live vs. archive
+
+Archive-era cases are weak by construction, not because of anything either system under test did. For any replay case whose `replay_at` predates this project's own board-snapshot collection, the only observation available is a Wayback capture, so `board_snapshot` evidence is sparse, `source_quality='archive'`, and often absent entirely (spec.md §1 classifies Wayback-only evidence as weak). Those cases carry no own board-snapshot corroboration by construction — the boundary below is simply the instant this project's own daily snapshots began, not a judgement about either system's behaviour, and the pooled agreement figures elsewhere in this report average the two eras together.
+
+Era boundary (own board-snapshot collection began): `2026-09-07T17:43:51.713871Z`.
+
+Cases: live-era=118, archive-era=518, live-era share=18.6%.
+
+### `live-era` — product-relevant view
+
+**A**
+
+| measure | value |
+| --- | --- |
+| action distribution | apply_now=48 quick_apply=36 skip=29 wait=5 |
+| evidence_quality distribution | strong=60 weak=58 |
+| overall agreement with A | 100.0% |
+| macro agreement with A | 100.0% |
+| medium/high probes per run | 2.80 |
+
+**B**
+
+| measure | value |
+| --- | --- |
+| action distribution | apply_now=48 quick_apply=36 skip=29 wait=5 |
+| evidence_quality distribution | strong=60 weak=58 |
+| overall agreement with A | 100.0% |
+| macro agreement with A | 100.0% |
+| medium/high probes per run | 1.69 |
+
+**C**
+
+| measure | value |
+| --- | --- |
+| action distribution | apply_now=47 quick_apply=37 skip=29 wait=5 |
+| evidence_quality distribution | strong=60 weak=58 |
+| overall agreement with A | 99.2% |
+| macro agreement with A | 99.5% |
+| medium/high probes per run | 1.07 |
+
+### `archive-era`
+
+**A**
+
+| measure | value |
+| --- | --- |
+| action distribution | quick_apply=475 skip=43 |
+| evidence_quality distribution | weak=518 |
+| overall agreement with A | 100.0% |
+| macro agreement with A | 100.0% |
+| medium/high probes per run | 2.29 |
+
+**B**
+
+| measure | value |
+| --- | --- |
+| action distribution | quick_apply=475 skip=43 |
+| evidence_quality distribution | weak=518 |
+| overall agreement with A | 100.0% |
+| macro agreement with A | 100.0% |
+| medium/high probes per run | 1.48 |
+
+**C**
+
+| measure | value |
+| --- | --- |
+| action distribution | quick_apply=475 skip=43 |
+| evidence_quality distribution | weak=518 |
+| overall agreement with A | 100.0% |
+| macro agreement with A | 100.0% |
+| medium/high probes per run | 0.92 |
+
+### Live-era gate (informational)
+
+This is an INFORMATIONAL, NON-authoritative re-run of the spec.md §6 agent gate, scoped to live-era cases only, using the same three legs and thresholds. **The pooled 'Agent gate' section below remains the authoritative spec.md §6 verdict** — nothing here replaces it; this exists only to show whether that verdict would look different on the product-relevant (live-era) slice.
+
+| leg | candidate (C) | baseline (B) | requirement | pass? |
+| --- | --- | --- | --- | --- |
+| medium/high probes per run | 1.07 | 1.69 | ratio 0.63 <= 0.70 | yes |
+| overall agreement with A | 99.2% | 100.0% | >= 98.0% | yes |
+| macro agreement with A | 99.5% | 100.0% | >= 98.0% | yes |
+
+Live-era gate verdict (informational, NON-authoritative): **PASS**.
+
 ## Action distributions
 
 | action | A | B | C |
 | --- | --- | --- | --- |
-| apply_now | 13 | 13 | 13 |
-| quick_apply | 546 | 546 | 546 |
+| apply_now | 48 | 48 | 47 |
+| quick_apply | 511 | 511 | 512 |
 | skip | 72 | 72 | 72 |
 | wait | 5 | 5 | 5 |
 
@@ -56,7 +145,7 @@ spec.md §6 requires agreement to be read WITH the action distribution: a defaul
 | --- | --- | --- | --- |
 | A | 636 | 100.0% | 100.0% |
 | B | 636 | 100.0% | 100.0% |
-| C | 636 | 100.0% | 100.0% |
+| C | 636 | 99.8% | 99.5% |
 
 `A` compared against itself is trivially 100% and is shown so that A's own probe, cost and latency figures have a row in every table below.
 
@@ -66,8 +155,8 @@ spec.md §6 requires agreement to be read WITH the action distribution: a defaul
 
 | A action | n (A count) | A agreement |
 | --- | --- | --- |
-| apply_now | 13 | 100.0% |
-| quick_apply | 546 | 100.0% |
+| apply_now | 48 | 100.0% |
+| quick_apply | 511 | 100.0% |
 | skip | 72 | 100.0% |
 | wait | 5 | 100.0% |
 
@@ -75,8 +164,8 @@ spec.md §6 requires agreement to be read WITH the action distribution: a defaul
 
 | A action | n (A count) | B agreement |
 | --- | --- | --- |
-| apply_now | 13 | 100.0% |
-| quick_apply | 546 | 100.0% |
+| apply_now | 48 | 100.0% |
+| quick_apply | 511 | 100.0% |
 | skip | 72 | 100.0% |
 | wait | 5 | 100.0% |
 
@@ -84,8 +173,8 @@ spec.md §6 requires agreement to be read WITH the action distribution: a defaul
 
 | A action | n (A count) | C agreement |
 | --- | --- | --- |
-| apply_now | 13 | 100.0% |
-| quick_apply | 546 | 100.0% |
+| apply_now | 48 | 97.9% |
+| quick_apply | 511 | 100.0% |
 | skip | 72 | 100.0% |
 | wait | 5 | 100.0% |
 
@@ -95,8 +184,8 @@ spec.md §6 requires agreement to be read WITH the action distribution: a defaul
 
 | A \ A | apply_now | quick_apply | skip | wait |
 | --- | --- | --- | --- | --- |
-| apply_now | 13 | 0 | 0 | 0 |
-| quick_apply | 0 | 546 | 0 | 0 |
+| apply_now | 48 | 0 | 0 | 0 |
+| quick_apply | 0 | 511 | 0 | 0 |
 | skip | 0 | 0 | 72 | 0 |
 | wait | 0 | 0 | 0 | 5 |
 
@@ -104,8 +193,8 @@ spec.md §6 requires agreement to be read WITH the action distribution: a defaul
 
 | A \ B | apply_now | quick_apply | skip | wait |
 | --- | --- | --- | --- | --- |
-| apply_now | 13 | 0 | 0 | 0 |
-| quick_apply | 0 | 546 | 0 | 0 |
+| apply_now | 48 | 0 | 0 | 0 |
+| quick_apply | 0 | 511 | 0 | 0 |
 | skip | 0 | 0 | 72 | 0 |
 | wait | 0 | 0 | 0 | 5 |
 
@@ -113,8 +202,8 @@ spec.md §6 requires agreement to be read WITH the action distribution: a defaul
 
 | A \ C | apply_now | quick_apply | skip | wait |
 | --- | --- | --- | --- | --- |
-| apply_now | 13 | 0 | 0 | 0 |
-| quick_apply | 0 | 546 | 0 | 0 |
+| apply_now | 47 | 1 | 0 | 0 |
+| quick_apply | 0 | 511 | 0 | 0 |
 | skip | 0 | 0 | 72 | 0 |
 | wait | 0 | 0 | 0 | 5 |
 
@@ -123,9 +212,9 @@ spec.md §6 requires agreement to be read WITH the action distribution: a defaul
 
 | system | runs | probe steps | probe cost POINTS (total) | probe cost POINTS (mean/run) | model steps | model cost USD (total) | model cost USD (mean/run) | tokens in/out | latency ms (total) | latency ms (mean/run) |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| A | 636 | 3228 | 9340.00 | 14.69 | 0 | $0.0000 | $0.0000 | 0/0 | 1016 | 2 |
-| B | 636 | 2558 | 4408.00 | 6.93 | 0 | $0.0000 | $0.0000 | 0/0 | 996 | 2 |
-| C | 636 | 1836 | 2964.00 | 4.66 | 1704 | $0.0000 | $0.0000 | 1007214/116515 | 1770427 | 2784 |
+| A | 636 | 3228 | 9340.00 | 14.69 | 0 | $0.0000 | $0.0000 | 0/0 | 1210 | 2 |
+| B | 636 | 2599 | 4818.00 | 7.58 | 0 | $0.0000 | $0.0000 | 0/0 | 1008 | 2 |
+| C | 636 | 1873 | 3334.00 | 5.24 | 1743 | $0.0000 | $0.0000 | 486719/45480 | 944464 | 1485 |
 
 **These are two different units and are NEVER summed.** `run_steps.cost_usd` holds unitless placeholder cost POINTS on `component='probe'` rows (configured in `[probe_costs]`: low=1, medium=3, high=10) and REAL DOLLARS on `component='model'` rows. `runs.total_cost_usd` adds the two together, which is why it is not quoted anywhere in this report and why no combined 'total cost' column exists. A probe-heavy system and a model-heavy system are not comparable on one axis.
 
@@ -136,8 +225,8 @@ Latency is SUMMED STEP LATENCY, a lower bound on wall-clock time: it excludes co
 | system | probe steps by tier | medium/high probe steps | repeated calls | invalid arguments | recovered / runs with a failed probe | early-stop regret cases / opportunities | unnecessary probe steps | A's extra probes that changed no action | undecodable decisions |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | A | high=440 low=1712 medium=1076 | 1516 (2.38/run) | 0 | 0 | 0/0 (n/a) | 0/0 (n/a) | 908 (46.4%) | 0 | 0 |
-| B | low=1633 medium=925 | 925 (1.45/run) | 0 | 0 | 0/0 (n/a) | 0/441 (0.0%) | 784 (61.0%) | 670 | 0 |
-| C | low=1272 medium=564 | 564 (0.89/run) | 0 | 0 | 0/0 (n/a) | 0/441 (0.0%) | 110 (19.5%) | 1392 | 0 |
+| B | high=41 low=1633 medium=925 | 966 (1.52/run) | 0 | 0 | 0/0 (n/a) | 0/400 (0.0%) | 784 (59.1%) | 629 | 0 |
+| C | high=37 low=1272 medium=564 | 601 (0.94/run) | 0 | 0 | 0/0 (n/a) | 1/441 (0.2%) | 110 (18.3%) | 1352 | 0 |
 
 `repeated calls` and `invalid arguments` are controller-forbidden events: any nonzero value is a real finding, not noise.
 
@@ -166,9 +255,9 @@ Scoped to system(s) `A` over splits `dev, validation, test`. System A runs every
 | every cited evidence id exists | 1191 (100.0%) |
 | reasons citing a missing id | 0 |
 | reasons citing no id at all | 0 |
-| classified / unclassified reason text | 775 / 416 |
-| supported / unsupported (of classified) | 775 / 0 (100.0%) |
-| claim families seen | company_event=6 posting_state=708 publish=61 |
+| classified / unclassified reason text | 1025 / 166 |
+| supported / unsupported (of classified) | 1025 / 0 (100.0%) |
+| claim families seen | company_event=6 posting_state=958 publish=61 |
 
 An UNCLASSIFIED reason is one whose text matched no claim family: it is reported, never guessed at, and counts as neither supported nor unsupported. A reason citing no evidence id at all does not count as 'all ids exist'.
 
@@ -214,17 +303,17 @@ Verdict: **PASS** (candidate runs: 636, baseline runs: 636).
 
 | leg | candidate (C) | baseline (B) | requirement | pass? |
 | --- | --- | --- | --- | --- |
-| medium/high probes per run | 0.89 | 1.45 | ratio 0.61 <= 0.70 | yes |
-| overall agreement with A | 100.0% | 100.0% | >= 98.0% | yes |
-| macro agreement with A | 100.0% | 100.0% | >= 98.0% | yes |
+| medium/high probes per run | 0.94 | 1.52 | ratio 0.62 <= 0.70 | yes |
+| overall agreement with A | 99.8% | 100.0% | >= 98.0% | yes |
+| macro agreement with A | 99.5% | 100.0% | >= 98.0% | yes |
 
 Notes:
 
 - STRUCTURAL CAVEAT: System A is not a neutral upper bound. `rli.eval.system_a` calls `eligible_probes(..., unpopulated_inputs=set(ALL_DYNAMIC_INPUTS))`, which makes spec.md §4's unresolved-question gate vacuous for A: A runs every dynamic probe that survives the history and licensing gates, whether or not that probe could change the action. System C is gated by `rli.policy.inputs.could_change_action` and therefore skips probes A always runs. Every probe-count comparison against A (medium/high probe use, cost points, latency, 'unnecessary probes', early-stop regret) is biased in the leaner system's favour BY CONSTRUCTION, not by measurement. This is why spec.md §6's agent gate measures probe use against System B rather than against A. Read agreement-with-A as an accuracy figure, and probe-count-vs-A as an upper bound on achievable savings — never as evidence that A wasted work.
 - the held-out 'test' split is IN SCOPE for this gate. spec.md §6 permits this once, for the final evaluation; any tuning decision made after reading it invalidates the holdout.
-- probe use: C=0.886792 medium/high probe steps per run (564 steps / 636 runs) vs B=1.454403 (925 steps / 636 runs); allowed <= 0.70 x 1.454403 = 1.018082 (+1e-09 tolerance) -> PASS
-- overall agreement with A: C=1.000000 vs B=1.000000; required >= 1.000000 - 0.02 = 0.980000 (-1e-09 tolerance) -> PASS
-- macro agreement with A: C=1.000000 vs B=1.000000; required >= 1.000000 - 0.02 = 0.980000 (-1e-09 tolerance) -> PASS
+- probe use: C=0.944969 medium/high probe steps per run (601 steps / 636 runs) vs B=1.518868 (966 steps / 636 runs); allowed <= 0.70 x 1.518868 = 1.063208 (+1e-09 tolerance) -> PASS
+- overall agreement with A: C=0.998428 vs B=1.000000; required >= 1.000000 - 0.02 = 0.980000 (-1e-09 tolerance) -> PASS
+- macro agreement with A: C=0.994792 vs B=1.000000; required >= 1.000000 - 0.02 = 0.980000 (-1e-09 tolerance) -> PASS
 
 ## Product gate
 
@@ -263,7 +352,7 @@ spec.md §6's C2 is System C with a learned probe ranking substituted for the de
 | status | degenerate |
 | rows (candidate probe decisions) | 1956 |
 | train / holdout rows | 1467 / 489 |
-| positive rate (train / holdout) | 0.0% / 0.0% |
+| positive rate (train / holdout) | 0.2% / 0.6% |
 | features | has_board_absent, has_board_present, has_publish_evidence, n_evidence, n_evidence_archive, n_evidence_ats_native, n_evidence_enrichment, n_evidence_news, n_evidence_page_structured, n_probes_before, probe_cost_points, probe_is_company_events, probe_is_repost_history, probe_is_requirements_drift, probe_is_team_signal |
 | learned AUC / accuracy | n/a / n/a |
 | deterministic AUC / accuracy | n/a / n/a |
