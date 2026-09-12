@@ -32,4 +32,4 @@ for ds in "${DATASETS[@]}"; do
     echo "$(date -u +%FT%TZ) dataset=$ds failed rc=$rc; retrying in 10 min" | tee -a "$LOG"; sleep 600
   done
 done
-uv run rli replay status --dataset dev-300-v2 --db data/rli.db | tee -a "$LOG"
+for ds in "${DATASETS[@]}"; do uv run rli replay status --dataset "$ds" --db data/rli.db | tee -a "$LOG"; done

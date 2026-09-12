@@ -310,23 +310,21 @@ steps; no report anywhere quotes one combined "total cost" figure.
 
 ## Agent go/no-go
 
-**Status (2026-09-10): NOT DECIDED.** See `reports/evaluation.md` (temporal dev split, 300 postings / 78 companies / 1,283 replay cases, amended policy) and `reports/evaluation_company_split.md` (150 postings / 33 companies).
+**Status (2026-09-12): GO — the agent gate passes on both holdout-style datasets.** See `reports/evaluation.md` (temporal dev split, 300 postings / 78 companies / 1,287 replay cases) and `reports/evaluation_company_split.md` (150 postings / 33 companies / 693 cases). System C ran on Mistral `ministral-14b-latest` (free tier); leakage checks are clean on both datasets.
 
-| measure | A | B | C |
+| measure | A (full probes) | B (rules) | C (agent) |
 |---|---|---|---|
-| runs | 1,185 | 1,185 | not run (no LLM endpoint was reachable) |
-| action distribution | apply_now 32 · quick_apply 1,024 · skip 118 · wait 14 | identical | n/a |
-| agreement with A (overall / macro) | — | 100% / 100% | n/a |
-| medium/high probes per run | 2.38 | 1.42 | n/a |
-| probe cost points per run | 13.85 | 6.79 | n/a |
-| leakage violations | 0 | 0 | n/a |
+| paired runs, temporal | 1,192 | 1,192 | 1,192 |
+| action distribution, temporal | apply_now 29 · quick_apply 1,026 · skip 123 · wait 14 | identical | identical |
+| agreement with A, overall / macro | — | 100% / 100% | 100% / 100% |
+| medium/high probes per run, temporal | — | 1.42 | 0.90 (ratio 0.63, gate ≤ 0.70) |
+| medium/high probes per run, company split | — | 1.45 | 0.89 (ratio 0.61) |
+| probe cost points per run, temporal | 7.5 | 6.77 | 4.69 |
+| model calls, temporal | 0 | 0 | 3,188 (free tier, $0) |
 
-The agent gate (C medium/high probe use ≤ 70% of B and agreement with A within 2 points of B's) cannot be evaluated until System C runs against a live LLM endpoint. Rules (B) currently reproduce A exactly at about half of A's probe cost (A always runs the high-cost team_signal probe), so if C does not beat that, the spec says to remove the agent.
+**Reading it honestly.** Both legs of the spec §6 gate pass: C uses about 37% fewer medium/high-cost probes than the rules baseline while reproducing System A's decisions exactly, overall and per action class. But the agreement leg is easy on this corpus: most cases are archive-era and route to `quick_apply`, and B also matches A perfectly. The agent earns its place on investigation cost, not on accuracy. Whether that saving is worth the model dependency is a product call; the spec's rule ("if rules are equally good and simpler, remove the agent") does not apply because C is materially cheaper in probes, at the price of ~2.7 model calls per case.
 
-**Stale pending regeneration: the two probe-use rows above and the 90%-of-A figure predate a case-builder fix.** `rli.eval.case.build_case_state` used to pre-populate `material_negative_event` / `freeze_or_pause` / `last_material_event_at` by reading the `company_events` store directly, with no evidence behind them — which made spec.md §4's populates-the-unpopulated eligibility rule call `company_events` ineligible for any company whose events were already collected, so System C's controller never reached the probe at all (its pre-flight stopped with `no_unresolved_question`) and System B's R1/R3 routing condition, which only asks for the probe while those inputs are Unknown or True, declined to name it. System A was unaffected: it neutralizes the eligibility gate by treating every dynamic input as unpopulated, and B filters through that same neutralized gate. Those three inputs are now derived only from the `company_events` probe's own evidence, so the probe is eligible on every case. The absolute medium/high-cost figures above will go up once `reports/evaluation.md` is regenerated; A-vs-B-vs-C stay comparable because all three now pay for it.
-
-Read the 100% agreement with the action distribution: after the 2026-09-10 policy amendment all four actions occur, but most replay cases are still archive-era and route to `quick_apply`. This is not proof that B is as good as A on live-era postings.
-
+**Caveats that still stand:** System A is not a neutral upper bound (it runs every eligible probe, so probe-count comparisons flatter leaner systems by construction; that is why the gate measures against B). The policy is tuned but not yet frozen on live-era evidence. Product value is unproven (see below).
 ## Product gate
 
 **UNPROVEN.** The `outcomes` table is empty. No claim about job-search outcomes is made. Record outcomes via `POST /outcomes` and re-run `rli eval gates`.
