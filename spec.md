@@ -285,6 +285,33 @@ otherwise                                          → quick_apply
 
 `team_signal` remains the only source for `corroborating_hiring_signal` and keeps its medium/high cost tier so the controller must still justify running it. Its data source is now first-party board history rather than a licensed feed; §4's table row is read accordingly. All new thresholds live in `config.toml` and are frozen with the rest of the policy.
 
+#### Amendment 2026-09-12 (positive hiring-activity path, before freeze)
+
+Evaluation on rebuilt datasets showed that among live, strong-evidence open roles the policy says `apply_now` only when the role was published or refreshed within `recent_publish_days`; an open role older than that can never rise above `quick_apply`, whatever the employer is doing. The 2026-09-10 table is kept verbatim as **before**; the version below is **after** and is what the code implements from this date.
+
+| Rule | Before | After |
+|---|---|---|
+| `apply_now` via hiring activity (new row) | — | open + strong evidence + no material negative event + `corroborating_hiring_signal` = true → `apply_now`, regardless of publish recency |
+| `team_signal` eligibility (§4) | only when `corroborating_hiring_signal` is unknown **and** the repost/long-lived skip branch is reachable | only when `corroborating_hiring_signal` is unknown **and** either the repost/long-lived skip branch **or** this hiring-activity `apply_now` branch is reachable |
+
+```text
+closed                                             → skip
+open + unresolved posting state                    → wait
+open + explicit freeze/pause or declared expiry
+     + unresolved current status                   → wait
+open + material negative event after last refresh  → wait
+repeated unchanged repost + long-lived history
+     + corroborating hiring signal = false         → skip
+open + recent + strong evidence
+     + no material negative event                  → apply_now
+open + strong evidence + no material negative event
+     + corroborating hiring signal = true          → apply_now   (new)
+open + mixed/weak evidence                         → quick_apply
+otherwise                                          → quick_apply
+```
+
+The new row sits after the recency `apply_now` row so a recent role never needs the probe. `corroborating_hiring_signal` keeps its single source (`team_signal`, first-party board history) and its cost tier. The deterministic rules baseline (System B) is re-versioned to route `team_signal` whenever this row is reachable, so A, B and C are compared under the same table.
+
 ### Outcome data
 
 **Posting behavior:** closure/repost timing from snapshots. Open postings are right-censored; archive-derived closures are interval-censored (`last_seen_open`, `first_seen_absent`). Use a library with interval-censored fitters (lifelines) for evaluation, or, if using scikit-survival, use interval midpoints with interval width recorded as a covariate and say so in the report. Do not use posting survival probability as the v1 action engine.
