@@ -1,0 +1,69 @@
+clear.bank|ClearBank
+candidco.com|Candid
+getclera.com|Clera
+coins.ph|Coins.ph
+cannabisandglass.com|Cannabis & Glass
+clickhouse.com|ClickHouse
+canonical.com|Canonical
+clickup.com|ClickUp
+getcanopy.com|Canopy
+clipboardworks.com|Clipboard
+easterncommunications.com|Eastern Communications
+clipbook.com|Clipbook
+cloaked.com|Cloaked
+capfi.fr|CAPFI
+capgemini.com|Capgemini Invent
+cloudscaler.com|Cloudscaler
+lightcast.io|Lightcast
+cloudzero.com|CloudZero
+econstruct.co|econstruct
+ecosystem-energy.com|Ecosystem
+edgeofs.com|Edge OFS
+carbon3d.com|Carbon, Inc.
+cmr.london|Cooper Moss Rutland
+educative.io|Educative Inc
+coastalbank.com|Coastal Community Bank
+egen.ai|Egen
+egenesisbio.com|eGenesis
+co.bot|Cobot
+eki.academy|Ekimetrics
+cocodelivery.com|Coco
+careaccess.com|Care Access
+electricmind.com|Electric Mind
+caredx.com|CareDx, Inc.
+codemetal.ai|Code Metal
+eleks.com|Eleks
+coder.com|Coder
+coderabbit.ai|CodeRabbit
+getcodeshealth.com|Codes Health
+codesphere.com|Codesphere
+elfbeauty.com|e.l.f. Beauty
+coframe.com|Coframe
+cogent.security|Cogent Security
+elroyair.com|Elroy Air
+cohere.com|Cohere
+coinflow.cash|Coinflow
+emburse.com|Emburse
+coinhako.com|Coinhako
+collective.com|Collective
+emilabs.ai|Emi Labs
+color.com|Color Health
+emma-sleep.com|Emma – The Sleep Company
+column.com|Column
+comand.ai|Comand AI
+comfy.org|Comfy
+caseguard.com|CaseGuard
+comind.io|CoMind
+caseinpointco.com|Case in Point Consulting
+enablecomp.com|EnableComp
+casetify.com|CASETiFY
+cashcowlouisiana.com|Cash Cow - Louisiana
+endpointclinical.com|Endpoint Clinical
+communityp.com|The Community Preservation Corporation
+energyby5.com|5
+commure.com|Commure
+catawiki.com|Catawiki
+compass-sp.com|Compass Surgical Partners
+entefy.com|Entefy
+composio.dev|Composio
+entrata.com|Entrata
