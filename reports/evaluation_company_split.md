@@ -1,6 +1,6 @@
 # Evaluation report (spec.md §6 / PLAN.md M6)
 
-Dataset: `company-150-v3` (`split_name=dev`, `split_kind=company`) · Splits read: `dev, validation, test` · `allow_test=True` · Policy version: `policy-v1:b500d9ccad04f7a201e43e435f666a59` · Generated: `2026-09-12T23:07:40.521653Z`
+Dataset: `company-150-v3` (`split_name=dev`, `split_kind=company`) · Splits read: `dev, validation, test` · `allow_test=True` · Policy version: `policy-v1:b500d9ccad04f7a201e43e435f666a59` · Generated: `2026-09-13T01:34:57.495536Z`
 
 ## Headline gate (sample sizes)
 
@@ -78,11 +78,11 @@ Cases: live-era=118, archive-era=518, live-era share=18.6%.
 
 | measure | value |
 | --- | --- |
-| action distribution | apply_now=47 quick_apply=37 skip=29 wait=5 |
+| action distribution | apply_now=48 quick_apply=36 skip=29 wait=5 |
 | evidence_quality distribution | strong=60 weak=58 |
-| overall agreement with A | 99.2% |
-| macro agreement with A | 99.5% |
-| medium/high probes per run | 1.07 |
+| overall agreement with A | 100.0% |
+| macro agreement with A | 100.0% |
+| medium/high probes per run | 1.08 |
 
 ### `archive-era`
 
@@ -122,9 +122,9 @@ This is an INFORMATIONAL, NON-authoritative re-run of the spec.md §6 agent gate
 
 | leg | candidate (C) | baseline (B) | requirement | pass? |
 | --- | --- | --- | --- | --- |
-| medium/high probes per run | 1.07 | 1.69 | ratio 0.63 <= 0.70 | yes |
-| overall agreement with A | 99.2% | 100.0% | >= 98.0% | yes |
-| macro agreement with A | 99.5% | 100.0% | >= 98.0% | yes |
+| medium/high probes per run | 1.08 | 1.69 | ratio 0.64 <= 0.70 | yes |
+| overall agreement with A | 100.0% | 100.0% | >= 98.0% | yes |
+| macro agreement with A | 100.0% | 100.0% | >= 98.0% | yes |
 
 Live-era gate verdict (informational, NON-authoritative): **PASS**.
 
@@ -132,8 +132,8 @@ Live-era gate verdict (informational, NON-authoritative): **PASS**.
 
 | action | A | B | C |
 | --- | --- | --- | --- |
-| apply_now | 48 | 48 | 47 |
-| quick_apply | 511 | 511 | 512 |
+| apply_now | 48 | 48 | 48 |
+| quick_apply | 511 | 511 | 511 |
 | skip | 72 | 72 | 72 |
 | wait | 5 | 5 | 5 |
 
@@ -145,7 +145,7 @@ spec.md §6 requires agreement to be read WITH the action distribution: a defaul
 | --- | --- | --- | --- |
 | A | 636 | 100.0% | 100.0% |
 | B | 636 | 100.0% | 100.0% |
-| C | 636 | 99.8% | 99.5% |
+| C | 636 | 100.0% | 100.0% |
 
 `A` compared against itself is trivially 100% and is shown so that A's own probe, cost and latency figures have a row in every table below.
 
@@ -173,7 +173,7 @@ spec.md §6 requires agreement to be read WITH the action distribution: a defaul
 
 | A action | n (A count) | C agreement |
 | --- | --- | --- |
-| apply_now | 48 | 97.9% |
+| apply_now | 48 | 100.0% |
 | quick_apply | 511 | 100.0% |
 | skip | 72 | 100.0% |
 | wait | 5 | 100.0% |
@@ -202,7 +202,7 @@ spec.md §6 requires agreement to be read WITH the action distribution: a defaul
 
 | A \ C | apply_now | quick_apply | skip | wait |
 | --- | --- | --- | --- | --- |
-| apply_now | 47 | 1 | 0 | 0 |
+| apply_now | 48 | 0 | 0 | 0 |
 | quick_apply | 0 | 511 | 0 | 0 |
 | skip | 0 | 0 | 72 | 0 |
 | wait | 0 | 0 | 0 | 5 |
@@ -214,7 +214,7 @@ spec.md §6 requires agreement to be read WITH the action distribution: a defaul
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | A | 636 | 3228 | 9340.00 | 14.69 | 0 | $0.0000 | $0.0000 | 0/0 | 1210 | 2 |
 | B | 636 | 2599 | 4818.00 | 7.58 | 0 | $0.0000 | $0.0000 | 0/0 | 1008 | 2 |
-| C | 636 | 1873 | 3334.00 | 5.24 | 1743 | $0.0000 | $0.0000 | 486719/45480 | 944464 | 1485 |
+| C | 636 | 1874 | 3344.00 | 5.26 | 1238 | $0.0000 | $0.0000 | 8550/600 | 13863 | 22 |
 
 **These are two different units and are NEVER summed.** `run_steps.cost_usd` holds unitless placeholder cost POINTS on `component='probe'` rows (configured in `[probe_costs]`: low=1, medium=3, high=10) and REAL DOLLARS on `component='model'` rows. `runs.total_cost_usd` adds the two together, which is why it is not quoted anywhere in this report and why no combined 'total cost' column exists. A probe-heavy system and a model-heavy system are not comparable on one axis.
 
@@ -226,7 +226,7 @@ Latency is SUMMED STEP LATENCY, a lower bound on wall-clock time: it excludes co
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | A | high=440 low=1712 medium=1076 | 1516 (2.38/run) | 0 | 0 | 0/0 (n/a) | 0/0 (n/a) | 908 (46.4%) | 0 | 0 |
 | B | high=41 low=1633 medium=925 | 966 (1.52/run) | 0 | 0 | 0/0 (n/a) | 0/400 (0.0%) | 784 (59.1%) | 629 | 0 |
-| C | high=37 low=1272 medium=564 | 601 (0.94/run) | 0 | 0 | 0/0 (n/a) | 1/441 (0.2%) | 110 (18.3%) | 1352 | 0 |
+| C | high=38 low=1272 medium=564 | 602 (0.95/run) | 0 | 0 | 0/0 (n/a) | 0/441 (0.0%) | 110 (18.3%) | 1354 | 0 |
 
 `repeated calls` and `invalid arguments` are controller-forbidden events: any nonzero value is a real finding, not noise.
 
@@ -303,17 +303,17 @@ Verdict: **PASS** (candidate runs: 636, baseline runs: 636).
 
 | leg | candidate (C) | baseline (B) | requirement | pass? |
 | --- | --- | --- | --- | --- |
-| medium/high probes per run | 0.94 | 1.52 | ratio 0.62 <= 0.70 | yes |
-| overall agreement with A | 99.8% | 100.0% | >= 98.0% | yes |
-| macro agreement with A | 99.5% | 100.0% | >= 98.0% | yes |
+| medium/high probes per run | 0.95 | 1.52 | ratio 0.62 <= 0.70 | yes |
+| overall agreement with A | 100.0% | 100.0% | >= 98.0% | yes |
+| macro agreement with A | 100.0% | 100.0% | >= 98.0% | yes |
 
 Notes:
 
 - STRUCTURAL CAVEAT: System A is not a neutral upper bound. `rli.eval.system_a` calls `eligible_probes(..., unpopulated_inputs=set(ALL_DYNAMIC_INPUTS))`, which makes spec.md §4's unresolved-question gate vacuous for A: A runs every dynamic probe that survives the history and licensing gates, whether or not that probe could change the action. System C is gated by `rli.policy.inputs.could_change_action` and therefore skips probes A always runs. Every probe-count comparison against A (medium/high probe use, cost points, latency, 'unnecessary probes', early-stop regret) is biased in the leaner system's favour BY CONSTRUCTION, not by measurement. This is why spec.md §6's agent gate measures probe use against System B rather than against A. Read agreement-with-A as an accuracy figure, and probe-count-vs-A as an upper bound on achievable savings — never as evidence that A wasted work.
 - the held-out 'test' split is IN SCOPE for this gate. spec.md §6 permits this once, for the final evaluation; any tuning decision made after reading it invalidates the holdout.
-- probe use: C=0.944969 medium/high probe steps per run (601 steps / 636 runs) vs B=1.518868 (966 steps / 636 runs); allowed <= 0.70 x 1.518868 = 1.063208 (+1e-09 tolerance) -> PASS
-- overall agreement with A: C=0.998428 vs B=1.000000; required >= 1.000000 - 0.02 = 0.980000 (-1e-09 tolerance) -> PASS
-- macro agreement with A: C=0.994792 vs B=1.000000; required >= 1.000000 - 0.02 = 0.980000 (-1e-09 tolerance) -> PASS
+- probe use: C=0.946541 medium/high probe steps per run (602 steps / 636 runs) vs B=1.518868 (966 steps / 636 runs); allowed <= 0.70 x 1.518868 = 1.063208 (+1e-09 tolerance) -> PASS
+- overall agreement with A: C=1.000000 vs B=1.000000; required >= 1.000000 - 0.02 = 0.980000 (-1e-09 tolerance) -> PASS
+- macro agreement with A: C=1.000000 vs B=1.000000; required >= 1.000000 - 0.02 = 0.980000 (-1e-09 tolerance) -> PASS
 
 ## Product gate
 
@@ -352,7 +352,7 @@ spec.md §6's C2 is System C with a learned probe ranking substituted for the de
 | status | degenerate |
 | rows (candidate probe decisions) | 1956 |
 | train / holdout rows | 1467 / 489 |
-| positive rate (train / holdout) | 0.2% / 0.6% |
+| positive rate (train / holdout) | 0.0% / 0.0% |
 | features | has_board_absent, has_board_present, has_publish_evidence, n_evidence, n_evidence_archive, n_evidence_ats_native, n_evidence_enrichment, n_evidence_news, n_evidence_page_structured, n_probes_before, probe_cost_points, probe_is_company_events, probe_is_repost_history, probe_is_requirements_drift, probe_is_team_signal |
 | learned AUC / accuracy | n/a / n/a |
 | deterministic AUC / accuracy | n/a / n/a |

@@ -1,6 +1,6 @@
 # Evaluation report (spec.md §6 / PLAN.md M6)
 
-Dataset: `dev-300-v3` (`split_name=dev`, `split_kind=temporal`) · Splits read: `dev, validation, test` · `allow_test=True` · Policy version: `policy-v1:b500d9ccad04f7a201e43e435f666a59` · Generated: `2026-09-12T23:07:01.563250Z`
+Dataset: `dev-300-v3` (`split_name=dev`, `split_kind=temporal`) · Splits read: `dev, validation, test` · `allow_test=True` · Policy version: `policy-v1:b500d9ccad04f7a201e43e435f666a59` · Generated: `2026-09-13T01:34:04.698586Z`
 
 ## Headline gate (sample sizes)
 
@@ -214,7 +214,7 @@ spec.md §6 requires agreement to be read WITH the action distribution: a defaul
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | A | 1192 | 5841 | 16530.00 | 13.87 | 0 | $0.0000 | $0.0000 | 0/0 | 2411 | 2 |
 | B | 1192 | 4766 | 8817.00 | 7.40 | 0 | $0.0000 | $0.0000 | 0/0 | 1598 | 1 |
-| C | 1192 | 3523 | 6291.00 | 5.28 | 3277 | $0.0000 | $0.0000 | 984039/95359 | 1011209 | 848 |
+| C | 1192 | 3523 | 6291.00 | 5.28 | 2331 | $0.0000 | $0.0000 | 0/0 | 10674 | 9 |
 
 **These are two different units and are NEVER summed.** `run_steps.cost_usd` holds unitless placeholder cost POINTS on `component='probe'` rows (configured in `[probe_costs]`: low=1, medium=3, high=10) and REAL DOLLARS on `component='model'` rows. `runs.total_cost_usd` adds the two together, which is why it is not quoted anywhere in this report and why no combined 'total cost' column exists. A probe-heavy system and a model-heavy system are not comparable on one axis.
 

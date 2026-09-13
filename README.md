@@ -320,11 +320,13 @@ steps; no report anywhere quotes one combined "total cost" figure.
 | agreement with A, overall / macro | — | 100% / 100% both sets | 100% / 100% temporal; 99.2% / 99.5% company |
 | medium/high probes per run, temporal | 2.27 | 1.48 | 0.96 (ratio 0.65, gate ≤ 0.70) |
 | medium/high probes per run, company | — | 1.52 | 0.94 (ratio 0.62) |
-| model calls | 0 | 0 | ~2.5 per case, $0 on the free tier |
+| model calls | 0 | 0 | ~2.0 per case (2,331 on the temporal set), $0 on the free tier |
 
 **Live-era view (the product-relevant slice; 295 of the 1,192 temporal cases fall after own collection began on 2026-09-07):** apply_now 94 · quick_apply 126 · skip 61 · wait 14, identical across A, B and C; C vs B probe ratio 0.68 (informational gate: pass). The remaining 897 cases are archive-era: their only evidence is Wayback captures, which spec §1 defines as weak, so they route to `quick_apply` or `skip` by construction. That block, not the policy, is what makes the pooled distribution look default-heavy.
 
 **Reading it honestly.** Both legs of the spec §6 gate pass: C reproduces the reference decisions while running about 35–38% fewer medium/high-cost probes than the rules baseline. Under the 2026-09-12 amendment, an open, strong-evidence role with observed team hiring activity now gets `apply_now` regardless of age; the agent reached all 94 such answers on the temporal set by choosing to run the team probe itself. The rules baseline (re-versioned to b2) reaches them too, so the agent still wins on cost, not on accuracy.
+
+**Loop efficiency:** a deterministic controller pre-check (2026-09-13) stops the loop before the investigator is called when every eligible probe has already run; this removed ~43% of investigator calls with decisions unchanged.
 
 **Caveats that still stand:** System A is not a neutral upper bound (it runs every eligible probe, which is why the gate measures against B). The policy is tuned but not yet frozen on live-era evidence, and the untouched `test` split has not been evaluated. Product value is unproven (see below).
 ## Product gate
