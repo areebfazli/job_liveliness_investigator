@@ -133,3 +133,164 @@ conditions.
 This is a rough spot-check only (10 of 78 boards), not a full backfill —
 useful as a directional signal for how much Wayback history exists per
 ATS provider, not a guarantee of coverage for any specific company.
+
+## Board discovery expansion — 2026-09-13
+
+`scripts/discover_boards.py` (new) grew `scripts/targets.csv` from **78 to 352
+rows** (+274) without a web search engine. Three stages, all resumable from one
+durable cache (`scripts/targets_candidates_discovered.csv`, 2,440 candidate
+rows + shard bookkeeping):
+
+1. **Discover** tenant slugs from the Wayback CDX Server API
+   (`collapse=urlkey&fl=original&filter=statuscode:200&limit=20000&from=2025`).
+2. **Verify live** each tenant against its ATS's public postings API and count
+   currently-open jobs; keep only the 8–400 band the existing targets are
+   curated to.
+3. **Resolve identity** from one real job-posting HTML page per board, via
+   `rli.resolvers.jsonld.extract_job_posting` with a link-mining fallback.
+
+### Discovered candidates (CDX)
+
+A single `url=<host>/*` scan returns rows in urlkey (alphabetical) order and is
+capped at `limit`, so one tenant with thousands of archived posting URLs can eat
+the whole budget — `job-boards.greenhouse.io/c*` returned the full 20,000 rows
+but only 275 distinct tenants. Scans were therefore **sharded by the first
+character of the tenant slug**, in a fixed-seed shuffled order so an early stop
+is not biased toward slugs starting with "a".
+
+| ATS | CDX host(s) scanned | shard scans | distinct new tenants |
+|---|---|---|---|
+| greenhouse | `boards.greenhouse.io`, `job-boards.greenhouse.io` | 9 | 1,008 |
+| ashby | `jobs.ashbyhq.com` | 4 | 701 |
+| lever | `jobs.lever.co` | 7 | 731 |
+| **total** | | **20** | **2,440** |
+
+CDX was not thin for any ATS (every ATS cleared the 200-candidate threshold on
+its first few shards), so the **Common Crawl fallback was implemented but never
+triggered** in this run. It remains wired up (`collinfo.json` → newest crawl's
+`cdx-api` → `?url=<pattern>&output=json`) behind `--commoncrawl-threshold`.
+
+### Verified live, kept, and rejected
+
+1,039 of the 2,440 candidates were probed in this run (the remaining 1,396 stay
+cached as `status=new` for a future run — the goal was reached first).
+
+| ATS | probed | verified live | kept (8–400) | **added to targets.csv** |
+|---|---|---|---|---|
+| greenhouse | 339 | 253 | 123 | 68 |
+| ashby | 353 | 263 | 118 | 116 |
+| lever | 347 | 244 | 103 | 90 |
+| **total** | **1,039** | **760** | **344** | **274** |
+
+"Verified live" = the postings API answered 200 with a parseable `jobs` array
+(including boards with zero open jobs). Rejects:
+
+| ATS | dead (404/410) | live but 0 jobs | too few (<8) | too many (>400) | no resolvable domain |
+|---|---|---|---|---|---|
+| greenhouse | 86 | 36 | 92 | 2 | 55 |
+| ashby | 90 | 20 | 125 | 0 | 2 |
+| lever | 103 | 59 | 81 | 1 | 13 |
+| **total** | **279** | **115** | **298** | **3** | **70** |
+
+**Archived ≠ alive: 394 of 1,039 probed candidates (38%) were dead or empty.**
+A Wayback capture only proves a board once existed, which is exactly why every
+row is re-verified against the live API rather than trusted from the archive.
+
+The dominant *quality* filter is the lower bound, not the upper: **298 boards
+(29% of probed) were live but had fewer than 8 open jobs**, versus only **3
+above 400**. Long-tail ATS tenants are overwhelmingly tiny.
+
+### Domain resolution — 70 boards parked in `targets_needs_domain.csv`
+
+The three ATSes publish wildly different structured data, and this is the single
+biggest per-ATS difference found:
+
+* **Ashby** — job pages carry a full `JobPosting` JSON-LD block with
+  `hiringOrganization.name` *and* `sameAs`. Near-perfect: only **2 of 118** kept
+  Ashby boards lacked a resolvable domain.
+* **Lever** — JSON-LD is present but `hiringOrganization` has **no `sameAs`/`url`**,
+  so `extract_job_posting().company_domain_candidate` is always `None`. The
+  employer domain comes from the header logo link instead. **13 of 103** failed.
+* **Greenhouse** — rendered job pages (`job-boards.greenhouse.io`) contain **no
+  JSON-LD at all**, and no company link in the chrome; the only employer domain
+  signal is whatever the description body happens to link (handbook, benefits,
+  EEO pages) plus the postings API's `absolute_url` when the board is
+  self-hosted. **55 of 123** kept Greenhouse boards (45%) could not be resolved
+  and were parked rather than guessed at.
+
+Those 70 boards are otherwise good targets — live, in-band — and are recorded in
+`scripts/targets_needs_domain.csv` with their observed job counts, not added to
+`targets.csv` and not counted toward the goal.
+
+**Guarding against confident-but-wrong domains.** Link mining accepts a domain
+only when it *names* the employer (or its tenant slug). An earlier, looser
+"appears at least twice on the page" rule produced plausible-looking wrong
+answers — Convera resolved to its application vendor `service-now.com`, Capital
+Farm Credit to `baiworks.com`, a CATORCE posting to the `ddb.com` agency
+network — so a non-name-matching domain now additionally has to be dominant
+(≥4 links, ≥2× the runner-up) **and** be confirmed by fetching `https://<domain>`
+and checking the site itself names the employer. That confirmation step kept
+`crai.com` (Charles River Associates), `calacademy.org`, `thealliance.health`
+and `centriconsulting.com`, and correctly rejected `baiworks.com` and `ddb.com`.
+267 of the 274 added rows name-match directly; the other 7 came through JSON-LD
+or this live confirmation.
+
+Three further traps worth recording, all found by auditing added rows rather
+than by reasoning:
+
+* Ashby boards that leave `sameAs` unset emit **`jobs.ashbyhq.com` itself** as
+  the `hiringOrganization` URL — the blocklist has to be applied to JSON-LD
+  output, not just to mined links.
+* A malformed href yielded `you.if` as a "domain". A TLD gate (real ccTLD for
+  two-letter TLDs, alphabetic/IDN otherwise) is required; a hand-written TLD
+  allowlist is *not* — the first attempt wrongly rejected the real
+  `capsule.video` and `incident.io`.
+* Board titles can be generic ("Job Board") or lag a rebrand: the Greenhouse
+  tenant `classpass` is still titled "ClassPass" but its postings now redirect
+  to `playlist.com` and its JSON-LD says Playlist. Where JSON-LD supplies the
+  domain, its organisation name is preferred over the ATS board title.
+
+One legitimate duplicate domain now exists in `targets.csv`: Chainalysis runs
+**two** Ashby tenants (`chainalysis-careers`, `chainalysis-government-solutions`,
+48 and 8 open jobs). Same company domain, two boards — a real instance of the
+tenant-vs-company-identity split this project cares about.
+
+### Rate limiting and errors
+
+Politeness mirrored `rli/archive/cdx.py` and `scripts/wayback_spotcheck.py`:
+**0.5 req/s to `web.archive.org` / `index.commoncrawl.org`, 1 req/s per host
+everywhere else**, a `job-liveliness-investigator/1.0` User-Agent with a contact
+address, 10s API / 20s HTML timeouts, and exponential backoff (2s → 4s → … cap
+60s, honouring `Retry-After`) on 408/425/429/5xx and on timeouts.
+
+Verification is round-robined across the three ATSes rather than draining one at
+a time: each ATS has its own API host and its own 1 req/s budget, so the
+politeness sleep for one is spent doing useful work on another — ~3× the
+throughput at identical per-host request rates.
+
+What was actually encountered:
+
+* **`web.archive.org` HTTP 503, repeatedly** — on roughly a quarter of CDX shard
+  scans, usually clearing on the first or second retry. One scan
+  (`boards.greenhouse.io/e*`) exhausted all three attempts. Consistent with the
+  earlier Wayback spot-check finding: **CDX throttling is a coverage gap, not
+  evidence of absence.** A shard that fails is deliberately *not* marked done in
+  the cache, so a rerun retries it; a tenant whose live probe fails transiently
+  keeps `status=new` and is re-probed rather than being written off as dead.
+  **No 429s were seen from the archive in this run — the failure mode was 503.**
+* **Read timeouts on `job-boards.greenhouse.io` job pages** — a handful across
+  ~1,000 page fetches, all recovered on retry.
+* **Zero 429s and zero throttling from the three ATS APIs** (`boards-api.greenhouse.io`,
+  `api.ashbyhq.com`, `api.lever.co`) across ~1,900 requests at 1 req/s. They were
+  markedly more tolerant than the Internet Archive.
+* **TLS/connection failures on employer homepages** during domain confirmation:
+  `baiworks.com` reset the connection, `cclgroup.com` failed with
+  `SSLV3_ALERT_HANDSHAKE_FAILURE`. These are treated as *unconfirmed*, so the
+  board is parked in `targets_needs_domain.csv`. This is deliberately
+  conservative and costs a real target: `cclgroup.com` is in fact Connor, Clark &
+  Lunn's site, but an unreachable host cannot be claimed as an observation.
+
+Reruns are cheap and idempotent: completed CDX shards, already-probed tenants and
+already-added rows are all skipped, `--max-new` / `--time-budget` bound any single
+invocation, and `--retry-no-domain` re-queues parked boards after a resolver
+improvement.
