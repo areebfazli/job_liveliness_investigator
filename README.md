@@ -47,7 +47,8 @@ uv run rli load-targets --targets scripts/targets.csv --db ./data/rli.db
 uv run rli load-events --path data/events/company_events.csv --db ./data/rli.db
 
 # 4. Daily board snapshot (run once now, then put on a schedule — see
-#    docs/cron.md for the full cron setup and how to verify it ran)
+#    docs/deploy-snapshot.md for the daily snapshot deployment setup and
+#    how to verify it ran)
 uv run rli snapshot --db ./data/rli.db
 uv run rli snapshot-status --db ./data/rli.db
 
@@ -290,13 +291,14 @@ against A is therefore biased toward the leaner system by construction, not
 by measurement — this is why spec §6's agent gate compares medium/high
 probe use against System B, not A.
 
-**Cron reliability is not guaranteed.** `docs/cron.md` documents a single
-daily invocation; a missed or failed day is recorded per-company as a
-`capture_attempts` coverage gap, never silently treated as "still open" or
-"closed", but the collection history is only as complete as the cron job's
-actual uptime — see `docs/cron.md`'s verification checklist
-(`rli snapshot-status`, the day's log file, and `board_snapshots` row-count
-growth) for how to check whether it is really running.
+**Cron reliability is not guaranteed.** `docs/deploy-snapshot.md` documents
+a single daily invocation; a missed or failed day is recorded per-company
+as a `capture_attempts` coverage gap, never silently treated as "still
+open" or "closed", but the collection history is only as complete as the
+daily job's actual uptime — see `docs/deploy-snapshot.md`'s verification
+checklist (`rli snapshot-status`, the day's log file, and
+`board_snapshots` row-count growth) for how to check whether it is really
+running.
 
 **Repost/version match precision is not yet validated.** Spec §4 requires a
 hand-checked sample of 50 matches; `reports/evaluation.md` records that
@@ -437,8 +439,12 @@ busy timeout, and foreign keys enforced.
 
 Daily board snapshots are the long pole of the whole project — history
 gated evidence only exists for as long as this job has actually been
-running. See `docs/cron.md` for the crontab entry, why it must use absolute
-paths, and three independent ways to verify it actually ran.
+running. The default deployment is a systemd user timer
+(`scripts/setup_laptop_timer.sh`), not cron — a laptop isn't always on, and
+unlike cron a systemd timer catches up a missed day on next boot/login. An
+optional always-on free-tier cloud VM setup (`scripts/setup_cloud_vm.sh`)
+is also available. See `docs/deploy-snapshot.md` for both setups and three
+independent ways to verify the job actually ran.
 
 ## Project layout
 
