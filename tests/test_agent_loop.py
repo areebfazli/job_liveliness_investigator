@@ -84,7 +84,7 @@ from rli.eval.runner import (
 )
 from rli.eval.system_a import run_system_a
 from rli.llm.client import CachedClient, LLMError, LLMSchemaError, ScriptedClient
-from rli.llm.prompts import PROMPT_VERSION, TEMPLATE_INVESTIGATOR
+from rli.llm.prompts import PROMPT_VERSION, TEMPLATE_INVESTIGATOR, build_investigator_prompt
 from rli.models.decision import Decision
 
 NOW = datetime(2026, 9, 7, tzinfo=UTC)
@@ -394,6 +394,19 @@ def test_proposing_the_same_probe_and_arguments_twice_is_rejected_as_duplicate(
     second proposal would be refused as `ineligible` first (the controller
     filters in that order) and this test would silently stop testing
     duplication.
+
+    It also relies on `repost_pattern` having TWO probes that can populate it
+    (`repost_history` and `requirements_drift`, `rli.probes.registry`): after
+    step one, `requirements_drift` is still a genuinely NEW eligible probe
+    nobody has proposed or run, so `rli.agent.controller.decide`'s
+    `no_new_eligible_probe` pre-check (added to skip the wasted SECOND
+    investigator call once every eligible probe is exhausted — see that
+    module's docstring) does not fire here: there is still something new to
+    ask about, so the model IS asked again, re-proposes the stale
+    `repost_history`, and the per-candidate `duplicate` filter this test
+    targets is what actually refuses it. A single-probe repeat (nothing else
+    left to try) is covered instead by `tests/test_agent_controller.py`'s
+    `test_stops_with_no_new_eligible_probe_when_the_only_eligible_probe_already_ran`.
     """
     job_id = "9105"
     posting_id = seed_reposted_history(conn, job_id, now=NOW)
@@ -408,6 +421,113 @@ def test_proposing_the_same_probe_and_arguments_twice_is_rejected_as_duplicate(
     duplicates = steps_matching(steps, f"{STEP_CANDIDATE_REJECTED}:duplicate")
     assert [row["probe_name"] for row in duplicates] == ["repost_history"]
     assert _stop_reasons(steps) == [f"{STEP_CONTROLLER_DECISION}:stop:no_eligible_candidate"]
+
+
+# ---------------------------------------------------------------------------
+# 3b. `no_new_eligible_probe`: the wasted second call, eliminated
+# ---------------------------------------------------------------------------
+#
+# A 1,287-case System C replay measured that after the controller ran the
+# ONLY eligible probe, the loop asked the investigator a second time anyway;
+# the model re-proposed the same probe (there was nothing else to propose);
+# the controller rejected it `duplicate`; and the run stopped
+# `no_eligible_candidate` — ~40% of every investigator call this system made,
+# entirely wasted. `rli.agent.controller.decide` now answers "is there
+# anything NEW worth asking about?" itself, before the model is asked, and
+# the tests below pin the fix at the loop level: fewer model calls, the SAME
+# probes run, the SAME final action.
+
+
+@respx.mock
+def test_the_loop_skips_the_wasted_second_call_when_one_probe_exhausts_the_case(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    """The measured scenario itself: one eligible probe, one investigator call.
+
+    `material_negative_event` / `freeze_or_pause` are populated only by
+    `company_events` (`rli.probes.company_events`'s `populates`), and the
+    suite's `NO_COLLECTION_STATUS` fixture makes that probe report
+    `collected=False` forever (module docstring), so the question stays open
+    after it runs — exactly the shape that used to buy a second, wasted call.
+    `team_signal` is disabled so it cannot also become eligible here (its
+    default corpus/branch reachability is exercised separately below); with
+    `seed_history`'s corpus `repost_pattern` resolves to `'none'` immediately,
+    so neither history-gated probe is eligible either. `company_events` is
+    therefore the ONLY eligible probe, on EVERY iteration, which is what lets
+    one scripted reply prove the second call never happens: if the loop
+    regressed to asking twice, `scripted_llm`'s exhaustion behaviour would
+    still return a valid `stop=True` reply rather than erroring, so only
+    counting the calls — not merely checking the run still finishes — catches
+    the regression.
+    """
+    disabled = cfg.model_copy(
+        update={"team_signal": cfg.team_signal.model_copy(update={"enabled": False})}
+    )
+    job_id = "9106"
+    seed_history(conn, job_id, now=NOW)
+    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
+    llm = scripted_llm(
+        [propose("company_events", company_id=COMPANY, as_of=NOW.isoformat())], cfg=disabled
+    )
+
+    result = _run_c(conn, disabled, job_id, llm)
+
+    assert result.probes_run == ("company_events",)
+    assert len(template_calls(llm, TEMPLATE_INVESTIGATOR)) == 1
+
+    steps = run_steps(conn, result.run_id)
+    assert len(_dynamic_probe_runs(steps, "company_events")) == 1
+    # Model-independent: the pre-check fires before any candidate exists, so
+    # there is nothing to reject and no `duplicate` row — unlike the
+    # per-candidate path `test_proposing_the_same_probe_and_arguments_twice_
+    # is_rejected_as_duplicate` covers.
+    assert steps_matching(steps, f"{STEP_CANDIDATE_REJECTED}:") == []
+    assert _stop_reasons(steps) == [f"{STEP_CONTROLLER_DECISION}:stop:no_new_eligible_probe"]
+    assert result.decision.recommended_action == "quick_apply"
+
+
+@respx.mock
+def test_a_second_new_eligible_probe_still_earns_a_second_investigator_call(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    """The flip side: while a genuinely NEW probe remains, the model IS asked again.
+
+    `seed_history` plus a second posting on the same team makes BOTH
+    `team_signal` (`corroborating_hiring_signal`, spec.md §5's Amendment
+    2026-09-12 P5b branch — see `test_p5b_hiring_activity_runs_team_signal_
+    and_reaches_apply_now`) and `company_events` (`material_negative_event`
+    / `freeze_or_pause`, never resolved by this suite's fixtures) eligible at
+    once. After the first probe runs, the second is still untried, so
+    `no_new_eligible_probe` must not fire — the model is asked again, chooses
+    the second probe, and only THEN, with nothing new left, does the loop
+    stop on its own without a third call.
+    """
+    job_id = "9142"
+    posting_id = seed_history(conn, job_id, now=NOW)
+    add_posting(conn, job_id=f"{job_id}-hire", first_observed=NOW - timedelta(days=5))
+    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
+    llm = scripted_llm(
+        [
+            propose(
+                "team_signal", posting_id=posting_id, company_id=COMPANY, as_of=NOW.isoformat()
+            ),
+            propose("company_events", company_id=COMPANY, as_of=NOW.isoformat()),
+        ],
+        cfg=cfg,
+    )
+
+    result = _run_c(conn, cfg, job_id, llm)
+
+    assert result.probes_run == ("team_signal", "company_events")
+    assert len(template_calls(llm, TEMPLATE_INVESTIGATOR)) == 2
+
+    steps = run_steps(conn, result.run_id)
+    assert len(_dynamic_probe_runs(steps, "team_signal")) == 1
+    assert len(_dynamic_probe_runs(steps, "company_events")) == 1
+    # No third call was needed: once both ran, nothing new was left to ask
+    # about, and the pre-flight caught that itself.
+    assert _stop_reasons(steps) == [f"{STEP_CONTROLLER_DECISION}:stop:no_new_eligible_probe"]
+    assert result.decision.recommended_action == "apply_now"
 
 
 @respx.mock
@@ -1152,3 +1272,277 @@ def test_the_same_case_without_a_positive_team_signal_stays_at_quick_apply(
     assert steps_matching(steps, f"{STEP_POLICY_DECISION}:P7_default:strong") != []
     assert result.decision.recommended_action == "quick_apply"
     assert Decision.model_validate(result.decision.model_dump()) == result.decision
+
+
+# ---------------------------------------------------------------------------
+# 16. `no_new_eligible_probe`: budget accounting, prompt stability, and a
+#     decisions-unchanged regression matrix
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_the_skipped_investigator_call_is_not_charged_and_the_ledger_is_unchanged(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    """The pre-check removes a CALL, not a charge — pin the dollars to prove it.
+
+    Same corpus as `test_the_loop_skips_the_wasted_second_call_when_one_
+    probe_exhausts_the_case`. `company_events` is `[probe_costs].medium`
+    (see the module header's `CALL_USD` note for the analogous investigator
+    arithmetic): `3 * probe_cost_usd_per_point (0.002) + 5.0 *
+    latency_cost_usd_per_s (0.002) + failure_rate_placeholder (0.1) *
+    failure_cost_usd (0.01)` = `0.006 + 0.01 + 0.001` = `0.017` usd is what
+    `rli.agent.controller.Budget.with_probe` would charge the agent's OWN
+    ledger — `run_steps.cost_usd` on the `probe_run` row instead carries the
+    RAW point value (`3.0`; the module docstring on `rli.eval.runner`
+    explains why the two are different units), which this test pins as the
+    concrete, unit-labelled number a reader of the trace actually sees.
+
+    The real claim is about what is NOT there: if the wasted second
+    investigator call had survived, there would be a THIRD `component ==
+    'model'` row billed at `CALL_USD`, inflating both the model spend and
+    (via `Budget.with_llm`) the run's real-dollar ledger, for a call whose
+    `InvestigatorOutput` was never going to be allowed to run anything. There
+    are exactly two — the one investigator call that mattered, and the
+    explanation — and their total is exactly `2 * CALL_USD`.
+    """
+    disabled = cfg.model_copy(
+        update={"team_signal": cfg.team_signal.model_copy(update={"enabled": False})}
+    )
+    job_id = "9152"
+    seed_history(conn, job_id, now=NOW)
+    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
+    llm = scripted_llm(
+        [propose("company_events", company_id=COMPANY, as_of=NOW.isoformat())], cfg=disabled
+    )
+
+    result = _run_c(conn, disabled, job_id, llm)
+    steps = run_steps(conn, result.run_id)
+
+    # `run_steps.probe_run.latency_s` is the MEASURED wall-clock time (a stub
+    # probe's is near-zero here), not the `latency_estimate_s` the agent's own
+    # `Budget` gates and charges against — this change touches neither
+    # `Budget.with_probe` nor `latency_estimate_s`, and
+    # `test_cost_cap_stops_the_loop_and_bounds_what_the_loop_spends` /
+    # `test_the_loop_refuses_an_investigator_call_it_cannot_afford` (both
+    # unmodified by this fix, both still green) already pin that estimator's
+    # arithmetic against the ledger directly.
+    probe_rows = _dynamic_probe_runs(steps, "company_events")
+    assert len(probe_rows) == 1
+    assert probe_rows[0]["cost_usd"] == pytest.approx(3.0)  # [probe_costs].medium, points
+
+    model_rows = _model_rows(steps)
+    assert len(model_rows) == 2  # investigator, explanation -- NOT a third, wasted call
+    assert [row["cost_usd"] for row in model_rows] == pytest.approx([CALL_USD, CALL_USD])
+    assert sum(row["cost_usd"] for row in model_rows) == pytest.approx(2 * CALL_USD)
+
+    # `dynamic_steps` in `rli.agent.controller.Budget` counts probe EXECUTIONS
+    # only (module docstring): one ran (`probe_rows` above, one row), so
+    # exactly one step was spent out of `[agent].max_dynamic_steps` (4) — the
+    # skipped call never touches it, because an investigator call was never
+    # a step to begin with.
+    assert result.probes_run == ("company_events",)
+
+
+@respx.mock
+def test_the_investigator_prompt_is_unchanged_by_this_fix(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    """Guards the `llm_cache` keys: this fix must not silently invalidate them.
+
+    `rli.llm.client.Prompt`'s cache key is the pair `(prompt_hash,
+    structured_input_hash)` — `prompt_hash` covers only the TEMPLATE half
+    (`template_id`, `version`, `system`, `instructions`, the schema), and
+    `structured_input_hash` covers the per-call data separately (spec.md §2:
+    caching keys off exactly what the model actually saw). Neither is a
+    function of `rli.agent.controller` at all — `decide` runs AFTER the
+    prompt is built and is not part of either hash's inputs — so this
+    controller-only change provably cannot move either hash. `prompt_hash`
+    below is the template-identity value actually observed across the
+    llm_cache rows of the 1,287-case System C replay this fix is measured
+    against (386 real cached investigator calls, all one constant) —
+    captured from the CURRENT code, before and independently of this change
+    — so this test fails loudly, rather than papering over it, if a future
+    edit to the investigator templates (not to the controller) silently
+    invalidates that cache.
+    """
+    assert PROMPT_VERSION == "v1"
+
+    structured_input = {
+        "now": "2026-09-07T00:00:00.000000Z",
+        "identity": {
+            "input_url": "https://boards.greenhouse.io/acme/jobs/9001",
+            "canonical_url": "https://boards.greenhouse.io/acme/jobs/9001",
+            "ats": "greenhouse",
+            "tenant": "acme",
+            "job_id": "9001",
+            "posting_id": "greenhouse:acme:9001",
+            "company_id": "acme",
+            "title": "Backend Engineer",
+            "team": "Engineering",
+            "location": "Remote",
+            "posting_row_exists": True,
+            "identity_resolved": True,
+        },
+        "evidence": [
+            {
+                "id": "e1",
+                "probe": "resolve_posting",
+                "claim_type": "posting_state",
+                "value": "open",
+                "source_url": "https://boards.greenhouse.io/acme/jobs/9001",
+                "source_quality": "ats_native",
+                "source_event_at": "2026-09-04T00:00:00.000000Z",
+                "available_at": "2026-09-07T00:00:00.000000Z",
+                "fetched_at": "2026-09-07T00:00:00.000000Z",
+                "raw_excerpt_ref": None,
+            },
+        ],
+        "policy_inputs": {
+            "posting_state": "open",
+            "repost_pattern": "unknown_unpopulated",
+        },
+        "evidence_quality": {
+            "quality": "mixed",
+            "rule": "no_primary_publish_evidence",
+            "detail": "d",
+        },
+        "unpopulated": ["repost_pattern"],
+        "could_change_action": ["repost_pattern"],
+        "probe_catalogue": [],
+        "probes_already_run": [],
+        "budget": {
+            "steps_remaining": 4,
+            "cost_remaining_usd": 0.5,
+            "latency_remaining_s": 60.0,
+        },
+    }
+    prompt = build_investigator_prompt(structured_input=structured_input, untrusted=())
+    assert (
+        prompt.prompt_hash(InvestigatorOutput)
+        == "f910026bbc1b2d0aa48f7f391a359669d0d2a65601619a9e1b86c289bad62a54"
+    )
+    assert (
+        prompt.structured_input_hash()
+        == "db9d626ccdd1fbd55e03acaacb6ab0bfc422870032e9232158a3554f4dd80355"
+    )
+
+
+@respx.mock
+def test_no_new_eligible_probe_does_not_change_which_probes_run_or_the_final_action(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    """`no_new_eligible_probe` only removes a WASTED call; it changes no outcome.
+
+    Every branch below was captured twice while building this fix — once
+    with `rli.agent.controller.decide`'s new pre-check disabled (restoring
+    the exact PRE-FIX behaviour) and once with it enabled — and the pair
+    agreed on `probes_run` and `recommended_action` in every case. Only two
+    of the six branches (one eligible probe / two eligible probes, covered
+    by name below) actually had a wasted call for the pre-check to remove,
+    so only those two also saw their investigator call count and final stop
+    reason change; the other four are here to prove the pre-check stays
+    SILENT everywhere it has nothing to do — the same `probes_run`,
+    `recommended_action`, call count and stop reason as before, unchanged
+    because `eligible_now` was never fully exhausted-or-empty on any call
+    they made. That A/B pair is what this test pins, scenario by scenario,
+    so a future regression in either direction (a probe that stops running,
+    an action that moves, or a call the pre-check should not have skipped)
+    is caught even though the old code path itself is gone.
+
+    * **a history-gated probe is proposed but ineligible, while a different
+      probe stays eligible in the background** (no board captures at all;
+      `repost_history` proposed anyway): `company_events` — history
+      INDEPENDENT, and never resolved by this suite's `NO_COLLECTION_STATUS`
+      fixture (module docstring) — is the probe `eligible_probes` actually
+      returns for this case's `could_change`, but the model proposes
+      `repost_history` instead, which `eligible_probes` refuses outright (no
+      usable board history). So `eligible_now` here is NON-empty:
+      `no_new_eligible_probe`'s pre-check does not fire, the model IS asked
+      (exactly once — the run stops right after this reply), and it is the
+      per-candidate `ineligible` filter (`decide`'s step 6, unrelated to this
+      fix) that produces `no_eligible_candidate`. The genuinely EMPTY case —
+      zero eligible probes for a non-empty `could_change`, so the new
+      pre-check itself fires `no_new_eligible_probe` on the very first call —
+      is covered at the controller level, where it is exact and does not
+      depend on which unrelated probe the fixture happens to make eligible:
+      `tests/test_agent_controller.py::
+      test_stops_when_no_probe_is_eligible_at_all_without_asking_the_model`.
+    * **one eligible probe**: covered above by name
+      (`test_the_loop_skips_the_wasted_second_call_when_one_probe_exhausts_
+      the_case`); repeated here only for the `quick_apply` action pin.
+    * **two eligible probes**: likewise covered above
+      (`test_a_second_new_eligible_probe_still_earns_a_second_investigator_
+      call`); repeated here for the `apply_now` action pin.
+    * **history-gated probes ineligible**: the same mechanism as the first
+      bullet, through `requirements_drift` instead of `repost_history` — a
+      second history-gated probe class refused by the per-candidate filter
+      while `company_events` again stays eligible but unproposed. Kept
+      separate from the first bullet because it exercises the `ineligible`
+      rejection for a DIFFERENT probe class, not because the underlying
+      eligibility shape differs.
+    * **`could_change` empty**: a closed posting (`P1_closed` is
+      unconditional, spec.md §5), which must still stop
+      `no_unresolved_question` — NOT `no_new_eligible_probe` — because
+      `decide`'s order keeps that check first (module docstring: it is
+      checked before `case_file`/`executed` are even read).
+    * **the investigator stopping early on its own**: nothing eligible is
+      exhausted; the model simply declines on its first turn, and
+      `investigator_stop` is unaffected because the pre-check only ever
+      short-circuits BEFORE the model is asked, never after.
+    """
+    # -- a history-gated probe is proposed but ineligible; company_events --
+    # -- stays eligible in the background, unproposed -----------------------
+    job_id = "9500"
+    add_posting(conn, job_id=job_id)  # a posting row, no board captures at all
+    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
+    posting_id = f"greenhouse:{COMPANY}:{job_id}"
+    llm = scripted_llm([propose("repost_history", posting_id=posting_id)], cfg=cfg)
+    result = _run_c(conn, cfg, job_id, llm)
+    assert result.probes_run == ()
+    assert result.decision.recommended_action == "quick_apply"
+    steps = run_steps(conn, result.run_id)
+    assert len(template_calls(llm, TEMPLATE_INVESTIGATOR)) == 1
+    assert steps_matching(steps, f"{STEP_CANDIDATE_REJECTED}:ineligible") != []
+    assert _stop_reasons(steps) == [f"{STEP_CONTROLLER_DECISION}:stop:no_eligible_candidate"]
+
+    # -- history-gated probes ineligible: same mechanism, requirements_drift -
+    job_id = "9503"
+    add_posting(conn, job_id=job_id)  # a posting row, no board captures at all
+    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
+    posting_id = f"greenhouse:{COMPANY}:{job_id}"
+    llm = scripted_llm([propose("requirements_drift", posting_id=posting_id)], cfg=cfg)
+    result = _run_c(conn, cfg, job_id, llm)
+    assert result.probes_run == ()
+    assert result.decision.recommended_action == "quick_apply"
+    steps = run_steps(conn, result.run_id)
+    assert len(template_calls(llm, TEMPLATE_INVESTIGATOR)) == 1
+    assert steps_matching(steps, f"{STEP_CANDIDATE_REJECTED}:ineligible") != []
+    assert _stop_reasons(steps) == [f"{STEP_CONTROLLER_DECISION}:stop:no_eligible_candidate"]
+
+    # -- could_change empty: must stay no_unresolved_question ----------------
+    job_id = "9506"
+    posting_id = seed_history(conn, job_id, now=NOW)
+    mock_greenhouse_missing(job_id)
+    llm = scripted_llm([propose("repost_history", posting_id=posting_id)], cfg=cfg)
+    result = _run_c(conn, cfg, job_id, llm)
+    assert result.probes_run == ()
+    assert result.decision.recommended_action == "skip"
+    assert _stop_reasons(run_steps(conn, result.run_id)) == [
+        f"{STEP_CONTROLLER_DECISION}:stop:no_unresolved_question"
+    ]
+    assert template_calls(llm, TEMPLATE_INVESTIGATOR) == []
+
+    # -- the investigator stopping early on its own --------------------------
+    job_id = "9505"
+    seed_history(conn, job_id, now=NOW)
+    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
+    llm = scripted_llm(
+        [InvestigatorOutput(stop=True, stop_reason="nothing left worth running")], cfg=cfg
+    )
+    result = _run_c(conn, cfg, job_id, llm)
+    assert result.probes_run == ()
+    assert result.decision.recommended_action == "quick_apply"
+    assert _stop_reasons(run_steps(conn, result.run_id)) == [
+        f"{STEP_CONTROLLER_DECISION}:stop:investigator_stop"
+    ]

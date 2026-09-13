@@ -41,18 +41,18 @@ model call with `output=None`, and once after it with the model's real
 output. The first call costs nothing and is not a duplication of controller
 logic — it is a *query* of it.
 
-`decide` checks its two model-independent hard stops FIRST (spec.md §4's
-"no unresolved question could change the action" and "step cap is
-reached"), and only then notices `output is None`. So the pre-flight has
-exactly two possible outcomes:
+`decide` checks its THREE model-independent hard stops FIRST (spec.md §4's
+"no unresolved question could change the action", "step cap is reached",
+and — as of the paragraph below — "no eligible probe is worth its
+cost"/"the same probe+arguments would repeat"), and only then notices
+`output is None`. So the pre-flight has exactly two possible outcomes:
 
 * it returns a stop whose reason is anything **other than**
   `investigator_error` — that stop is a fact about the case and the ledger,
   true no matter what a model would have replied. The loop honours it,
   records it, and breaks WITHOUT calling the LLM.
-* it returns `investigator_error` — which here means only "neither hard
-  stop fired". The pre-flight decision is discarded and the real work
-  begins.
+* it returns `investigator_error` — which here means only "no hard stop
+  fired". The pre-flight decision is discarded and the real work begins.
 
 The alternative was to re-test `could_change` emptiness and
 `budget.remaining_steps()` in this module before calling the model. That is
@@ -62,6 +62,25 @@ stays the single authority on stopping (spec.md §2: "Never rely on the LLM
 alone for ... stopping" — and, equally, never rely on two implementations),
 and System C still never pays for a model call whose answer the controller
 would throw away.
+
+**Why a third hard stop, and why here specifically.** A 1,287-case System C
+replay measured what the two-stop pre-flight above was still missing: after
+the controller ran the only eligible probe (usually `company_events`), THIS
+loop dutifully asked the investigator again; the model re-proposed the same
+probe, because there was nothing else left to propose; the per-candidate
+filter (see `rli.agent.controller`'s "step 6" in `decide`'s docstring)
+rejected it `duplicate`; and the run then stopped `no_eligible_candidate` —
+927 duplicate rejections and 1,015 such stops in that replay, meaning
+roughly 40% of every investigator call this system made bought literally
+nothing, because the answer ("nothing new to try") was already computable
+from `(case state, executed history)` alone. `rli.agent.controller.decide`
+now answers that question itself, as `StopReason` `no_new_eligible_probe`,
+checked alongside the other two model-independent stops and therefore
+caught by this exact pre-flight mechanism with NO change to this module: the
+third stop rides the same "query, don't duplicate" pipe the first two
+already built. See that function's docstring for the full judgment call,
+including why `case.case_file() is None` is deliberately left to the
+loop's OWN identity precondition below rather than folded in here too.
 
 --------------------------------------------------------------------------
 JUDGMENT CALL: the LLM call has its own cost gate

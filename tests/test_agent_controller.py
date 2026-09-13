@@ -308,6 +308,103 @@ def test_stops_with_no_eligible_candidate_when_nothing_survives(
     assert decision.ranking == ()
 
 
+def test_stops_with_no_new_eligible_probe_when_the_only_eligible_probe_already_ran(
+    conn: sqlite3.Connection, cfg: Config, ctx: ProbeContext
+) -> None:
+    """The measured waste this stop exists to remove (module docstring).
+
+    `material_negative_event` is populated only by `company_events`
+    (`company_events.py`'s `populates`), which is history-independent — so
+    once it has run, `eligible_probes` has nothing left to offer, and the
+    controller must not need the model to know that. Passing `output=None`
+    proves the point literally: this is exactly the pre-flight call
+    `rli.agent.loop` makes BEFORE it would have paid for an investigator
+    reply, and the stop fires identically whether or not a reply exists.
+    """
+    case_file = _case().case_file()
+    assert case_file is not None
+    canonical = build_args(CompanyEventsProbe, case_file, ctx)
+    already = ExecutedProbe(
+        probe="company_events",
+        args_hash=hash_args("company_events", **canonical.model_dump(mode="json")),
+        args=canonical.model_dump(mode="json"),
+        ok=True,
+    )
+    decision = _decide(
+        None,
+        case=_case(),
+        cfg=cfg,
+        ctx=ctx,
+        could_change={"material_negative_event"},
+        executed=(already,),
+    )
+    assert (decision.decision, decision.reason) == ("stop", "no_new_eligible_probe")
+    assert decision.considered == ("company_events",)
+
+    # A model reply proposing the very same stale probe changes nothing: the
+    # stop is model-independent and fires before `output` is even examined.
+    reproposed = _decide(
+        _output(_candidate("company_events", company_id=COMPANY, as_of=NOW)),
+        case=_case(),
+        cfg=cfg,
+        ctx=ctx,
+        could_change={"material_negative_event"},
+        executed=(already,),
+    )
+    assert (reproposed.decision, reproposed.reason) == ("stop", "no_new_eligible_probe")
+    # And, unlike the per-candidate `duplicate` path it pre-empts, no
+    # candidate was ever looked at: there is nothing in `rejected`.
+    assert reproposed.rejected == ()
+
+
+def test_stops_with_no_new_eligible_probe_and_names_every_stale_survivor(
+    conn: sqlite3.Connection, cfg: Config, ctx: ProbeContext
+) -> None:
+    """`considered` carries ALL eligible-but-exhausted probes, sorted, for the trace.
+
+    `repost_pattern` is populated by two probes (`repost_history` AND
+    `requirements_drift`); running both exhausts every probe that could
+    still answer it, so the pre-check must inspect the WHOLE eligible set,
+    not just the first name it finds.
+    """
+    _seed_history(conn)
+    case_file = _case().case_file()
+    assert case_file is not None
+    executed = tuple(
+        ExecutedProbe(
+            probe=probe_cls.name,
+            args_hash=hash_args(
+                probe_cls.name,
+                **build_args(probe_cls, case_file, ctx).model_dump(mode="json"),
+            ),
+            args=build_args(probe_cls, case_file, ctx).model_dump(mode="json"),
+            ok=True,
+        )
+        for probe_cls in (RepostHistoryProbe, RequirementsDriftProbe)
+    )
+    decision = _decide(_output(), case=_case(), cfg=cfg, ctx=ctx, executed=executed)
+    assert (decision.decision, decision.reason) == ("stop", "no_new_eligible_probe")
+    assert decision.considered == ("repost_history", "requirements_drift")
+
+
+def test_stops_when_no_probe_is_eligible_at_all_without_asking_the_model(
+    conn: sqlite3.Connection, cfg: Config, ctx: ProbeContext
+) -> None:
+    """spec.md §4: "no eligible probe is worth its cost" — also true on step ONE.
+
+    `no_new_eligible_probe`'s "or the eligible list is empty" clause is not
+    only about repeats: if `eligible_probes` returns nothing at all (here,
+    no board history for the only probe that could answer `repost_pattern`),
+    the model's answer could not possibly matter either, so there is no
+    reason to spend a call finding that out. `executed` is empty — this is
+    a FIRST-iteration stop, not a repeat.
+    """
+    add_posting(conn, job_id="9001")  # a posting row, but no board captures
+    decision = _decide(None, case=_case(), cfg=cfg, ctx=ctx)
+    assert (decision.decision, decision.reason) == ("stop", "no_new_eligible_probe")
+    assert decision.considered == ()
+
+
 # ---------------------------------------------------------------------------
 # spec.md §4 step 4: filtering invalid / ineligible candidates
 # ---------------------------------------------------------------------------
@@ -422,7 +519,18 @@ def test_rejects_the_same_probe_proposed_twice_in_one_output(
 def test_rejects_a_history_gated_probe_without_usable_history(
     conn: sqlite3.Connection, cfg: Config, ctx: ProbeContext
 ) -> None:
-    """spec.md §4: "history probes are ineligible without usable history"."""
+    """spec.md §4: "history probes are ineligible without usable history".
+
+    `could_change` also names `material_negative_event`, which
+    `company_events` (history-independent) can still populate — that keeps
+    `eligible_probes` non-empty so the `no_new_eligible_probe` pre-check
+    (see the controller's judgment call) does not short-circuit the decision
+    before the per-candidate filter this test targets ever runs. Without
+    that second target, EVERY probe able to answer `could_change` would be
+    ineligible from the start, and the pre-check — correctly — would stop
+    the run without looking at `output` at all (see
+    `test_stops_when_no_probe_is_eligible_at_all_without_asking_the_model`).
+    """
     add_posting(conn, job_id="9001")  # a posting row, but no board captures
     decision = _decide(
         _output(
@@ -432,6 +540,7 @@ def test_rejects_a_history_gated_probe_without_usable_history(
         case=_case(),
         cfg=cfg,
         ctx=ctx,
+        could_change={"repost_pattern", "material_negative_event"},
     )
     assert _reasons(decision) == {
         "repost_history": "ineligible",
@@ -483,6 +592,11 @@ def test_rejects_candidates_beyond_the_candidate_limit(
 def test_team_signal_is_ineligible_while_the_licence_flag_is_false(
     conn: sqlite3.Connection, cfg: Config, ctx: ProbeContext
 ) -> None:
+    """`could_change` also names `repost_pattern` — see the sibling history-gating
+    test's docstring for why a second, genuinely eligible target is needed to
+    reach the per-candidate filter instead of the `no_new_eligible_probe`
+    pre-check.
+    """
     _seed_history(conn)
     disabled = cfg.model_copy(
         update={"team_signal": cfg.team_signal.model_copy(update={"enabled": False})}
@@ -493,7 +607,7 @@ def test_team_signal_is_ineligible_while_the_licence_flag_is_false(
         case=_case(),
         cfg=disabled,
         ctx=disabled_ctx,
-        could_change={"corroborating_hiring_signal"},
+        could_change={"corroborating_hiring_signal", "repost_pattern"},
     )
     assert _reasons(decision)["team_signal"] == "ineligible"
     assert decision.reason == "no_eligible_candidate"

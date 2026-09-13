@@ -224,6 +224,72 @@ never emits: the step cap is checked as a whole-decision stop (order rule
 rejected for it. It is kept in the literal so the reject vocabulary and the
 stop vocabulary line up in the trace; the alternative (dropping it) would
 make a future per-candidate step accounting a schema change.
+
+--------------------------------------------------------------------------
+Judgment call: `no_new_eligible_probe` — a duplicate the model never gets
+asked about
+--------------------------------------------------------------------------
+
+A 1,287-case System C replay measured the shape of this waste directly:
+after the controller ran the only eligible probe (usually
+`company_events`), the loop called the investigator a SECOND time; the
+model re-proposed the same probe (there was nothing else left to propose);
+the controller rejected it as `duplicate` (927 of those replies); and the
+run then stopped with `no_eligible_candidate` (1,015 stops). That second
+investigator call was pure waste — ~40% of every investigator call this
+system made — because its answer was already knowable from `(case state,
+executed history)` alone, with no model input required.
+
+spec.md §4's hard-stop list already covers this outcome twice over: "the
+same probe+arguments would repeat" and "no eligible probe is worth its
+cost" — both true the moment every probe `eligible_probes` would return is
+already in `executed`. And spec.md §2 is explicit that stopping is never
+the LLM's call to make: "Never rely on the LLM alone for ... stopping".
+Together they mean this stop must be computable, and enforced, WITHOUT
+asking the model — the same instinct that already produced the pre-flight
+`decide(output=None)` call `rli.agent.loop` makes every iteration (see that
+module's docstring). `no_new_eligible_probe` is that instinct made
+explicit: a THIRD model-independent hard stop, checked alongside
+`no_unresolved_question` and `step_cap`, so the pre-flight catches it for
+free and the investigator is never billed for a question the controller
+already knows the answer to.
+
+*Why not just let the existing `duplicate` rejection + `no_eligible_candidate`
+stop handle it, one step later, the way it already did?* Because "one step
+later" is exactly the model call this stop exists to skip. The two paths
+are not competing designs for the same behaviour; they cover different
+inputs. `no_new_eligible_probe` fires only when the model's answer could
+not possibly change the outcome — every candidate it COULD legally propose
+is already executed — which is knowable from `executed` and
+`eligible_probes` alone, before `output` exists. The per-candidate
+`duplicate` filter (see step 6 below) still exists and still fires whenever
+the model proposes a stale probe ALONGSIDE at least one genuinely new
+eligible one, or names the same probe twice in one reply — cases where the
+model's choice among the survivors still matters, so the call was not
+wasted and the filter's per-candidate detail (`args_hash` in `detail`) is
+still worth recording.
+
+*Why is `case.case_file() is None` a skip, not a stop?* Because that path
+is already owned, end to end, by a DIFFERENT precondition —
+`rli.agent.loop`'s "an unresolved identity stops the loop before the first
+call" (module docstring there) short-circuits before `decide` is even
+called, and when `decide` IS reached with no `CaseFile` (e.g. directly, in
+a test), the existing per-candidate filter already rejects every candidate
+`ineligible`/`identity_unresolved` and stops `no_eligible_candidate`. Adding
+a second, competing "no case file" stop here would just be racing that
+established path to the punch, for no behavioural gain and a real risk of
+changing which reason the trace records for a case the loop already
+handles correctly.
+
+Requirement preserved: the investigator is still called whenever at least
+one NEW eligible probe exists — this stop only ever fires when the model's
+candidate set is provably a strict subset of "already tried everything
+worth trying." And because `InvestigatorOutput.hypotheses` is never
+consumed by the loop (the user-facing hypotheses come from the separate
+explanation call, over `case.evidence` — see `rli.agent.explanation`) and
+`build_explanation_input` carries no budget remainder from the skipped
+call, skipping the wasted investigator call cannot change the final action
+or the explanation the user sees — only the cost of getting there.
 """
 
 from __future__ import annotations
@@ -238,6 +304,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from rli.agent.investigator import ExecutedProbe, InvestigatorOutput
 from rli.config import Config
 from rli.eval.case import CaseState
+from rli.models.case_file import CaseFile
 from rli.net.client import hash_args
 from rli.probes.base import Probe, ProbeContext
 from rli.probes.registry import (
@@ -280,6 +347,7 @@ StopReason = Literal[
     "investigator_stop",
     "investigator_error",
     "no_unresolved_question",
+    "no_new_eligible_probe",
     "no_eligible_candidate",
     "step_cap",
     "cost_cap",
@@ -544,6 +612,26 @@ def _stop(
     )
 
 
+def _canonical_args(
+    probe_cls: type[Probe], case_file: CaseFile, ctx: ProbeContext
+) -> tuple[BaseModel, str]:
+    """`(canonical args, args_hash)` for `probe_cls` against this case, RIGHT NOW.
+
+    The ONE computation of "what running this probe would actually look like
+    and how that is keyed" — called from both the `no_new_eligible_probe`
+    pre-check below (which only needs the hash, to compare against
+    `executed_keys`) and the per-candidate filter's survivor loop further
+    down (which needs the `canonical` object too, for `RankedCandidate.args`)
+    — not two hand-written copies that would merely agree today. See the
+    module docstring's judgment call on `no_new_eligible_probe` for why that
+    distinction matters: the pre-check's correctness depends on computing
+    EXACTLY the key `build_args`/`hash_args` would produce for a real run,
+    and a second, drifted definition here would silently break it.
+    """
+    canonical = build_args(probe_cls, case_file, ctx)
+    return canonical, hash_args(probe_cls.name, **canonical.model_dump(mode="json"))
+
+
 def decide(
     *,
     output: InvestigatorOutput | None,
@@ -564,15 +652,26 @@ def decide(
 
     1. `could_change` empty -> `no_unresolved_question`.
     2. no steps left -> `step_cap`.
-    3. `output is None` -> `investigator_error` (see the module docstring
+    3. every probe `eligible_probes` would allow right now is already in
+       `executed` (or none is eligible at all) -> `no_new_eligible_probe`.
+       Skipped when `case.case_file()` is `None` — see the module
+       docstring's judgment call on this stop for why that path is left to
+       the existing `identity_unresolved` handling instead. This is the
+       THIRD model-independent hard stop, added to eliminate the wasted
+       investigator call a real 1,287-case replay measured at ~40% of all
+       investigator calls (module docstring); it must run before step 4 so
+       `rli.agent.loop`'s pre-flight `decide(output=None)` catches it
+       without the loop needing to change.
+    4. `output is None` -> `investigator_error` (see the module docstring
        for why this is not a fallback to System B's routing).
-    4. `output.stop` -> `investigator_stop`. Checked LAST of the four
-       because it is the only one that is the model's opinion: the three
-       above are facts, and a model that asks to continue must not be able
-       to talk the controller past a cap.
-    5. filter the candidates (see below).
-    6. no survivors -> `no_eligible_candidate`; else budget-check the best.
-    7. run the best.
+    5. `output.stop` -> `investigator_stop`. Checked LAST of the
+       model-independent/model-dependent pair above because it is the only
+       one that is the model's opinion: the stops above are facts, and a
+       model that asks to continue must not be able to talk the controller
+       past a cap.
+    6. filter the candidates (see below).
+    7. no survivors -> `no_eligible_candidate`; else budget-check the best.
+    8. run the best.
 
     The per-candidate filter runs in the order spec.md §2/§4 imply, cheapest
     and most decisive first: unknown name, unresolvable identity, invalid
@@ -601,6 +700,27 @@ def decide(
     if budget.remaining_steps() <= 0:
         return _stop("step_cap")
 
+    case_file = case.case_file()
+    executed_keys = {(item.probe, item.args_hash) for item in executed}
+
+    if case_file is not None:
+        # spec.md §4: "the same probe+arguments would repeat" / "no eligible
+        # probe is worth its cost" — both true, and knowable WITHOUT the
+        # model, the moment every probe `eligible_probes` would allow right
+        # now has already been executed (or none is eligible at all). See
+        # the module docstring's judgment call on `no_new_eligible_probe`
+        # for the measured waste this eliminates and why `case_file is None`
+        # is a skip rather than a stop here.
+        eligible_now = eligible_probes(ctx, case_file, unpopulated_inputs=set(could_change))
+        if not eligible_now or all(
+            (probe_cls.name, _canonical_args(probe_cls, case_file, ctx)[1]) in executed_keys
+            for probe_cls in eligible_now
+        ):
+            return _stop(
+                "no_new_eligible_probe",
+                considered=sorted(probe_cls.name for probe_cls in eligible_now),
+            )
+
     if output is None:
         return _stop(
             "investigator_error",
@@ -616,7 +736,7 @@ def decide(
     if output.stop:
         return _stop("investigator_stop")
 
-    # --- step 5: filter -----------------------------------------------------
+    # --- step 6: filter -----------------------------------------------------
     limit = cfg.agent.max_candidates
     head = list(output.candidates[:limit])
     overflow = list(output.candidates[limit:])
@@ -631,9 +751,27 @@ def decide(
         for candidate in overflow
     ]
 
-    case_file = case.case_file()
     # ONE eligibility call, all gates. See the module docstring for why
     # `could_change` (not `unpopulated`) is the right `unpopulated_inputs`.
+    # Recomputed from `case_file`/`could_change` above (not reused from the
+    # `no_new_eligible_probe` check above, which may not have run — e.g.
+    # `case_file is None`): `eligible_probes` is a pure, side-effect-free
+    # function of its arguments, so calling it again here costs nothing
+    # beyond CPU and keeps this block correct standalone.
+    #
+    # ACCEPTED COST: across one `rli.agent.loop` iteration this makes
+    # `eligible_probes` run up to THREE times where it used to run once — the
+    # new pre-check calls it once in the pre-flight `decide(output=None)`,
+    # once more in the post-investigator `decide(output=...)` (same
+    # `could_change`/`executed`, so if it did not fire in the pre-flight it
+    # cannot fire here either — see the module docstring), and this line
+    # calls it a third time to build `eligible_names`. `eligible_probes` is
+    # pure but not free: `has_usable_history` hits sqlite. That cost is
+    # judged negligible next to the probe fetch or the LLM call this
+    # iteration is about to make (or, in the case this stop exists to
+    # optimize, negligible next to the model call it just SAVED) — not
+    # measured, but not the kind of query a per-posting board-history lookup
+    # needs to be re-derived carefully to avoid.
     eligible_names: set[str] = (
         set()
         if case_file is None
@@ -643,7 +781,6 @@ def decide(
         }
     )
 
-    executed_keys = {(item.probe, item.args_hash) for item in executed}
     # A batch can name the same probe twice; the canonical args are identical
     # by construction, so the second naming IS spec.md §4's "the same
     # probe+arguments would repeat".
@@ -693,8 +830,7 @@ def decide(
             )
             continue
 
-        canonical = build_args(probe_cls, case_file, ctx)
-        args_hash = hash_args(name, **canonical.model_dump(mode="json"))
+        canonical, args_hash = _canonical_args(probe_cls, case_file, ctx)
 
         if (name, args_hash) in executed_keys:
             rejected.append(
