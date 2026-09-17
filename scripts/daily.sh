@@ -44,7 +44,9 @@ set -o pipefail
 cd "$(dirname "$0")/.."
 
 mkdir -p data/logs
-LOG="data/logs/daily-$(date -u +%Y%m%d).log"
+# Log named by LOCAL date so a run just after midnight files under the day it
+# belongs to (UTC naming made a 00:13 CEST run look like "yesterday").
+LOG="data/logs/daily-$(date +%Y%m%d).log"
 
 LOCKFILE="data/.daily.lock"
 exec 200>"$LOCKFILE"

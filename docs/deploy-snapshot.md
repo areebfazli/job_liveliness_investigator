@@ -11,7 +11,7 @@ actually been running.
 
 The default deployment is a systemd **user** timer, not cron. A laptop
 isn't always on, and plain cron has no built-in way to "catch up" a missed
-day — if the machine is asleep or off at the scheduled time, that day's run
+day — if the machine is asleep (suspended) or off at the scheduled time, that day's run
 just never happens. systemd timers do have that semantics
 (`Persistent=true`: a missed run fires as soon as the machine is next
 booted/logged in), which is why the daily job is installed as a timer
@@ -24,8 +24,13 @@ scripts/setup_laptop_timer.sh
 ```
 
 This installs a `rli-daily.timer` + `rli-daily.service` user unit pair that
-runs `scripts/daily.sh` once a day (`OnCalendar=daily`, randomized by up to
-15 minutes so it doesn't fire at exactly the same instant every day), and
+runs `scripts/daily.sh` twice a day (`OnCalendar` at 00:05 and 12:05 local,
+randomized by up to 15 minutes). Two firings because a laptop that is
+*suspended* (lid closed) at the scheduled time cannot fire a timer; with a
+second slot at noon, one night asleep no longer costs a whole day. The
+second run is a no-op if the first already captured that UTC day
+(`rli snapshot` skips boards already captured), so it never double-counts.
+The timer also
 enables `loginctl enable-linger` so the timer still fires even when you are
 logged out. Enabling linger needs your password once; the script warns and
 continues if that fails, so a failed linger step doesn't fail the install.

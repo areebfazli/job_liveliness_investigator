@@ -72,7 +72,8 @@ EOF
 Description=Daily timer for job_liveliness_investigator snapshot (rli-daily)
 
 [Timer]
-OnCalendar=daily
+OnCalendar=*-*-* 00:05:00
+OnCalendar=*-*-* 12:05:00
 Persistent=true
 RandomizedDelaySec=15m
 
