@@ -32,7 +32,11 @@ from rli.models.time import to_utc_z
 
 TEST_TOKEN = "secret-token-value"
 
-NOW = datetime(2026, 9, 7, tzinfo=UTC)
+# Relative to the real clock: /watch/due compares stored timestamps against the
+# wall clock, so a pinned calendar date turns "not due" entries due once that
+# date is far enough in the past (this failed on 2026-09-14 when it was fixed at
+# 2026-09-07).
+NOW = datetime.now(UTC).replace(microsecond=0)
 NO_JSONLD_PAGE = "<html><body>no structured data</body></html>"
 
 

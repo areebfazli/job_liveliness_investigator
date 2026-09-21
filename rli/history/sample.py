@@ -86,7 +86,11 @@ def export_match_sample(
     so an empty history still produces a valid (header-only) file rather
     than a missing one.
     """
-    candidates = rank_matches(conn, cfg, company_id, matches_only=matches_only)[:n]
+    # `top_n=n` rather than slicing afterwards: on a corpus-sized database
+    # the full ranking is millions of `MatchCandidate` objects, and this
+    # export only ever wanted the head of it. The rows are identical either
+    # way (see `rank_matches`).
+    candidates = rank_matches(conn, cfg, company_id, matches_only=matches_only, top_n=n)
 
     destination = Path(path)
     if destination.parent and not destination.parent.exists():

@@ -92,6 +92,7 @@ __all__ = [
     "PostingInterval",
     "apply_to_postings",
     "build_intervals",
+    "company_ids_with_captures",
     "load_captures",
 ]
 
@@ -189,7 +190,15 @@ class PostingInterval(BaseModel):
     present_snapshot_ids: tuple[int, ...] = ()
 
     def coexists_with(self, other: PostingInterval) -> bool:
-        """True when both jobs were listed together in at least one capture."""
+        """True when both jobs were listed together in at least one capture.
+
+        The straightforward, always-correct form: snapshot ids are globally
+        unique, so this is meaningful for any two intervals however they
+        were built. `rli.history.matching` does not call it on its bulk path
+        — at ~1.6M candidate pairs, two set constructions per pair is the
+        whole cost of the gate — and packs the same evidence into a bitmask
+        instead; see `matching._prepare_interval`.
+        """
         return bool(set(self.present_snapshot_ids) & set(other.present_snapshot_ids))
 
     @property
@@ -285,7 +294,13 @@ def load_captures(conn: sqlite3.Connection, company_id: str) -> list[Capture]:
     ]
 
 
-def _company_ids(conn: sqlite3.Connection) -> list[str]:
+def company_ids_with_captures(conn: sqlite3.Connection) -> list[str]:
+    """Every company with at least one board capture, in a stable order.
+
+    The unit of work for every corpus-wide operation in `rli.history`: both
+    `apply_to_postings` and `rli.history.matching.link_reposts` walk this
+    list and hold only one company's derived state at a time.
+    """
     return [
         row["company_id"]
         for row in conn.execute(
@@ -372,7 +387,7 @@ def build_intervals(
     resolves to a `postings` row via the documented correlation key; it stays
     None for archive-only jobs until `apply_to_postings` creates their row.
     """
-    company_ids = [company_id] if company_id is not None else _company_ids(conn)
+    company_ids = [company_id] if company_id is not None else company_ids_with_captures(conn)
 
     intervals: list[PostingInterval] = []
     for cid in company_ids:
@@ -610,6 +625,7 @@ def apply_to_postings(
     company_id: str | None = None,
     *,
     now: datetime | None = None,
+    commit: bool = True,
 ) -> ClosureApplySummary:
     """Project derived intervals onto `postings`, creating archive-only rows.
 
@@ -620,14 +636,23 @@ def apply_to_postings(
 
     Returns a `ClosureApplySummary` of exactly which fields moved, so a run
     is auditable without diffing the table.
+
+    Memory: one company's intervals are built, applied and released before
+    the next company is loaded, so peak usage tracks the LARGEST company
+    rather than the corpus.
+
+    `commit=False` leaves the writes in the caller's open transaction. That
+    is what `rli.history.cli.rebuild` needs to make a company's whole
+    clear-and-rewrite atomic; every other caller wants the default.
     """
     reference = now or now_utc()
     summary = ClosureApplySummary()
 
-    company_ids = [company_id] if company_id is not None else _company_ids(conn)
+    company_ids = [company_id] if company_id is not None else company_ids_with_captures(conn)
     for cid in company_ids:
         existing = _existing_postings(conn, cid)
-        for interval in build_intervals(conn, cid):
+        intervals = build_intervals(conn, cid)
+        for interval in intervals:
             summary.intervals += 1
             match = existing.get(interval.job_id)
             if match is None:
@@ -640,6 +665,10 @@ def apply_to_postings(
             if match_count > 1:
                 summary.ambiguous_job_ids += 1
             _merge_into_posting(conn, posting_id, stored, interval, summary, reference)
+        # Release this company's intervals and posting rows before the next
+        # company is loaded; nothing here is needed across companies.
+        del intervals, existing
 
-    conn.commit()
+    if commit:
+        conn.commit()
     return summary

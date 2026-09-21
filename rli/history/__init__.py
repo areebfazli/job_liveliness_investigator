@@ -45,6 +45,7 @@ from rli.history.closures import (
     PostingInterval,
     apply_to_postings,
     build_intervals,
+    company_ids_with_captures,
 )
 from rli.history.features import (
     CompanyHistoryFeatures,
@@ -82,6 +83,7 @@ __all__ = [
     "assign_one_to_one",
     "build_intervals",
     "company_features",
+    "company_ids_with_captures",
     "coverage_window",
     "dominant_title_fraction",
     "export_match_sample",

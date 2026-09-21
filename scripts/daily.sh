@@ -24,6 +24,23 @@
 #      re-measure and consider `--company` scoping or moving rebuild off
 #      the laptop entirely.
 #
+#      MEMORY CAP. On 2026-09-21 that weekly rebuild reached 7.1 GB RSS on
+#      the expanded corpus (351 companies) and was OOM-killed on an 11 GB
+#      laptop that is also running a desktop. `rli.history` was fixed to
+#      hold one company at a time (measured peak afterwards: well under
+#      100 MB), but this script no longer TRUSTS that: the rebuild runs
+#      inside a transient systemd scope capped at 3 GB with swap disabled,
+#      so the next regression kills the rebuild instead of the desktop. The
+#      cap is ~30x the measured peak, so it can only fire on a real
+#      regression. A kill is safe: `rli history rebuild` commits one
+#      company at a time, so an interrupted run leaves every company either
+#      fully re-derived or exactly as it was.
+#
+#      The peak RSS of each run is recorded in the log, so drift is visible
+#      before it becomes another incident. Both the cap and the measurement
+#      degrade gracefully: if `systemd-run` (or a usable user manager) or
+#      `/usr/bin/time` is missing, the rebuild simply runs without them.
+#
 # Concurrency / idempotency guarantees:
 #   - A non-blocking flock on data/.daily.lock ensures at most one instance
 #     of this script runs at a time; a second invocation while one is still
@@ -95,10 +112,46 @@ elif [ "$CHANGE_COUNT" -eq 0 ]; then
   echo "$(date -u +%FT%TZ) skipping history rebuild: no posting changes (new=$NEW absent=$ABSENT reappeared=$REAPPEARED)" | tee -a "$LOG"
 else
   echo "$(date -u +%FT%TZ) running rli history rebuild (Sunday UTC, new=$NEW absent=$ABSENT reappeared=$REAPPEARED)" | tee -a "$LOG"
-  uv run rli history rebuild --db data/rli.db >>"$LOG" 2>&1
+
+  REBUILD_CMD=(uv run rli history rebuild --db data/rli.db)
+
+  # Record peak RSS and wall clock. `/usr/bin/time` (GNU time), not the
+  # shell's `time` keyword, which has no -v and cannot write to a file.
+  TIME_STATS=""
+  if [ -x /usr/bin/time ]; then
+    TIME_STATS="data/logs/.rebuild-time.$$"
+    REBUILD_CMD=(/usr/bin/time -v -o "$TIME_STATS" "${REBUILD_CMD[@]}")
+  fi
+
+  # Cap the rebuild so a memory regression cannot take the desktop down
+  # with it. MemorySwapMax=0 matters as much as MemoryMax: without it a
+  # runaway rebuild thrashes gigabytes into swap and wedges the machine
+  # long before the cgroup kills anything. `systemd-run --user` needs a
+  # working user manager, so it is probed rather than assumed.
+  if command -v systemd-run >/dev/null 2>&1 && systemd-run --user --scope -q true >/dev/null 2>&1
+  then
+    REBUILD_CMD=(systemd-run --user --scope -q -p MemoryMax=3G -p MemorySwapMax=0 "${REBUILD_CMD[@]}")
+  else
+    echo "$(date -u +%FT%TZ) note: systemd-run unavailable; rebuild runs uncapped" | tee -a "$LOG"
+  fi
+
+  "${REBUILD_CMD[@]}" >>"$LOG" 2>&1
   REBUILD_RC=$?
+
+  if [ -n "$TIME_STATS" ] && [ -f "$TIME_STATS" ]; then
+    cat "$TIME_STATS" >>"$LOG"
+    PEAK_KB=$(awk '/Maximum resident set size/ {print $NF}' "$TIME_STATS")
+    WALL=$(awk -F': ' '/Elapsed \(wall clock\) time/ {print $NF}' "$TIME_STATS")
+    rm -f "$TIME_STATS"
+    echo "$(date -u +%FT%TZ) history rebuild peak RSS ${PEAK_KB:-?} KB, wall ${WALL:-?}" | tee -a "$LOG"
+  fi
+
   if [ "$REBUILD_RC" -ne 0 ]; then
+    # rc 137 = SIGKILL, which is what MemoryMax looks like from here.
     echo "$(date -u +%FT%TZ) history rebuild failed rc=$REBUILD_RC" | tee -a "$LOG"
+    if [ "$REBUILD_RC" -eq 137 ]; then
+      echo "$(date -u +%FT%TZ) rc=137 is SIGKILL: likely the 3G MemoryMax. Derived state is still consistent (rebuild commits per company); re-run after investigating." | tee -a "$LOG"
+    fi
     exit "$REBUILD_RC"
   fi
 fi
