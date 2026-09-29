@@ -132,17 +132,25 @@ def _schema_sql() -> str:
     return resources.files("rli.db").joinpath("schema.sql").read_text(encoding="utf-8")
 
 
-def connect(path: str | Path) -> sqlite3.Connection:
+def connect(path: str | Path, *, busy_timeout_ms: int = BUSY_TIMEOUT_MS) -> sqlite3.Connection:
     """Open a SQLite connection configured for concurrent, replay-safe use.
 
     Sets WAL journaling (a no-op for the in-memory `:memory:` database, which
     has no journal file), a busy timeout so concurrent writers block briefly
     instead of raising `sqlite3.OperationalError` immediately, foreign key
     enforcement, and row access by column name.
+
+    `busy_timeout_ms` defaults to `BUSY_TIMEOUT_MS`. A long-running writer
+    that shares the database with sibling processes — the sharded System C
+    replay (`rli replay run --shard`) — passes a longer one, because a case
+    that gives up on a lock after 5 s is a case that has to be redone.
     """
-    conn = sqlite3.connect(str(path), timeout=BUSY_TIMEOUT_MS / 1000)
+    busy_timeout_ms = int(busy_timeout_ms)
+    if busy_timeout_ms < 0:
+        raise ValueError(f"busy_timeout_ms must be >= 0, got {busy_timeout_ms}")
+    conn = sqlite3.connect(str(path), timeout=busy_timeout_ms / 1000)
     conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+    conn.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
     conn.execute("PRAGMA foreign_keys = ON")
     conn.row_factory = sqlite3.Row
     return conn

@@ -18,7 +18,13 @@ from rli.history.cli import app as history_app
 from rli.models.time import now_utc, parse_utc
 from rli.replay.build import DEFAULT_GRID_STEP_DAYS, build_dataset
 from rli.replay.leakage import check_dataset
-from rli.replay.run import SYSTEM_RUNNERS, dataset_status, run_replay
+from rli.replay.run import (
+    REPLAY_BUSY_TIMEOUT_S,
+    SYSTEM_RUNNERS,
+    dataset_status,
+    parse_shard,
+    run_replay,
+)
 from rli.snapshots.daily import run_daily_snapshot
 from rli.snapshots.targets import DEFAULT_TARGETS_PATH, load_targets, upsert_companies
 
@@ -385,6 +391,27 @@ def replay_run_command(
         "that case's run so `--resume` redoes it later. Defaults to on for --system C, "
         "off otherwise.",
     ),
+    shard: str | None = typer.Option(
+        None,
+        "--shard",
+        help="Walk only shard I of N (I/N, 0-based, e.g. 0/4) so N processes can replay "
+        "one dataset concurrently. Always resumes; refuses --no-resume and ignores "
+        "replacement, and never deletes another shard's runs.",
+    ),
+    rpm: int | None = typer.Option(
+        None,
+        "--rpm",
+        min=0,
+        help="LLM requests/minute for THIS process (System C), overriding "
+        "[llm].requests_per_minute. For N shard workers pass floor(total/N). Affects "
+        "pacing only; runs.config_hash is unchanged.",
+    ),
+    busy_timeout: float = typer.Option(
+        REPLAY_BUSY_TIMEOUT_S,
+        "--busy-timeout",
+        min=0.0,
+        help="Seconds a write waits on a locked database before failing.",
+    ),
     db: str = typer.Option(_DEFAULT_DB_PATH, "--db", help="Path to the SQLite database file."),
 ) -> None:
     """Replay one system over every (posting, T) case of a dataset."""
@@ -394,23 +421,48 @@ def replay_run_command(
     else:
         chosen = _normalized_system(system)
 
-    runner = None
-    if chosen == "C":
-        from rli.agent.loop import make_system_c  # lazy: avoids importing the agent stack for A/B
-
-        runner = make_system_c()
-    elif chosen not in SYSTEM_RUNNERS:  # pragma: no cover - defensive
+    if chosen != "C" and chosen not in SYSTEM_RUNNERS:  # pragma: no cover - defensive
         raise typer.BadParameter(
             f"system {chosen!r} has no shipped replay runner", param_hint="--system"
         )
 
-    effective_resume = resume if resume is not None else (chosen == "C")
+    shard_spec = None
+    if shard is not None:
+        try:
+            shard_spec = parse_shard(shard)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc), param_hint="--shard") from exc
+        if resume is False:
+            raise typer.BadParameter(
+                "--shard cannot be combined with --no-resume: a sharded worker must skip "
+                "completed cases, never re-run or replace them",
+                param_hint="--shard",
+            )
+
+    effective_resume = resume if resume is not None else (chosen == "C" or shard_spec is not None)
     effective_stop_on_quota = stop_on_quota if stop_on_quota is not None else (chosen == "C")
 
     cfg = load_config()
     init_db(db)
-    conn = connect(db)
+    conn = connect(db, busy_timeout_ms=int(busy_timeout * 1000))
+    llm_inner = None
     try:
+        runner = None
+        if chosen == "C":
+            from rli.agent.loop import make_system_c  # lazy: no agent stack for A/B
+            from rli.llm.client import CachedClient
+
+            # ONE model client for the whole walk, so `requests_per_minute`
+            # paces this process's calls across cases, not just within one
+            # case (a client per case restarts its throttle every case).
+            llm_inner = _replay_llm_client(cfg, rpm)
+            inner = llm_inner
+
+            def _cached(conn_, _cfg):
+                return CachedClient(inner, conn_)
+
+            runner = make_system_c(llm_factory=_cached)
+
         summary = run_replay(
             conn,
             cfg,
@@ -421,6 +473,7 @@ def replay_run_command(
             replace=not keep_previous,
             resume=effective_resume,
             stop_on_quota=effective_stop_on_quota,
+            shard=shard_spec,
         )
         typer.echo(summary.describe())
         if summary.stopped_reason == "quota_exhausted":
@@ -428,7 +481,29 @@ def replay_run_command(
         if summary.violations:
             raise typer.Exit(code=1)
     finally:
+        if llm_inner is not None:
+            from rli.llm.client import close_llm_client
+
+            close_llm_client(llm_inner)
         conn.close()
+
+
+def _replay_llm_client(cfg, rpm: int | None):
+    """The live model client for `replay run --system C` (a test seam).
+
+    `rpm` overrides `[llm].requests_per_minute` for THIS client only. The
+    `cfg` the replay itself runs under is left untouched on purpose:
+    `runs.config_hash` fingerprints the whole config, and a pacing knob that
+    differs per worker must not split one replay's runs into several
+    configurations.
+    """
+    from rli.llm.client import OpenAICompatibleClient
+
+    if rpm is not None:
+        cfg = cfg.model_copy(
+            update={"llm": cfg.llm.model_copy(update={"requests_per_minute": rpm})}
+        )
+    return OpenAICompatibleClient.from_config(cfg)
 
 
 @replay_app.command("check")
@@ -455,6 +530,12 @@ def replay_check_command(
 @replay_app.command("status")
 def replay_status_command(
     dataset: str = typer.Option(..., "--dataset", help="Replay dataset id to report on."),
+    shards: int | None = typer.Option(
+        None,
+        "--shards",
+        min=1,
+        help="Also split each system's counts by `replay run --shard I/N` shard (N shards).",
+    ),
     db: str = typer.Option(_DEFAULT_DB_PATH, "--db", help="Path to the SQLite database file."),
 ) -> None:
     """Per-system case totals for a replay dataset: total / completed / remaining.
@@ -466,7 +547,7 @@ def replay_status_command(
     init_db(db)
     conn = connect(db)
     try:
-        status = dataset_status(conn, dataset_id=dataset)
+        status = dataset_status(conn, dataset_id=dataset, shards=shards)
         typer.echo(status.describe())
     finally:
         conn.close()

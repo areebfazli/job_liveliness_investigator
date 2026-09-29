@@ -170,9 +170,11 @@ def test_cost_differs_per_model(cfg: Config) -> None:
 
 def test_a_local_model_is_priced_at_zero_explicitly(cfg: Config) -> None:
     # Not the unpriced-model fallback: the row exists and says 0.0, so the
-    # ledger's zero for a local run is a recorded fact.
-    assert cfg.llm.price_for(cfg.llm.model_id) is not None
-    assert compute_cost_usd(cfg, cfg.llm.model_id, 10_000_000, 10_000_000) == 0.0
+    # ledger's zero for a local run is a recorded fact. Named explicitly rather
+    # than via the shipped default model, which is a hosted (priced) model.
+    local = "llama3.2:3b"
+    assert cfg.llm.price_for(local) is not None
+    assert compute_cost_usd(cfg, local, 10_000_000, 10_000_000) == 0.0
 
 
 def test_unknown_model_costs_zero_and_does_not_raise(cfg: Config) -> None:

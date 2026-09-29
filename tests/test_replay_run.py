@@ -904,6 +904,9 @@ def test_a_database_failure_in_the_resume_path_fails_one_case_not_the_walk(
     An uncaught `sqlite3.Error` there ended the whole replay — the worst
     possible place for it, since `resume=True` is the default for System C's
     multi-day walk and the case had not even been run yet.
+
+    A lock is retried once (module docstring), so the failure here persists
+    across BOTH attempts of the first case.
     """
     _build(conn, cfg)
     run_replay(conn, cfg, dataset_id=DATASET, system="A", limit_cases=3)
@@ -916,17 +919,21 @@ def test_a_database_failure_in_the_resume_path_fails_one_case_not_the_walk(
 
     def flaky_delete(conn_: sqlite3.Connection, run_ids) -> int:
         calls["n"] += 1
-        if calls["n"] == 1:
+        if calls["n"] <= 2:
             raise sqlite3.OperationalError("database is locked")
         return _delete_run_ids(conn_, run_ids)
 
     monkeypatch.setattr("rli.replay.run._delete_run_ids", flaky_delete)
+    monkeypatch.setattr("rli.replay.run._LOCK_RETRY_DELAY_S", 0.0)
     summary = run_replay(conn, cfg, dataset_id=DATASET, system="A", resume=True)
 
     assert summary.cases == 8  # the walk visited the whole grid
     assert summary.errors == 1
     assert summary.completed == 7
-    assert calls["n"] == 3  # the other two resumed cases still got their cleanup
+    assert summary.lock_retries == 1
+    # Two attempts at the first case, then the other two resumed cases still
+    # got their cleanup.
+    assert calls["n"] == 4
 
     failed = [outcome for outcome in summary.outcomes if outcome.error is not None]
     assert len(failed) == 1
@@ -974,6 +981,32 @@ def test_a_concurrent_commit_during_a_case_does_not_fail_any_case(
         ).fetchone()[0]
         == 8
     )
+
+
+def test_a_resumed_walk_installs_no_corpus_for_cases_already_done(
+    conn: sqlite3.Connection, cfg: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Done cases are skipped BEFORE `point_in_time`, which costs ~0.4 s per `T`
+    on the real corpus — a resumed multi-day walk must not pay it again."""
+    _build(conn, cfg)
+    run_replay(conn, cfg, dataset_id=DATASET, system="A", limit_cases=3)
+
+    import rli.replay.run as run_module
+    from rli.replay.build import dataset_case_rows
+
+    real = run_module.point_in_time
+    installed: list[object] = []
+
+    def counting(conn_, moment, **kwargs):
+        installed.append(moment)
+        return real(conn_, moment, **kwargs)
+
+    monkeypatch.setattr("rli.replay.run.point_in_time", counting)
+    summary = run_replay(conn, cfg, dataset_id=DATASET, system="A", resume=True)
+
+    assert summary.skipped == 3 and summary.completed == 5 and summary.cases == 8
+    remaining_ts = {row["replay_at"] for row in dataset_case_rows(conn, DATASET)[3:]}
+    assert len(installed) == len(remaining_ts)
 
 
 def test_a_programming_error_in_the_walk_still_propagates(

@@ -107,12 +107,39 @@ Judgment calls
   quota exhaustion, deletes just that one run (so it looks "never attempted"
   to the next `resume=True` call), and returns immediately rather than
   burning the rest of the grid against an exhausted quota.
+
+* **`shard=(I, N)` splits one dataset across N concurrent processes.** A
+  case belongs to shard `I` iff `shard_of(posting_id, replay_at, N) == I` — a
+  sha256 of the case key, so the partition is the same in every process, on
+  every machine and in every Python (the builtin `hash()` is salted per
+  process and would not be). A sharded walk is always a RESUMING walk
+  (`resume=False` is refused, `replace` is ignored): N workers that each
+  started by clearing the dataset would delete each other's progress. Every
+  deletion the walk still makes — a stale failed run, a quota-cut run, a
+  half-written run after a lock failure — is per case, and is checked
+  against this shard's own case keys before it is issued
+  (`ShardViolation`), so no code path can delete a sibling shard's runs.
+
+* **A case that dies on a LOCK is retried once, and its partial run is
+  deleted first.** With several processes committing to one WAL database a
+  write can wait out `busy_timeout` (`REPLAY_BUSY_TIMEOUT_S` for the CLI)
+  and fail with "database is locked". That is contention, not a property of
+  the case, so the walk rolls back, deletes whatever run the failed attempt
+  created (it may even be `status='completed'` without its explanation,
+  which `resume` would otherwise skip forever), waits briefly and tries
+  again. A second failure is recorded as the case's error — with no run
+  left behind, so the next `resume` redoes it. Every other failure keeps
+  its run, exactly as before (a `ReplayViolation` trace is audit evidence).
 """
 
 from __future__ import annotations
 
+import hashlib
+import re
 import sqlite3
+import time
 from collections.abc import Callable, Sequence
+from contextlib import ExitStack
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Protocol
@@ -135,16 +162,79 @@ from rli.replay.mode import (
 from rli.replay.pit import point_in_time
 
 __all__ = [
+    "REPLAY_BUSY_TIMEOUT_S",
     "SYSTEM_RUNNERS",
     "CaseOutcome",
     "ReplayDatasetStatus",
     "ReplayRunSummary",
+    "ShardCaseStatus",
+    "ShardViolation",
     "SystemCaseStatus",
     "SystemRunner",
     "clear_replay_runs",
     "dataset_status",
+    "format_shard",
+    "parse_shard",
     "run_replay",
+    "shard_of",
 ]
+
+#: `busy_timeout` (seconds) the `rli replay run` CLI opens its connection
+#: with. Long on purpose: a sharded replay has up to N sibling processes
+#: committing short transactions to the same WAL database, and a write that
+#: gives up after `rli.db.BUSY_TIMEOUT_MS` (5 s) costs a whole case.
+REPLAY_BUSY_TIMEOUT_S = 60.0
+
+#: Attempts per case when the failure is a database LOCK (module docstring).
+_CASE_ATTEMPTS = 2
+
+#: Pause before the retry of a lock-failed case. Module-level so a test can
+#: set it to zero.
+_LOCK_RETRY_DELAY_S = 2.0
+
+
+class ShardViolation(RuntimeError):
+    """A sharded walk tried to delete a run that belongs to another shard.
+
+    Never a case-level failure: it means this module computed a deletion set
+    wrongly, so it propagates and ends the walk rather than being counted.
+    """
+
+
+def shard_of(posting_id: str, replay_at: str, shards: int) -> int:
+    """The shard (`0 <= I < shards`) that owns case `(posting_id, replay_at)`.
+
+    sha256, not `hash()`: Python salts `str` hashes per process, and N worker
+    processes must agree on the partition without talking to each other.
+    """
+    if shards < 1:
+        raise ValueError(f"shard count must be >= 1, got {shards}")
+    digest = hashlib.sha256(f"{posting_id}\n{replay_at}".encode()).digest()
+    return int.from_bytes(digest[:8], "big") % shards
+
+
+_SHARD_SPEC = re.compile(r"^\s*(\d+)\s*/\s*(\d+)\s*$")
+
+
+def _checked_shard(shard: tuple[int, int]) -> tuple[int, int]:
+    index, count = (int(shard[0]), int(shard[1]))
+    if count < 1 or not 0 <= index < count:
+        raise ValueError(
+            f"invalid shard {index}/{count}: expected I/N with N >= 1 and 0 <= I < N (0-based I)"
+        )
+    return index, count
+
+
+def parse_shard(text: str) -> tuple[int, int]:
+    """Parse `"I/N"` (0-based `I`) into `(I, N)`; `ValueError` if malformed."""
+    match = _SHARD_SPEC.match(text)
+    if match is None:
+        raise ValueError(f"invalid shard {text!r}: expected I/N, e.g. 0/4 (0-based I)")
+    return _checked_shard((int(match.group(1)), int(match.group(2))))
+
+
+def format_shard(shard: tuple[int, int]) -> str:
+    return f"{shard[0]}/{shard[1]}"
 
 
 class SystemRunner(Protocol):
@@ -216,6 +306,13 @@ class ReplayRunSummary(BaseModel):
     #: `to_utc_z` of the next moment a daily quota is expected to have reset,
     #: set only alongside `stopped_reason`.
     resume_after: str | None = None
+    #: `"I/N"` when this call walked one shard of the dataset, else `None`.
+    shard: str | None = None
+    #: Cases retried after a database-lock failure (module docstring).
+    lock_retries: int = 0
+    #: `"<posting_id> @ <T>: <error>"` for each of those retries, so a log
+    #: shows what the contention was even when the retry succeeded.
+    lock_retry_errors: tuple[str, ...] = ()
 
     action_distribution: dict[str, int] = {}
     posting_state_distribution: dict[str, int] = {}
@@ -226,11 +323,13 @@ class ReplayRunSummary(BaseModel):
     outcomes: tuple[CaseOutcome, ...] = ()
 
     def describe(self) -> str:
+        shard = f" [shard {self.shard}]" if self.shard is not None else ""
+        retries = f" lock_retries={self.lock_retries}" if self.lock_retries else ""
         lines = [
-            f"replay {self.system} over dataset {self.dataset_id!r}: "
+            f"replay {self.system} over dataset {self.dataset_id!r}{shard}: "
             f"cases={self.cases} completed={self.completed} "
-            f"violations={self.violations} errors={self.errors} skipped={self.skipped} "
-            f"(replaced {self.replaced_runs} previous run(s))",
+            f"violations={self.violations} errors={self.errors} skipped={self.skipped}"
+            f"{retries} (replaced {self.replaced_runs} previous run(s))",
             f"  actions: {_render(self.action_distribution)}",
             f"  posting_state: {_render(self.posting_state_distribution)}",
             f"  evidence_quality: {_render(self.evidence_quality_distribution)}",
@@ -246,6 +345,8 @@ class ReplayRunSummary(BaseModel):
         for outcome in self.outcomes:
             if outcome.error is not None:
                 lines.append(f"    ! {outcome.posting_id} @ {outcome.replay_at}: {outcome.error}")
+        for retried in self.lock_retry_errors:
+            lines.append(f"    ~ retried {retried}")
         return "\n".join(lines)
 
     def __str__(self) -> str:  # pragma: no cover - trivial delegation
@@ -266,11 +367,13 @@ def _sqlite_error_text(exc: sqlite3.Error) -> str:
     """A `sqlite3` failure, with the SQLite error NAME kept.
 
     `SQLITE_BUSY` and `SQLITE_BUSY_SNAPSHOT` both stringify as "database is
-    locked" and mean opposite things: the first is contention, which
-    `rli.db.connect`'s 5 s `busy_timeout` retries, and the second is a
-    read-snapshot conflict, which fails in ~0 ms and is never retried. A
-    recorded per-case error that says only "database is locked" sends the
-    reader after the wrong problem, so the name goes in the text.
+    locked" and mean opposite things: the first is contention, which the
+    connection's `busy_timeout` (`rli.db.connect`) retries, and the second is
+    a read-snapshot conflict, which fails in ~0 ms and is never retried by
+    SQLite. (The walk retries both once, after a `ROLLBACK` that releases any
+    snapshot — see `_CaseAttempt`.) A recorded per-case error that says only
+    "database is locked" sends the reader after the wrong problem, so the
+    name goes in the text.
     """
     name = getattr(exc, "sqlite_errorname", None)
     text = f"{type(exc).__name__}: {exc}"
@@ -294,6 +397,44 @@ def _failed_case(row: sqlite3.Row, error: str, outcome: CaseOutcome | None) -> C
         input_url=row["canonical_url"],
         error=error,
     )
+
+
+def _is_lock_error(exc: sqlite3.Error) -> bool:
+    """SQLITE_BUSY / SQLITE_LOCKED (and their extended codes), i.e. contention."""
+    name = getattr(exc, "sqlite_errorname", None) or ""
+    if name.startswith(("SQLITE_BUSY", "SQLITE_LOCKED")):
+        return True
+    return _is_lock_error_text(str(exc))
+
+
+def _is_lock_error_text(text: str) -> bool:
+    lowered = text.lower()
+    return "database is locked" in lowered or "database table is locked" in lowered
+
+
+def _assert_deletable(
+    conn: sqlite3.Connection, run_ids: Sequence[str], allowed: frozenset[tuple[str, str]] | None
+) -> None:
+    """Refuse (`ShardViolation`) to delete any run outside this shard's case keys.
+
+    `allowed` is `None` for an unsharded walk, which may delete anything its
+    own filters select. For a shard it is the set of `(input_url, replay_at)`
+    keys of the cases this shard owns — the same identity `_case_run_rows`
+    selects by — so a deletion set computed wrongly anywhere in this module
+    stops the walk instead of erasing a sibling worker's progress.
+    """
+    if allowed is None or not run_ids:
+        return
+    placeholders = ",".join("?" for _ in run_ids)
+    rows = conn.execute(
+        f"SELECT id, input_url, replay_at FROM runs WHERE id IN ({placeholders})", list(run_ids)
+    ).fetchall()
+    foreign = [row["id"] for row in rows if (row["input_url"], row["replay_at"]) not in allowed]
+    if foreign:
+        raise ShardViolation(
+            f"refusing to delete {len(foreign)} run(s) that belong to another shard's cases: "
+            f"{foreign[:5]}"
+        )
 
 
 def _delete_run_ids(conn: sqlite3.Connection, run_ids: Sequence[str]) -> int:
@@ -430,6 +571,7 @@ def run_replay(
     replace: bool = True,
     resume: bool = False,
     stop_on_quota: bool = False,
+    shard: tuple[int, int] | None = None,
 ) -> ReplayRunSummary:
     """Replay `system` over every case of `dataset_id` (spec.md §6).
 
@@ -442,7 +584,8 @@ def run_replay(
         limit_cases: stop after this many cases. For a smoke run; the
             selection is the dataset's own `(T, posting_id)` order, so a
             truncated replay is a prefix of the grid, not a sample of it —
-            do not report metrics from one.
+            do not report metrics from one. With `shard`, the prefix is of
+            this shard's cases.
         collection_status_csv: pinned company-event collection state, for the
             `company_events` probe (`rli.probes.company_events`). Pass the
             same value the build used, or a replay reads whatever the working
@@ -451,9 +594,9 @@ def run_replay(
             dataset record was written from.
         replace: delete this dataset's previous replay runs for `system`
             first (see the module docstring). Ignored (treated as `False` for
-            the bulk pass) when `resume=True`: resuming needs last call's
-            completed runs kept, and per-case cleanup below handles the
-            cases that actually get rerun.
+            the bulk pass) when `resume=True` or `shard` is given: resuming
+            needs last call's completed runs kept, and per-case cleanup below
+            handles the cases that actually get rerun.
         resume: skip any case that already has a completed, non-quota-
             affected replay run for this `(dataset, system)`; rerun (after
             deleting the stale row) any case whose prior run failed or was
@@ -466,14 +609,18 @@ def run_replay(
             shows `run_steps` evidence of daily LLM-quota exhaustion. That
             case's run is deleted first, so a later `resume=True` call redoes
             exactly it rather than skipping it as "completed".
+        shard: `(I, N)` — walk only the cases `shard_of` assigns to shard `I`
+            of `N` (0-based), so N processes can replay one dataset
+            concurrently against one database. Requires `resume=True`
+            (`ValueError` otherwise); see the module docstring.
 
     Raises `LookupError` if the dataset has no cases, and `ValueError` for a
-    system with no runner — both before any case runs. Once the walk starts,
-    a per-case failure (the system raising, a `ReplayViolation`, or a
-    `sqlite3.Error` in the resume/quota bookkeeping around it) is recorded in
-    `outcomes` and counted in `errors`; it never ends the walk. Anything else
-    escaping this loop is a bug in this module and is left to propagate (see
-    the module docstring's judgment call).
+    system with no runner or an invalid/unsafe `shard` — all before any case
+    runs. Once the walk starts, a per-case failure (the system raising, a
+    `ReplayViolation`, or a `sqlite3.Error` in the resume/quota bookkeeping
+    around it) is recorded in `outcomes` and counted in `errors`; it never
+    ends the walk. Anything else escaping this loop is a bug in this module
+    and is left to propagate (see the module docstring's judgment call).
     """
     rows = dataset_case_rows(conn, dataset_id)
     if not rows:
@@ -489,9 +636,22 @@ def run_replay(
             f"(this module ships {sorted(SYSTEM_RUNNERS)})"
         )
 
+    # The `(input_url, replay_at)` keys this call may delete runs for, or
+    # `None` for an unsharded walk (see `_assert_deletable`).
+    shard_keys: frozenset[tuple[str, str]] | None = None
+    if shard is not None:
+        shard = _checked_shard(shard)
+        if not resume:
+            raise ValueError(
+                "a sharded replay must resume (resume=True / no --no-resume): workers that "
+                "replace or re-run completed cases would delete each other's progress"
+            )
+        rows = _shard_rows(rows, shard)
+        shard_keys = frozenset((row["canonical_url"], row["replay_at"]) for row in rows)
+
     replaced = (
         clear_replay_runs(conn, dataset_id=dataset_id, system=system_name)
-        if replace and not resume
+        if replace and not resume and shard is None
         else 0
     )
 
@@ -505,6 +665,7 @@ def run_replay(
     errors = 0
     skipped = 0
     archive_cases = 0
+    lock_retries: list[str] = []
     seen = 0
     # The `run_steps.error` text of the case that exhausted the daily LLM
     # quota, set only under `stop_on_quota`. It doubles as the walk's stop
@@ -512,6 +673,19 @@ def run_replay(
     # leaves the `point_in_time` block the ordinary way and there is exactly
     # one place a `ReplayRunSummary` is built.
     quota_stop: str | None = None
+    # Runs made before this call are either all gone (`replace`) or are
+    # deleted per case by `resume` before the case runs; only a
+    # `replace=False, resume=False` call has to snapshot a case's earlier
+    # runs so a lock-failed attempt deletes only what IT wrote (`_CaseAttempt`).
+    fresh_case_state = resume or replace
+    # Cases `resume` would skip, read once up front in one scan of `runs`.
+    # Skipping them BEFORE `point_in_time` is what keeps a resumed walk from
+    # paying a corpus install (~0.4 s on the real database) for every case
+    # it already finished; a case not in this set still gets the per-case
+    # check in `_CaseAttempt`, which reads the database afresh.
+    done_at_start = (
+        _completed_case_keys(conn, dataset_id=dataset_id, system=system_name) if resume else set()
+    )
 
     for stamp, group in _group_by_replay_at(rows):
         if limit_cases is not None and seen >= limit_cases:
@@ -521,67 +695,58 @@ def run_replay(
         # lifecycle re-derivation is the expensive half of `point_in_time`,
         # and a case only ever reads its own company's history. On a grid
         # whose points are per-posting (each starts at that posting's
-        # `first_observed`) this is usually a single company per `T`.
-        with point_in_time(
-            conn, replay_at, company_ids=sorted({row["company_id"] for row in group})
-        ):
+        # `first_observed`) this is usually a single company per `T`. The
+        # context is entered lazily, on the first case of this `T` that is
+        # not already done, and left with the group.
+        with ExitStack() as corpus:
+            corpus_open = False
             for row in group:
                 if limit_cases is not None and seen >= limit_cases:
                     break
                 seen += 1
-
-                outcome: CaseOutcome | None = None
-                try:
-                    if resume:
-                        prior = _case_run_rows(
+                if (row["canonical_url"], row["replay_at"]) in done_at_start:
+                    skipped += 1
+                    continue
+                if not corpus_open:
+                    corpus.enter_context(
+                        point_in_time(
                             conn,
-                            dataset_id=dataset_id,
-                            system=system_name,
-                            input_url=row["canonical_url"],
-                            replay_at=row["replay_at"],
+                            replay_at,
+                            company_ids=sorted({r["company_id"] for r in group}),
                         )
-                        done = [r for r in prior if r["status"] == "completed"]
-                        if done and not any(
-                            _run_quota_detail(conn, r["id"]) is not None for r in done
-                        ):
-                            skipped += 1
-                            continue
-                        if prior:
-                            _delete_run_ids(conn, [r["id"] for r in prior])
-
-                    outcome = _replay_one(
-                        conn,
-                        cfg,
-                        execute,
-                        dataset_id=dataset_id,
-                        posting_id=row["posting_id"],
-                        url=row["canonical_url"],
-                        replay_at=replay_at,
-                        collection_status_csv=collection_status_csv,
                     )
+                    corpus_open = True
 
-                    if stop_on_quota and outcome.run_id is not None:
-                        quota_text = _run_quota_detail(conn, outcome.run_id)
-                        if quota_text is not None:
-                            _delete_run_ids(conn, [outcome.run_id])
-                            outcomes.append(outcome)
-                            quota_stop = quota_text
-                            break
-                except sqlite3.Error as exc:
-                    # Everything the SYSTEM can raise is already a case
-                    # outcome by the time it gets here (`_replay_one`). What
-                    # is left is this module's own database work AROUND that
-                    # call — the resume path's `_case_run_rows` /
-                    # `_delete_run_ids`, the quota check, and the archive
-                    # claim lookup `_replay_one` makes before its own
-                    # handler — and a failure in it is this case's failure,
-                    # not the walk's. See the module docstring's judgment
-                    # call for why the class is `sqlite3.Error` and not
-                    # `Exception`.
-                    conn.rollback()
-                    outcomes.append(_failed_case(row, _sqlite_error_text(exc), outcome))
+                attempt = _CaseAttempt(
+                    conn=conn,
+                    cfg=cfg,
+                    execute=execute,
+                    row=row,
+                    dataset_id=dataset_id,
+                    system=system_name,
+                    replay_at=replay_at,
+                    collection_status_csv=collection_status_csv,
+                    resume=resume,
+                    stop_on_quota=stop_on_quota,
+                    shard_keys=shard_keys,
+                    fresh_case_state=fresh_case_state,
+                )
+                attempt.run()
+                lock_retries.extend(attempt.lock_retry_errors)
+
+                if attempt.skipped:
+                    skipped += 1
+                    continue
+                outcome = attempt.outcome
+                assert outcome is not None  # every non-skipped attempt sets one
+                if attempt.failed:
+                    outcomes.append(outcome)
                     errors += 1
                     continue
+                if attempt.quota_text is not None:
+                    outcomes.append(outcome)
+                    quota_stop = attempt.quota_text
+                    break
 
                 outcomes.append(outcome)
                 if outcome.archive_state_claims:
@@ -619,7 +784,191 @@ def run_replay(
         stopped_reason=None if quota_stop is None else "quota_exhausted",
         quota_detail=quota_stop,
         resume_after=None if quota_stop is None else to_utc_z(_next_quota_reset()),
+        shard=None if shard is None else format_shard(shard),
+        lock_retries=len(lock_retries),
+        lock_retry_errors=tuple(lock_retries),
     )
+
+
+def _shard_rows(rows: Sequence[sqlite3.Row], shard: tuple[int, int]) -> list[sqlite3.Row]:
+    """This shard's cases, refusing a dataset whose case identity crosses shards.
+
+    Cases are ASSIGNED by `(posting_id, replay_at)`, but `resume` and every
+    deletion recognise a case's runs by `(input_url, replay_at)` (see
+    `_case_run_rows`). If two cases shared a URL and `T` but hashed to
+    different shards, two workers would each treat the other's run as their
+    own — skipping it, or deleting it. No dataset built so far has such a
+    pair, so this is a refusal, not a merge rule.
+    """
+    index, count = shard
+    owner: dict[tuple[str, str], int] = {}
+    mine: list[sqlite3.Row] = []
+    for row in rows:
+        assigned = shard_of(row["posting_id"], row["replay_at"], count)
+        key = (row["canonical_url"], row["replay_at"])
+        previous = owner.setdefault(key, assigned)
+        if previous != assigned:
+            raise ValueError(
+                f"cannot shard: cases for {key[0]!r} at {key[1]} fall in shards "
+                f"{previous} and {assigned}, and runs are matched to cases by (url, T)"
+            )
+        if assigned == index:
+            mine.append(row)
+    return mine
+
+
+class _CaseLocked(Exception):
+    """`_replay_one` returned an outcome whose error is a database lock."""
+
+    def __init__(self, outcome: CaseOutcome) -> None:
+        super().__init__(outcome.error)
+        self.outcome = outcome
+
+
+class _CaseAttempt:
+    """One case of the walk: resume check, the run, the quota check, lock retry.
+
+    A small class rather than more nesting in `run_replay`: the per-case state
+    (`skipped`, `failed`, `quota_text`, `lock_retries`) is what the walk reads
+    back, and the retry loop needs to know which runs existed before it
+    started so it can delete exactly the ones a failed attempt wrote.
+    """
+
+    def __init__(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        cfg: Config,
+        execute: Callable[..., RunResult],
+        row: sqlite3.Row,
+        dataset_id: str,
+        system: str,
+        replay_at: datetime,
+        collection_status_csv: str | Path | None,
+        resume: bool,
+        stop_on_quota: bool,
+        shard_keys: frozenset[tuple[str, str]] | None,
+        fresh_case_state: bool,
+    ) -> None:
+        self.conn = conn
+        self.cfg = cfg
+        self.execute = execute
+        self.row = row
+        self.dataset_id = dataset_id
+        self.system = system
+        self.replay_at = replay_at
+        self.collection_status_csv = collection_status_csv
+        self.resume = resume
+        self.stop_on_quota = stop_on_quota
+        self.shard_keys = shard_keys
+        self.fresh_case_state = fresh_case_state
+
+        self.skipped = False
+        self.failed = False
+        self.outcome: CaseOutcome | None = None
+        self.quota_text: str | None = None
+        self.lock_retry_errors: list[str] = []
+
+    def _prior(self) -> list[sqlite3.Row]:
+        return _case_run_rows(
+            self.conn,
+            dataset_id=self.dataset_id,
+            system=self.system,
+            input_url=self.row["canonical_url"],
+            replay_at=self.row["replay_at"],
+        )
+
+    def _delete(self, run_ids: Sequence[str]) -> None:
+        _assert_deletable(self.conn, run_ids, self.shard_keys)
+        _delete_run_ids(self.conn, run_ids)
+
+    def run(self) -> None:
+        for attempt in range(1, _CASE_ATTEMPTS + 1):
+            # The case's run ids from before this attempt wrote anything;
+            # `None` until known (a failure before that point wrote nothing).
+            existing: set[str] | None = None
+            outcome: CaseOutcome | None = None
+            try:
+                if self.resume:
+                    prior = self._prior()
+                    done = [r for r in prior if r["status"] == "completed"]
+                    if done and not any(
+                        _run_quota_detail(self.conn, r["id"]) is not None for r in done
+                    ):
+                        self.skipped = True
+                        return
+                    if prior:
+                        self._delete([r["id"] for r in prior])
+                existing = set() if self.fresh_case_state else {r["id"] for r in self._prior()}
+
+                outcome = _replay_one(
+                    self.conn,
+                    self.cfg,
+                    self.execute,
+                    dataset_id=self.dataset_id,
+                    posting_id=self.row["posting_id"],
+                    url=self.row["canonical_url"],
+                    replay_at=self.replay_at,
+                    collection_status_csv=self.collection_status_csv,
+                )
+                if outcome.error is not None and _is_lock_error_text(outcome.error):
+                    raise _CaseLocked(outcome)
+
+                if self.stop_on_quota and outcome.run_id is not None:
+                    quota_text = _run_quota_detail(self.conn, outcome.run_id)
+                    if quota_text is not None:
+                        self._delete([outcome.run_id])
+                        self.quota_text = quota_text
+                self.outcome = outcome
+                return
+            except (sqlite3.Error, _CaseLocked) as exc:
+                # Everything the SYSTEM can raise is already a case outcome
+                # by the time it gets here (`_replay_one`). What is left is
+                # this module's own database work AROUND that call — the
+                # resume path's `_case_run_rows` / `_delete_run_ids`, the
+                # quota check, and the archive claim lookup `_replay_one`
+                # makes before its own handler — plus a system run that died
+                # on a lock (`_CaseLocked`). A failure here is this case's
+                # failure, not the walk's. See the module docstring's
+                # judgment call for why the class is `sqlite3.Error` and not
+                # `Exception`.
+                self.conn.rollback()
+                if isinstance(exc, _CaseLocked):
+                    outcome = exc.outcome
+                    error = exc.outcome.error or "database is locked"
+                    locked = True
+                else:
+                    error = _sqlite_error_text(exc)
+                    locked = _is_lock_error(exc)
+                if locked:
+                    self._discard_partial_runs(existing)
+                    if attempt < _CASE_ATTEMPTS:
+                        self.lock_retry_errors.append(
+                            f"{self.row['posting_id']} @ {self.row['replay_at']}: {error}"
+                        )
+                        time.sleep(_LOCK_RETRY_DELAY_S)
+                        continue
+                self.failed = True
+                self.outcome = _failed_case(self.row, error, outcome)
+                return
+
+    def _discard_partial_runs(self, existing: set[str] | None) -> None:
+        """Delete the runs a lock-failed attempt wrote for this case (best effort).
+
+        Such a run can be anything from a bare `status='running'` row to a
+        `completed` run whose explanation never landed — and `resume` skips
+        a completed run forever — so it is removed rather than trusted. If
+        the cleanup itself cannot get the lock, the run stays; a run that
+        is not `completed` is still redone by the next `resume`.
+        """
+        if existing is None:
+            return
+        try:
+            stray = [r["id"] for r in self._prior() if r["id"] not in existing]
+            if stray:
+                self._delete(stray)
+        except sqlite3.Error:
+            self.conn.rollback()
 
 
 def _replay_one(
@@ -684,7 +1033,11 @@ def _replay_one(
             input_url=url,
             archive_state_claims=len(archive_claims),
             exposed_probes=tuple(name for name, _ in store.exposed),
-            error=f"{type(exc).__name__}: {exc}",
+            error=(
+                _sqlite_error_text(exc)
+                if isinstance(exc, sqlite3.Error)
+                else f"{type(exc).__name__}: {exc}"
+            ),
         )
 
     return CaseOutcome(
@@ -706,6 +1059,17 @@ def _replay_one(
 # ---------------------------------------------------------------------------
 
 
+class ShardCaseStatus(BaseModel):
+    """One shard's slice of a `SystemCaseStatus` (`dataset_status(shards=N)`)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    shard: int
+    total: int
+    completed: int
+    remaining: int
+
+
 class SystemCaseStatus(BaseModel):
     """One system's completion count against one dataset's case grid."""
 
@@ -715,6 +1079,8 @@ class SystemCaseStatus(BaseModel):
     total: int
     completed: int
     remaining: int
+    #: Per-shard breakdown, only when `dataset_status` was asked for one.
+    shards: tuple[ShardCaseStatus, ...] = ()
 
 
 class ReplayDatasetStatus(BaseModel):
@@ -737,6 +1103,11 @@ class ReplayDatasetStatus(BaseModel):
             lines.append(
                 f"  {s.system}: completed={s.completed} remaining={s.remaining} total={s.total}"
             )
+            for part in s.shards:
+                lines.append(
+                    f"    shard {part.shard}/{len(s.shards)}: completed={part.completed} "
+                    f"remaining={part.remaining} total={part.total}"
+                )
         return "\n".join(lines)
 
     def __str__(self) -> str:  # pragma: no cover - trivial delegation
@@ -748,38 +1119,88 @@ class ReplayDatasetStatus(BaseModel):
 _ALL_SYSTEMS = ("A", "B", "C", "C2")
 
 
-def dataset_status(conn: sqlite3.Connection, *, dataset_id: str) -> ReplayDatasetStatus:
+def _completed_case_keys(
+    conn: sqlite3.Connection, *, dataset_id: str, system: str
+) -> set[tuple[str, str]]:
+    """`(input_url, replay_at)` of every case `run_replay(resume=True)` would skip.
+
+    The bulk form of the per-case test in `_CaseAttempt.run`: the same
+    `_case_run_rows` filter (mode, system, dataset suffix), the same "some
+    run completed and no completed run carries a quota signature" rule —
+    in one scan of `runs` instead of one per case, which on the real corpus
+    is the difference between seconds and the better part of an hour.
+    """
+    suffix = f"|dataset:{dataset_id}"
+    by_case: dict[tuple[str, str], list[sqlite3.Row]] = {}
+    for row in conn.execute(
+        """
+        SELECT id, status, config_hash, input_url, replay_at FROM runs
+        WHERE mode = 'replay' AND system = ? AND config_hash IS NOT NULL
+        """,
+        (system,),
+    ):
+        if str(row["config_hash"]).endswith(suffix):
+            by_case.setdefault((row["input_url"], row["replay_at"]), []).append(row)
+    done_keys: set[tuple[str, str]] = set()
+    for key, prior in by_case.items():
+        done = [r for r in prior if r["status"] == "completed"]
+        if done and not any(_run_quota_detail(conn, r["id"]) is not None for r in done):
+            done_keys.add(key)
+    return done_keys
+
+
+def dataset_status(
+    conn: sqlite3.Connection, *, dataset_id: str, shards: int | None = None
+) -> ReplayDatasetStatus:
     """Per-system `(completed, remaining)` counts over `dataset_id`'s case grid.
 
-    O(cases × systems) with one `_case_run_rows` query per case per system —
-    fine for this project's dataset sizes (hundreds to ~1300 cases). Raises
-    `LookupError` for an unbuilt dataset, matching `run_replay`'s message
-    shape, so a caller can rely on the same exception either way.
+    One scan of `runs` per system (`_completed_case_keys`). With `shards=N`,
+    each system's counts are also split by `shard_of` — the partition
+    `run_replay(shard=(I, N))` walks — so a sharded replay's progress can be
+    read per worker. Raises `LookupError` for an unbuilt dataset, matching
+    `run_replay`'s message shape, so a caller can rely on the same exception
+    either way.
     """
     rows = dataset_case_rows(conn, dataset_id)
     if not rows:
         raise LookupError(
             f"replay dataset {dataset_id!r} has no cases; build it first (`rli replay build`)"
         )
+    if shards is not None and shards < 1:
+        raise ValueError(f"shard count must be >= 1, got {shards}")
 
     total = len(rows)
+    assignment = (
+        [shard_of(row["posting_id"], row["replay_at"], shards) for row in rows]
+        if shards is not None
+        else []
+    )
     by_system = []
     for system in _ALL_SYSTEMS:
-        completed = 0
-        for row in rows:
-            prior = _case_run_rows(
-                conn,
-                dataset_id=dataset_id,
-                system=system,
-                input_url=row["canonical_url"],
-                replay_at=row["replay_at"],
-            )
-            done = [r for r in prior if r["status"] == "completed"]
-            if done and not any(_run_quota_detail(conn, r["id"]) is not None for r in done):
-                completed += 1
+        done_keys = _completed_case_keys(conn, dataset_id=dataset_id, system=system)
+        flags = [(row["canonical_url"], row["replay_at"]) in done_keys for row in rows]
+        completed = sum(flags)
+        parts: list[ShardCaseStatus] = []
+        if shards is not None:
+            for index in range(shards):
+                mine = [
+                    flag for flag, owner in zip(flags, assignment, strict=True) if owner == index
+                ]
+                parts.append(
+                    ShardCaseStatus(
+                        shard=index,
+                        total=len(mine),
+                        completed=sum(mine),
+                        remaining=len(mine) - sum(mine),
+                    )
+                )
         by_system.append(
             SystemCaseStatus(
-                system=system, total=total, completed=completed, remaining=total - completed
+                system=system,
+                total=total,
+                completed=completed,
+                remaining=total - completed,
+                shards=tuple(parts),
             )
         )
     return ReplayDatasetStatus(dataset_id=dataset_id, total_cases=total, by_system=tuple(by_system))

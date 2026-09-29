@@ -1344,10 +1344,12 @@ class CachedClient:
       `latency_ms` is the measured LOOKUP time (real, small), not the
       original call's — the trace should say how long THIS run took.
     * **MISS** — `inner` is called, `response.parsed.model_dump_json()` is
-      stored with `INSERT OR REPLACE`, and the inner response is returned
-      with `cache_status="miss"`. spec.md §6 explicitly allows a live LLM
-      call on a miss during replay and requires it to be recorded; that is
-      this branch.
+      stored (`ON CONFLICT DO NOTHING`, then read back: if a concurrent
+      process stored the same key first, ITS answer is returned, so a
+      sharded replay can never crash on — or disagree with — a racing
+      insert), and the response is returned with `cache_status="miss"`.
+      spec.md §6 explicitly allows a live LLM call on a miss during replay
+      and requires it to be recorded; that is this branch.
     * **A row that no longer validates against `schema` is a MISS** and is
       overwritten. `prompt_hash` folds in the schema, so this should not
       happen — but "should not happen" is exactly the state that wedges a
@@ -1419,11 +1421,22 @@ class CachedClient:
                 )
 
         response = self.inner.complete_structured(prompt, schema)
+        # A row that was present but unusable is overwritten (see the class
+        # docstring); an ABSENT row is inserted only if nobody beat us to it.
+        # Several processes share this table during a sharded replay
+        # (`rli replay run --shard`), and two of them can miss on the same key
+        # at once. `DO NOTHING` makes that race harmless — neither insert can
+        # raise — and the read-back below makes it CONSISTENT: whoever
+        # committed first owns the key, and this call returns exactly what
+        # every later cache hit will return.
+        conflict = "DO UPDATE SET response = excluded.response, created_at = excluded.created_at"
         self._conn.execute(
-            """
-            INSERT OR REPLACE INTO llm_cache
+            f"""
+            INSERT INTO llm_cache
                 (model_id, prompt_hash, structured_input_hash, response, created_at)
             VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (model_id, prompt_hash, structured_input_hash)
+            {conflict if row is not None else "DO NOTHING"}
             """,
             (
                 model_id,
@@ -1434,4 +1447,33 @@ class CachedClient:
             ),
         )
         self._conn.commit()
-        return response.model_copy(update={"cache_status": "miss"})
+        return self._settle_race(
+            response.model_copy(update={"cache_status": "miss"}),
+            schema,
+            (model_id, prompt_hash, structured_input_hash),
+        )
+
+    def _settle_race(
+        self, response: LLMResponse, schema: type[BaseModel], key: tuple[str, str, str]
+    ) -> LLMResponse:
+        """Prefer the stored row over this call's answer when a concurrent writer won.
+
+        Tokens, cost and latency stay this call's: they were really spent. Only
+        the ANSWER is swapped, and only when the stored row validates — a row
+        that does not is left for the next miss to overwrite.
+        """
+        stored_row = self._conn.execute(
+            """
+            SELECT response
+            FROM llm_cache
+            WHERE model_id = ? AND prompt_hash = ? AND structured_input_hash = ?
+            """,
+            key,
+        ).fetchone()
+        if stored_row is None or stored_row[0] == response.parsed.model_dump_json():
+            return response
+        try:
+            stored = schema.model_validate_json(stored_row[0])
+        except (ValidationError, ValueError, TypeError):
+            return response
+        return response.model_copy(update={"parsed": stored, "raw_text": stored_row[0]})
