@@ -28,7 +28,18 @@ for ds in "${DATASETS[@]}"; do
     uv run rli replay run --system C --dataset "$ds" --db data/rli.db >> "$LOG" 2>&1
     rc=$?
     if [ $rc -eq 0 ]; then echo "$(date -u +%FT%TZ) dataset=$ds complete" | tee -a "$LOG"; break; fi
-    if [ $rc -eq 3 ]; then sleep_until_reset; continue; fi
+    if [ $rc -eq 3 ]; then
+      # Exit 3 covers every 429. Only a genuine DAILY quota should wait for the
+      # reset; a transient one (e.g. Mistral "backend_out_of_capacity", or a
+      # per-minute limit) just needs a short pause before resuming.
+      if tail -n 20 "$LOG" | grep -qiE "PerDay|per day|RequestsPerDay|daily"; then
+        sleep_until_reset
+      else
+        echo "$(date -u +%FT%TZ) transient 429 (not a daily quota); pausing 10 min" | tee -a "$LOG"
+        sleep 600
+      fi
+      continue
+    fi
     echo "$(date -u +%FT%TZ) dataset=$ds failed rc=$rc; retrying in 10 min" | tee -a "$LOG"; sleep 600
   done
 done

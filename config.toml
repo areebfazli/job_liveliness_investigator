@@ -379,7 +379,7 @@ api_key_env = "MISTRAL_API_KEY"
 # Model used by System C's investigator and explanation calls. Both prompts
 # demand a JSON object matching a schema, so pick a model that can actually
 # hold a structured format.
-model_id = "ministral-14b-latest"
+model_id = "ministral-8b-latest"
 
 # ---------------------------------------------------------------------------
 # No-egress alternative: a local Ollama. Free, no API key, nothing leaves
@@ -421,7 +421,7 @@ max_retries = 3
 # hit for every previously-answered case without going anywhere near the
 # network, so a conservative cap here only ever slows down cache MISSES (a
 # changed prompt, a new case), never a replay of an already-cached run.
-requests_per_minute = 25
+requests_per_minute = 150
 
 # Ceiling on how long one 429 retry may wait (seconds), overriding both the
 # `Retry-After` header and the 429 backoff schedule when both would go
