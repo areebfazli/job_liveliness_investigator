@@ -87,13 +87,20 @@ under the synthetic probe name
 `ProbeRunner.always_run_extra()`, not through a probe, because no probe
 observes them: they are a re-reading of captures the collector already took.
 
-What an archive-era case deliberately does NOT get is a `first_published`
-claim. The ATS's publish date was fetched now, not then, so
-`publish_recency` stays UNKNOWN and `rli.policy.quality`'s Q2 rule marks the
-evidence `weak`. That is the honest state of an archive-era case and it is a
-finding, not a defect: it is precisely what "we started collecting on day 0"
-costs, and inventing a backdated publish claim to avoid it would be the
-single most damaging thing this module could do.
+What an archive-era case deliberately does NOT get is the RESOLVER's
+`first_published` claim: that date was fetched now, not then, and inventing a
+backdated publish claim from it would be the single most damaging thing this
+module could do. What it DOES get, since schema version 4, is the publish
+evidence our own collection really held at `T` (`capture_date_claims`): the
+ATS-stated `first_published` / `updated_at` our daily board captures recorded
+(Greenhouse, Ashby), available from the earliest own capture at or before `T`
+that carried the value, and a Lever job page's JSON-LD `datePosted`,
+available from the moment the collector fetched it. They ride in the same
+`ARCHIVE_BOARD_STATE_PROBE` record. When no capture at or before `T` carried
+a date (every capture taken before version 4, every Wayback capture, every
+`T` before the first own sighting), nothing is emitted, `publish_recency`
+stays UNKNOWN and `rli.policy.quality`'s Q2 rule marks the evidence `weak` —
+the honest cost of "we started collecting on day 0".
 
 --------------------------------------------------------------------------
 Judgment calls
@@ -220,7 +227,7 @@ from rli.history.closures import Capture, load_captures
 from rli.models.probe import ProbeResult
 from rli.models.time import ensure_aware, now_utc, parse_utc, to_utc_z
 from rli.net import hash_args
-from rli.policy.inputs import CLAIM_BOARD_ABSENT, CLAIM_POSTING_STATE
+from rli.policy.inputs import CLAIM_BOARD_ABSENT, CLAIM_FIRST_PUBLISHED, CLAIM_POSTING_STATE
 from rli.policy.splits import DEFAULT_SEED, Split
 from rli.probes.base import Probe, ProbeClaim, ProbeContext
 from rli.probes.company_events import CompanyEventsProbe
@@ -243,6 +250,7 @@ __all__ = [
     "archive_state_args_hash",
     "archive_state_claims",
     "build_dataset",
+    "capture_date_claims",
     "case_state_at",
     "dataset_case_rows",
     "dataset_companies",
@@ -263,6 +271,9 @@ DEFAULT_GRID_STEP_DAYS = 30
 # restated so the archive-era claims are read by the SAME policy code that
 # reads the live ones.
 _CLAIM_BOARD_PRESENT = "board_present"
+# The resolver's claim type for an ATS-reported last-modified time
+# (`rli.probes.resolve_posting`; read by `rli.eval.case._refresh_claim`).
+_CLAIM_UPDATED_AT = "updated_at"
 
 #: Probes whose `args` carry an `as_of` and whose record is therefore
 #: collected ONCE PER `T` (`_company_events_at`, `_team_signal_at`) rather
@@ -426,6 +437,144 @@ def archive_state_claims(
             fetched_at=seen_at,
         ),
     ]
+
+
+# ---------------------------------------------------------------------------
+# Publish dates our own collection held at T
+# ---------------------------------------------------------------------------
+
+
+def _capture_dated_claim(
+    rows: list[sqlite3.Row],
+    *,
+    column: str,
+    claim_type: str,
+    fallback_url: str,
+) -> ProbeClaim | None:
+    """One ATS-stated date as our own captures held it at `T`, or None.
+
+    `rows` are the job's own captures at or before `T`, oldest first. The
+    claim states the value the LATEST capture carrying `column` reported (a
+    posting the ATS re-dated says so in its newer captures), and is available
+    from the EARLIEST capture that carried that same value — the first moment
+    we verifiably held it (spec.md §3). Captures that carried no value are
+    simply not witnesses; they never erase one.
+    """
+    carried = [row for row in rows if row[column] is not None]
+    if not carried:
+        return None
+    latest = carried[-1]
+    value = str(latest[column])
+    first = next(row for row in carried if row[column] == value)
+    available = parse_utc(first["captured_at"])
+    return ProbeClaim(
+        claim_type=claim_type,
+        value=value,
+        source_url=latest["url"] or fallback_url,
+        raw_excerpt=(
+            f"own board capture {first['captured_at']} listed the job with ATS "
+            f"{column}={value} (latest capture carrying it at or before T: "
+            f"{latest['captured_at']})"
+        ),
+        source_quality="ats_native",
+        source_event_at=parse_utc(value),
+        available_at=available,
+        fetched_at=available,
+    )
+
+
+def capture_date_claims(
+    conn: sqlite3.Connection, posting_id: str, replay_at: datetime
+) -> list[ProbeClaim]:
+    """Publish evidence our OWN collection already held at `T`.
+
+    Up to three claims, each available from the moment we really had it:
+
+    * `first_published` / `updated_at` (`ats_native`) — the ATS's own stated
+      dates as recorded in `board_snapshot_jobs` by our daily captures
+      (Greenhouse `first_published`/`updated_at`, Ashby `publishedAt`), with
+      `available_at` = the capture time of the EARLIEST own capture at or
+      before `T` that carried the stated value (`_capture_dated_claim`).
+    * `first_published` (`page_structured`) — the JSON-LD `datePosted` read
+      once from the posting's job page (Lever; `rli.snapshots.page_dates`),
+      with `available_at` = that page fetch's time, and only when it is at or
+      before `T`.
+
+    Never emitted from archive captures (`source='archive'`; a Wayback copy is
+    not primary publish evidence), never from a capture after `T`, and never
+    when no capture at or before `T` carried the date — that is "we did not
+    have it yet", which must stay UNKNOWN. The event date is `source_event_at`
+    only; nothing here is backdated to it.
+
+    These ride in the same `ARCHIVE_BOARD_STATE_PROBE` record as
+    `archive_state_claims`, reach the run through
+    `ProbeRunner.always_run_extra()`, and still pass the replay gate
+    (`available_at <= T`) on their own merits — so `rli.policy.quality`'s Q2
+    and `rli.policy.inputs.best_publish_claim` read them exactly as they read
+    the resolver's live date evidence, and an `updated_at` here feeds the
+    refresh match (`rli.eval.case._refresh_claim`) like the resolver's does.
+    """
+    replay_at = ensure_aware(replay_at, "replay_at")
+    row = posting_row(conn, posting_id)
+    if row is None:
+        return []
+    stamp = to_utc_z(replay_at)
+    company_id = str(row["company_id"])
+    claims: list[ProbeClaim] = []
+
+    if row["ats_job_id"] is not None:
+        job_id = str(row["ats_job_id"])
+        rows = conn.execute(
+            """
+            SELECT s.captured_at AS captured_at, j.url AS url,
+                   j.first_published AS first_published, j.updated_at AS updated_at
+            FROM board_snapshots AS s
+            JOIN board_snapshot_jobs AS j ON j.board_snapshot_id = s.id
+            WHERE s.company_id = ? AND s.source = 'own' AND s.captured_at <= ?
+              AND j.job_id = ?
+              AND (j.first_published IS NOT NULL OR j.updated_at IS NOT NULL)
+            ORDER BY s.captured_at, j.id
+            """,
+            (company_id, stamp, job_id),
+        ).fetchall()
+        fallback_url = BOARD_HISTORY_URL_PLACEHOLDER.format(company_id=company_id, job_id=job_id)
+        for column, claim_type in (
+            ("first_published", CLAIM_FIRST_PUBLISHED),
+            ("updated_at", _CLAIM_UPDATED_AT),
+        ):
+            claim = _capture_dated_claim(
+                rows, column=column, claim_type=claim_type, fallback_url=fallback_url
+            )
+            if claim is not None:
+                claims.append(claim)
+
+    page = conn.execute(
+        """
+        SELECT page_url, date_posted_raw, date_posted, fetched_at
+        FROM posting_page_dates
+        WHERE posting_id = ? AND status = 'ok'
+          AND date_posted IS NOT NULL AND fetched_at IS NOT NULL AND fetched_at <= ?
+        """,
+        (posting_id, stamp),
+    ).fetchone()
+    if page is not None:
+        fetched = parse_utc(page["fetched_at"])
+        claims.append(
+            ProbeClaim(
+                claim_type=CLAIM_FIRST_PUBLISHED,
+                value=page["date_posted_raw"] or page["date_posted"],
+                source_url=page["page_url"],
+                raw_excerpt=(
+                    f"JSON-LD JobPosting.datePosted read from the job page at "
+                    f"{page['fetched_at']} by the daily collector"
+                ),
+                source_quality="page_structured",
+                source_event_at=parse_utc(page["date_posted"]),
+                available_at=fetched,
+                fetched_at=fetched,
+            )
+        )
+    return claims
 
 
 # ---------------------------------------------------------------------------
@@ -747,6 +896,7 @@ class BuildSummary(BaseModel):
     probe_records: int = 0
     archive_state_records: int = 0
     cases_with_archive_state: int = 0
+    cases_with_capture_publish_date: int = 0
     live_probe_executions: int = 0
     postings_failed: int = 0
     failures: tuple[str, ...] = ()
@@ -759,6 +909,8 @@ class BuildSummary(BaseModel):
             f"  probe records={self.probe_records} (live executions={self.live_probe_executions})",
             f"  archive board-state records={self.archive_state_records} "
             f"(cases with an observable archive state: {self.cases_with_archive_state})",
+            f"  cases with a publish date our own collection held at T: "
+            f"{self.cases_with_capture_publish_date}",
             f"  postings that failed to build: {self.postings_failed}",
         ]
         lines.extend(f"    - {failure}" for failure in self.failures)
@@ -1131,6 +1283,7 @@ def build_dataset(
     probe_records = 0
     archive_records = 0
     cases_with_archive = 0
+    cases_with_publish = 0
     live_executions = 0
     failures: list[str] = []
     built_postings: list[CasePlan] = []
@@ -1227,6 +1380,10 @@ def build_dataset(
                 probe_records += 1
 
             claims = archive_state_claims(conn, plan.posting_id, replay_at)
+            # Same record, same delivery path, same gate: see
+            # `capture_date_claims`. `observable` keeps meaning "a board state
+            # is observable", so it is computed from the state claims alone.
+            dated = capture_date_claims(conn, plan.posting_id, replay_at)
             store.save(
                 conn,
                 dataset_id=dataset_id,
@@ -1245,7 +1402,7 @@ def build_dataset(
                         "posting_id": plan.posting_id,
                         "replay_at": to_utc_z(replay_at),
                         "observable": bool(claims),
-                        "evidence": claims,
+                        "evidence": [*claims, *dated],
                     },
                 ),
                 created_at=moment,
@@ -1253,6 +1410,8 @@ def build_dataset(
             archive_records += 1
             if claims:
                 cases_with_archive += 1
+            if any(claim.claim_type == CLAIM_FIRST_PUBLISHED for claim in dated):
+                cases_with_publish += 1
 
     companies = len({plan.company_id for plan in built_postings})
     _upsert_dataset(
@@ -1280,6 +1439,7 @@ def build_dataset(
         probe_records=probe_records,
         archive_state_records=archive_records,
         cases_with_archive_state=cases_with_archive,
+        cases_with_capture_publish_date=cases_with_publish,
         live_probe_executions=live_executions,
         postings_failed=len(failures),
         failures=tuple(failures),

@@ -10,17 +10,26 @@ keyed by the *from* version, e.g. `MIGRATIONS[1] = "ALTER TABLE ..."` to
 upgrade a version-1 database to version 2. `init_db` walks `MIGRATIONS` in
 ascending order from whatever `PRAGMA user_version` an existing database
 reports, up to `SCHEMA_VERSION`.
+
+A migration is either a SQL script (run with `executescript`) or a callable
+taking the connection. The callable form exists for `ALTER TABLE ... ADD
+COLUMN`, which SQLite cannot spell idempotently (there is no `IF NOT
+EXISTS`): the callable inspects `PRAGMA table_info` and adds only what is
+missing, inside one transaction that also stamps the new `user_version`, so
+an interrupted upgrade is either fully applied or not applied at all.
 """
 
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Callable
 from importlib import resources
 from pathlib import Path
 
 __all__ = [
     "BUSY_TIMEOUT_MS",
     "MIGRATIONS",
+    "POSTING_PAGE_DATES_DDL",
     "SCHEMA_VERSION",
     "connect",
     "init_db",
@@ -38,12 +47,17 @@ BUSY_TIMEOUT_MS = 5000
 # 2 -> 3: added the replay tables (`replay_datasets`, `replay_cases`,
 #         `replay_probe_results`) — the cached full-probe record spec.md §6
 #         requires replay to read instead of making live tool calls.
-SCHEMA_VERSION = 3
+# 3 -> 4: `board_snapshot_jobs.first_published` / `.updated_at` (the ATS's
+#         own stated dates, kept per daily capture) and the
+#         `posting_page_dates` table (JSON-LD `datePosted` read once from a
+#         Lever job page) — point-in-time publish evidence for replay.
+SCHEMA_VERSION = 4
 
-# from-version -> SQL script that upgrades that version to version + 1.
-# `schema.sql` describes only the newest version; every prior jump needed to
-# reach it from an older on-disk database lives here instead.
-MIGRATIONS: dict[int, str] = {}
+# from-version -> SQL script (or idempotent callable) that upgrades that
+# version to version + 1. `schema.sql` describes only the newest version;
+# every prior jump needed to reach it from an older on-disk database lives
+# here instead.
+MIGRATIONS: dict[int, str | Callable[[sqlite3.Connection], None]] = {}
 
 # 1 -> 2: `repost_links`, the audit trail for rli.history.matching.link_reposts.
 # This DDL is duplicated verbatim in rli/db/schema.sql (so a FRESH database gets
@@ -126,6 +140,56 @@ CREATE INDEX IF NOT EXISTS idx_replay_probe_results_lookup
     ON replay_probe_results (dataset_id, posting_id, replay_at);
 CREATE INDEX IF NOT EXISTS idx_replay_cases_dataset ON replay_cases (dataset_id);
 """
+
+
+# 3 -> 4. The `posting_page_dates` DDL is duplicated verbatim in
+# rli/db/schema.sql (the fresh-database path); tests/test_board_dates.py
+# asserts the two stay in sync. Frozen once shipped, like the scripts above.
+POSTING_PAGE_DATES_DDL = """
+CREATE TABLE IF NOT EXISTS posting_page_dates (
+    posting_id          TEXT PRIMARY KEY REFERENCES postings (posting_id),
+    page_url            TEXT NOT NULL,
+    status              TEXT NOT NULL CHECK (status IN ('ok', 'no_date', 'failed')),
+    date_posted_raw     TEXT,
+    date_posted         TEXT,
+    fetched_at          TEXT,
+    attempts            INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at     TEXT NOT NULL,
+    last_error          TEXT
+);
+"""
+
+# Nullable, no default: SQLite's ADD COLUMN for such a column is a schema-only
+# change (no table rewrite), so this is O(1) even on a multi-GB database.
+_BOARD_DATE_COLUMNS = (("first_published", "TEXT"), ("updated_at", "TEXT"))
+
+
+def _migrate_3_to_4(conn: sqlite3.Connection) -> None:
+    """Add the board-capture date columns and `posting_page_dates`, atomically.
+
+    Idempotent: a column that already exists is skipped (`ALTER TABLE ... ADD
+    COLUMN` has no `IF NOT EXISTS`, and a `board_snapshot_jobs` created from a
+    newer `schema.sql` already has both). Everything — including the
+    `user_version` stamp — happens in ONE `BEGIN IMMEDIATE` transaction, so an
+    interrupted upgrade leaves the database exactly at version 3 and a re-run
+    simply does it again.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(board_snapshot_jobs)")}
+        for name, sql_type in _BOARD_DATE_COLUMNS:
+            if name not in existing:
+                # Names come from the fixed tuple above, never from input.
+                conn.execute(f"ALTER TABLE board_snapshot_jobs ADD COLUMN {name} {sql_type}")
+        conn.execute(POSTING_PAGE_DATES_DDL)
+        _set_schema_version(conn, 4)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+MIGRATIONS[3] = _migrate_3_to_4
 
 
 def _schema_sql() -> str:
@@ -212,7 +276,10 @@ def init_db(path: str | Path) -> None:
                     f"no migration registered to upgrade schema version {version} "
                     f"to {version + 1} (SCHEMA_VERSION={SCHEMA_VERSION})"
                 )
-            conn.executescript(migration)
+            if callable(migration):
+                migration(conn)
+            else:
+                conn.executescript(migration)
             version += 1
             _set_schema_version(conn, version)
 

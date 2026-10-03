@@ -340,6 +340,23 @@ min_new_roles = 1
 min_closures = 1
 min_coverage = 0.5
 
+# Lever job-page publish dates (spec.md §3: Lever's API dates are untrusted, but
+# its job page carries JSON-LD `JobPosting.datePosted` -> page_structured). After
+# the board captures, `rli snapshot` fetches the page of Lever postings that
+# today's capture listed and that have no date yet, newest first, ONCE each
+# (rli.snapshots.page_dates); `posting_page_dates` keeps the date with its fetch
+# time as availability, which the replay builder cites point-in-time. A failed
+# fetch is a coverage gap only: never an absence, never a failed snapshot, and
+# retried on a later run. Pages go through rli.net under the board_snapshot
+# allowlist and the jobs.lever.co rate limit (1 req/s), so max_fetches_per_run
+# is roughly the extra seconds per daily run. ~80 new Lever postings/day; the
+# rest of the cap gradually catches up older still-open postings.
+[page_dates]
+enabled = true
+max_fetches_per_run = 150
+max_attempts_per_posting = 5
+max_consecutive_failures = 5
+
 # spec.md §2: "one structured-output-capable LLM API" (spec.md §7), with LLM
 # outputs cached by `(model_id, prompt_hash, structured_input_hash)` for exact
 # benchmark replay. `model_id` below is part of that cache key, so changing it

@@ -13,6 +13,14 @@ has a `board_snapshots` row for today (UTC calendar day), not by upserting
 the header. A same-day rerun therefore makes zero network calls and zero
 lifecycle writes for companies already captured — it does not "top up" or
 overwrite that day's capture.
+
+Each capture also keeps the ATS's own stated dates per job (Greenhouse
+`first_published` / `updated_at`, Ashby `publishedAt`) in
+`board_snapshot_jobs`, and after all captures a bounded pass reads JSON-LD
+`datePosted` from the job pages of Lever postings captured this run that have
+no date yet (`rli.snapshots.page_dates`; `[page_dates]` in config.toml). A
+page that cannot be fetched is a coverage gap only — the pass never fails the
+snapshot and never touches posting lifecycle state.
 """
 
 from __future__ import annotations
@@ -20,7 +28,7 @@ from __future__ import annotations
 import sqlite3
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from rli.config import Config
@@ -29,6 +37,7 @@ from rli.net import NetClient
 from rli.probes.base import ProbeContext
 from rli.probes.board_snapshot import BoardJob, board_snapshot
 from rli.probes.persist import record_capture_attempt, save_board_snapshot
+from rli.snapshots.page_dates import PageDateSummary, collect_lever_page_dates
 from rli.snapshots.targets import Target
 
 __all__ = ["DailySnapshotSummary", "run_daily_snapshot"]
@@ -52,12 +61,16 @@ class DailySnapshotSummary:
     postings_new: int = 0
     postings_absent: int = 0
     postings_reappeared: int = 0
+    page_dates: PageDateSummary = field(default_factory=PageDateSummary)
 
     def describe(self) -> str:
+        # The first segment's exact shape is parsed by scripts/daily.sh; the
+        # page-date counters are appended after it, never inserted into it.
         return (
             f"companies: ok={self.companies_ok} failed={self.companies_failed} "
             f"skipped={self.companies_skipped} | postings: new={self.postings_new} "
-            f"absent={self.postings_absent} reappeared={self.postings_reappeared}"
+            f"absent={self.postings_absent} reappeared={self.postings_reappeared} "
+            f"| {self.page_dates.describe()}"
         )
 
     def __str__(self) -> str:  # pragma: no cover - trivial delegation
@@ -230,6 +243,9 @@ def run_daily_snapshot(
     """
     summary = DailySnapshotSummary()
     net_client = NetClient.from_config(cfg, probe="board_snapshot", sleep=sleep)
+    # Lever companies captured successfully THIS run: the only ones whose
+    # postings the page-date pass may visit (see rli.snapshots.page_dates).
+    lever_captured: list[str] = []
     try:
         for target in targets:
             if _already_captured_today(conn, target.company_id, now):
@@ -270,6 +286,18 @@ def run_daily_snapshot(
             _apply_posting_lifecycle(conn, target=target, jobs=jobs, now=now, summary=summary)
             conn.commit()
             summary.companies_ok += 1
+            if target.ats == "lever":
+                lever_captured.append(target.company_id)
+
+        # After every board capture is committed, so nothing here can delay
+        # or undo one. Contained: a page-date problem is a coverage gap, never
+        # a failed snapshot (rli.snapshots.page_dates).
+        try:
+            summary.page_dates = collect_lever_page_dates(
+                conn, cfg, net_client, company_ids=lever_captured, now=now
+            )
+        except Exception:  # noqa: BLE001 - belt to page_dates' own braces
+            conn.rollback()
     finally:
         net_client.close()
 

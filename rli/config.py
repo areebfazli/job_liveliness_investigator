@@ -43,6 +43,7 @@ __all__ = [
     "Matching",
     "ModelPrice",
     "Net",
+    "PageDates",
     "Policy",
     "ProbeCosts",
     "RateLimit",
@@ -726,6 +727,38 @@ class Ranker(BaseModel):
     c: float = Field(1.0, gt=0.0)
 
 
+class PageDates(BaseModel):
+    """`[page_dates]` — JSON-LD `datePosted` read from Lever job pages.
+
+    Lever's board API carries no trusted date (spec.md §3), but its job page
+    carries a `JobPosting` JSON-LD `datePosted` (`page_structured`). The daily
+    collector (`rli.snapshots.page_dates`) reads it ONCE per posting, after
+    the board captures, for Lever postings that today's capture listed and
+    that have no date yet — newest `first_observed` first — and stores it in
+    `posting_page_dates` with `fetched_at` as its availability time.
+
+    Every knob bounds the daily job's runtime: the page host is rate-limited
+    to `[rate_limits."jobs.lever.co"]` (1 request/s), so `max_fetches_per_run`
+    is roughly the extra seconds the pass costs. New Lever postings arrive at
+    ~80/day; the remainder of the cap slowly catches up older still-open
+    postings that predate this feature.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    # Kill switch. Off = the collector makes no page fetch at all.
+    enabled: bool = True
+    # Hard cap on page fetches per `rli snapshot` run.
+    max_fetches_per_run: int = Field(150, ge=0)
+    # A posting whose page fetch keeps FAILING (network/HTTP) is retried on
+    # later runs until it has been attempted this many times, then left
+    # alone. A page that fetched fine but had no date is never retried.
+    max_attempts_per_posting: int = Field(5, ge=1)
+    # Circuit breaker: stop this run's pass after this many failures in a
+    # row (host down / throttling), so an outage cannot stretch the daily job.
+    max_consecutive_failures: int = Field(5, ge=1)
+
+
 class Config(BaseModel):
     """Root configuration object produced by `load_config`."""
 
@@ -740,6 +773,7 @@ class Config(BaseModel):
     policy: Policy
     probe_costs: ProbeCosts = Field(default_factory=ProbeCosts)
     team_signal: TeamSignal = Field(default_factory=TeamSignal)
+    page_dates: PageDates = Field(default_factory=PageDates)
     ranker: Ranker = Field(default_factory=Ranker)
     llm: Llm = Field(default_factory=Llm)
     agent: Agent = Field(default_factory=Agent)

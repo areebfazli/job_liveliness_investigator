@@ -109,6 +109,17 @@ CREATE INDEX IF NOT EXISTS idx_board_snapshots_company_captured
 -- Child rows of board_snapshots: one row per open job listed in a board
 -- capture (open_job_ids/titles/teams/locations, spec.md §4), needed for M2
 -- repost matching by title/team/location/description similarity.
+--
+-- first_published / updated_at (schema version 4): the ATS's OWN stated
+-- dates for the job as this capture's listing reported them, normalized to
+-- UTC-Z — Greenhouse `first_published` / `updated_at`, Ashby `publishedAt`
+-- (-> first_published). Both documented `ats_native` (spec.md §3). NULL for
+-- Lever (undocumented dates, untrusted), for archive captures, for every
+-- capture taken before version 4, and whenever the listing omitted or
+-- garbled the field. `updated_at` here is the ATS's last-modified time, NOT
+-- a row-maintenance timestamp. The replay builder cites them point-in-time:
+-- available from the capture's `captured_at`, never earlier.
+-- Version-3 databases gain both columns via rli.db.MIGRATIONS[3].
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS board_snapshot_jobs (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,7 +129,9 @@ CREATE TABLE IF NOT EXISTS board_snapshot_jobs (
     team                TEXT,
     location            TEXT,
     description_hash    TEXT,
-    url                 TEXT
+    url                 TEXT,
+    first_published     TEXT,
+    updated_at          TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_board_snapshot_jobs_board_snapshot_id
@@ -320,6 +333,45 @@ CREATE TABLE IF NOT EXISTS repost_links (
 );
 
 CREATE INDEX IF NOT EXISTS idx_repost_links_company_id ON repost_links (company_id);
+
+-- ---------------------------------------------------------------------------
+-- posting_page_dates (schema version 4)
+--
+-- One row per posting whose job PAGE the daily collector fetched to read a
+-- JSON-LD `JobPosting.datePosted` (spec.md §3: page_structured). Today only
+-- Lever postings, whose board API carries no trusted date. The page is
+-- fetched once when the posting is first seen open (and, under a per-run cap,
+-- for still-open postings that have no date yet); a row whose status is 'ok'
+-- or 'no_date' is never refetched.
+--
+--   * status 'ok'      — date obtained; date_posted (UTC-Z) is the stated
+--                        publish date (source_event_at), fetched_at the real
+--                        fetch time (available_at: spec.md §3 forbids
+--                        backdating the discovery to the publish date).
+--   * status 'no_date' — page fetched fine but carried no usable datePosted.
+--                        Terminal: an observation, not a gap.
+--   * status 'failed'  — every attempt so far failed (network/HTTP). A
+--                        COVERAGE GAP only — it never marks the posting
+--                        absent and never fails the snapshot — retried on a
+--                        later run until `attempts` reaches the configured cap.
+--
+-- (Placed before the version-3 replay section only so that section stays the
+-- file's tail, which tests/test_replay_migration.py slices on.)
+-- Not shadowed by rli.replay.pit: no probe reads it. Its only reader is the
+-- replay builder, which applies `status = 'ok' AND fetched_at <= T` itself.
+-- The same DDL lives in rli.db.MIGRATIONS[3]; tests assert they stay in sync.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS posting_page_dates (
+    posting_id          TEXT PRIMARY KEY REFERENCES postings (posting_id),
+    page_url            TEXT NOT NULL,
+    status              TEXT NOT NULL CHECK (status IN ('ok', 'no_date', 'failed')),
+    date_posted_raw     TEXT,
+    date_posted         TEXT,
+    fetched_at          TEXT,
+    attempts            INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at     TEXT NOT NULL,
+    last_error          TEXT
+);
 
 -- ---------------------------------------------------------------------------
 -- replay_datasets / replay_cases / replay_probe_results (schema version 3)

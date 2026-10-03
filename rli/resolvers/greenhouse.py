@@ -11,9 +11,10 @@ this change):
   documented `ats_native` per spec.md §3), `absolute_url`, `title`,
   `content` (HTML), `departments[]`, `offices[]`, `location.name`.
 * board endpoint `GET /v1/boards/{board}/jobs?content=true` ->
-  `{"jobs": [...]}`, each element shaped like the job endpoint's object
-  (assumed NOT to reliably include `first_published`, since Greenhouse's
-  own docs only call out `first_published` on the single-job endpoint).
+  `{"jobs": [...]}`, each element shaped like the job endpoint's object,
+  INCLUDING `first_published` and `updated_at` (verified on the live board
+  listing: every job carries both). `rli.probes.board_snapshot` therefore
+  keeps them, and the daily collector stores them per capture.
 """
 
 from __future__ import annotations

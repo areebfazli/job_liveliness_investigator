@@ -39,6 +39,7 @@ from rli.replay.build import (
     BuildSummary,
     archive_state_claims,
     build_dataset,
+    capture_date_claims,
     case_state_at,
     grid_times,
 )
@@ -67,6 +68,7 @@ __all__ = [
     "Violation",
     "archive_state_claims",
     "build_dataset",
+    "capture_date_claims",
     "case_state_at",
     "check_dataset",
     "grid_times",

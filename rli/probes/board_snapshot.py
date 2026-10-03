@@ -2,7 +2,8 @@
 
 Input `{ats, tenant}`. Fetches the ATS's board-listing endpoint and returns
 every currently open job (`job_id, title, team, location, url,
-description_hash`) for Greenhouse, Ashby, or Lever. Pure: on failure it
+description_hash`, plus the ATS's own stated dates where the API documents
+them) for Greenhouse, Ashby, or Lever. Pure: on failure it
 returns `ProbeResult(ok=False, ...)` and does NOT write to the database —
 the caller records a `capture_attempts` row via `rli.probes.persist`
 (spec.md §4: "on failure return ok=false and the caller records a
@@ -38,6 +39,16 @@ class BoardJob(BaseModel):
     location: str | None = None
     url: str | None = None
     description_hash: str | None = None
+    # The ATS's own stated dates, as the raw strings the listing returned
+    # (spec.md §3 source policy): Greenhouse `first_published` / `updated_at`
+    # and Ashby `publishedAt` (mapped onto `first_published`) are documented
+    # `ats_native` fields and are present on every job in the BOARD listing,
+    # not only on the single-job endpoint. Lever's dates are undocumented and
+    # untrusted, so a Lever job always leaves both None. Persisted to
+    # `board_snapshot_jobs` (normalized to UTC-Z) so a replay at `T` can cite
+    # the date as our own capture saw it, available from that capture's time.
+    first_published: str | None = None
+    updated_at: str | None = None
 
 
 def _from_greenhouse(job: greenhouse.GreenhouseJob) -> BoardJob:
@@ -48,6 +59,8 @@ def _from_greenhouse(job: greenhouse.GreenhouseJob) -> BoardJob:
         location=job.location,
         url=job.absolute_url,
         description_hash=job.content_hash,
+        first_published=job.first_published,
+        updated_at=job.updated_at,
     )
 
 
@@ -59,6 +72,8 @@ def _from_ashby(job: ashby.AshbyJob) -> BoardJob:
         location=job.location,
         url=job.job_url,
         description_hash=job.content_hash,
+        # Ashby documents only `publishedAt` (no updatedAt).
+        first_published=job.published_at,
     )
 
 

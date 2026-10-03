@@ -34,6 +34,8 @@ EXPECTED_TABLES = {
     "replay_datasets",
     "replay_cases",
     "replay_probe_results",
+    # schema version 4 (Lever job-page publish dates)
+    "posting_page_dates",
 }
 
 

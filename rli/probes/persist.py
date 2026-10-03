@@ -19,8 +19,20 @@ from rli.models.evidence import EvidenceItem
 from rli.models.time import to_utc_z
 from rli.probes.base import ProbeClaim
 from rli.probes.board_snapshot import BoardJob
+from rli.resolvers.common import parse_flexible_datetime
 
 __all__ = ["record_capture_attempt", "save_board_snapshot", "save_evidence"]
+
+
+def _normalized_stamp(raw: str | None) -> str | None:
+    """An ATS-stated date as a `to_utc_z` string, or None if absent/unparseable.
+
+    Normalized (rather than stored raw) so the column keeps the schema's
+    lexical-order-is-chronological-order invariant: Greenhouse states local
+    offsets (`...-04:00`), Ashby UTC. Garbage is dropped, never guessed at.
+    """
+    parsed = parse_flexible_datetime(raw)
+    return to_utc_z(parsed) if parsed is not None else None
 
 
 def record_capture_attempt(
@@ -88,8 +100,9 @@ def save_board_snapshot(
     conn.executemany(
         """
         INSERT INTO board_snapshot_jobs
-            (board_snapshot_id, job_id, title, team, location, description_hash, url)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+            (board_snapshot_id, job_id, title, team, location, description_hash, url,
+             first_published, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             (
@@ -100,6 +113,8 @@ def save_board_snapshot(
                 job.location,
                 job.description_hash,
                 job.url,
+                _normalized_stamp(job.first_published),
+                _normalized_stamp(job.updated_at),
             )
             for job in jobs
         ],
