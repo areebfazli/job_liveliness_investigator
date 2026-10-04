@@ -1,474 +1,204 @@
 # Role-Liveness Investigator (`rli`)
 
-Evidence-backed system for tech/startup job seekers that answers:
+> **Is this job worth applying to right now, and what should I do next?**
 
-> **Is this role worth effort now, and what should I do next?**
+## What it is
 
-Given a job posting URL, `rli` resolves it against its ATS (Greenhouse,
-Ashby, Lever) or its career page's JSON-LD, gathers timestamped,
-source-linked evidence, and returns one of four recommended actions with
-evidence-cited reasons. It never returns a definitive `ghost_job` verdict,
-never scrapes LinkedIn, never produces a crowd score or a generic
-company-health score, and never exposes an uncalibrated 0–100 "Apply
-Priority" — see `spec.md` §1 for the full non-goals list. `evergreen`,
-`paused`, and similar labels are treated as hypotheses to investigate, not
-observable facts to assert.
+Many job postings online are not what they seem. Some were filled months ago
+and never taken down. Some are reposted again and again. Some belong to
+companies that have just frozen hiring. Job seekers waste hours tailoring
+applications for roles that were never really open.
 
-See `spec.md` for the full product spec and `PLAN.md` for the build order
-this repository followed.
+`rli` takes a job link and checks the evidence before you spend that time:
 
-## The four actions
+- **Is the posting still live** on the company's own hiring system?
+- **How fresh is it?** When was it published or last refreshed?
+- **Has it been reposted** over and over, or open for a very long time?
+- **What is the company doing?** Is it hiring more people on the same team, or are there layoffs or a hiring freeze in the news?
 
-- **`apply_now`** — worth focused effort now (open, recent primary publish
-  evidence, no material negative event).
-- **`quick_apply`** — apply with minimal tailoring (evidence is mixed or
-  weak, or none of the stronger conditions are met).
-- **`wait`** — evidence is unresolved or hiring appears paused; includes
-  `recheck_after_days` (`min(14, days_until_validThrough)` when a declared
-  expiry exists, otherwise a 14-day config default).
-- **`skip`** — the posting is closed, or evidence indicates a long-lived
-  repost pattern with corroborating weak-hiring signals.
+It then gives one of four answers:
 
-`message_first` is deferred until a verified contact exists (spec.md §1).
-
-## How to run
-
-```bash
-# 1. Install
-uv sync
-
-# 2. Create the database (idempotent)
-uv run rli init-db --path ./data/rli.db
-
-# 3. Load the verified target-company list into `companies`
-uv run rli load-targets --targets scripts/targets.csv --db ./data/rli.db
-
-# 3b. Load pre-collected dated company events (spec.md §4) into `company_events`
-uv run rli load-events --path data/events/company_events.csv --db ./data/rli.db
-
-# 4. Daily board snapshot (run once now, then put on a schedule — see
-#    docs/deploy-snapshot.md for the daily snapshot deployment setup and
-#    how to verify it ran)
-uv run rli snapshot --db ./data/rli.db
-uv run rli snapshot-status --db ./data/rli.db
-
-# 5. Archive backfill (Wayback Machine; live network calls)
-uv run rli archive backfill --months 12 --db ./data/rli.db
-uv run rli archive coverage --db ./data/rli.db --out data/archive_coverage.md
-
-# 6. Derive history: interval-censored closures + repost/version matching
-uv run rli history rebuild --db ./data/rli.db
-uv run rli history sample --db ./data/rli.db --out data/match_sample.csv --n 50
-
-# 7. Build a point-in-time replay dataset, replay A/B on it, audit leakage
-#    (this is the ONE replay command that makes live network calls)
-uv run rli replay build --dataset my-dataset --split dev --split-kind company --db ./data/rli.db
-uv run rli replay run --system A --dataset my-dataset --db ./data/rli.db
-uv run rli replay run --system B --dataset my-dataset --db ./data/rli.db
-uv run rli replay check --dataset my-dataset --db ./data/rli.db
-
-# 8. Reports
-uv run rli eval baseline --dataset my-dataset --out reports/baseline.md --db ./data/rli.db
-uv run rli eval behavior --out reports/behavior.md --db ./data/rli.db
-uv run rli eval run --dataset my-dataset --out reports/evaluation.md --db ./data/rli.db
-#   add --with-c to also score System C (needs a reachable LLM endpoint —
-#   see "LLM setup" below; otherwise C is recorded as "not run: no LLM
-#   endpoint configured" and the agent gate reads "not run")
-uv run rli eval gates --dataset my-dataset --db ./data/rli.db
-
-# 9. Investigate one URL directly (System A = full probes, System B = rules)
-uv run rli run --system B --url https://boards.greenhouse.io/<tenant>/jobs/<id> --db ./data/rli.db
-
-# 10. System C: the bounded LLM agent (needs an LLM endpoint — see "LLM setup")
-uv run rli agent run --url https://boards.greenhouse.io/<tenant>/jobs/<id> --db ./data/rli.db
-uv run rli agent trace --run-id <run-id-from-stderr> --db ./data/rli.db
-
-# 11. Product API + UI
-RLI_DB_PATH=./data/rli.db uv run python -m rli.api
-# then, in another shell:
-curl -s -X POST http://127.0.0.1:8000/investigate \
-  -H 'Content-Type: application/json' \
-  -d '{"url": "https://boards.greenhouse.io/<tenant>/jobs/<id>", "system": "B"}'
-# or open http://localhost:8000/ in a browser
-```
-
-Steps 4–7 need live network access; step 7's `replay build` is the only
-*replay* command that does (everything downstream of it replays from the
-cached record with tool calls forbidden — spec.md §6). Step 10 and an
-`/investigate` call with `system: "C"` (or omitted — "C" is the API
-default) need a reachable LLM endpoint (next section); without one, System
-C is untested live in this environment (see Limitations) and the API
-transparently falls back to System B, marking the response
-`degraded: true`.
-
-`uv run rli --help` and `<command> --help` are the source of truth for every
-flag above — this recipe was verified against that output, not against a
-stale description.
-
-## LLM setup (System C)
-
-System C talks to exactly **one** kind of API: an OpenAI-compatible
-chat-completions endpoint (`POST {base_url}/chat/completions`). There is no
-vendor SDK and no per-provider code path (`OpenAICompatibleClient` in
-`rli/llm/client.py` is a direct httpx call), so anything that speaks that
-protocol works and switching providers is a two-line config change.
-
-Three ways to point it somewhere, in `config.toml`'s `[llm]` table:
-
-**1. Mistral's free Experiment tier (the shipped default — an API key, no local
-RAM, but data leaves the machine — see below).**
-
-```bash
-export MISTRAL_API_KEY=...    # https://console.mistral.ai (free Experiment plan; phone verification, no card)
-```
-
-```toml
-[llm]
-provider = "openai_compatible"
-base_url = "https://api.mistral.ai/v1"
-model_id = "ministral-14b-latest"
-api_key_env = "MISTRAL_API_KEY"
-```
-
-#### What is sent to the LLM endpoint
-
-Every System C investigator/explanation call sends, over the network, to
-whichever `base_url` is configured:
-
-- the posting URL and title, and the company name
-- evidence claim values (including third-party news headline text surfaced
-  by the `company_events` probe)
-- the raw-excerpt text, truncated to `[agent].max_excerpt_chars` (400 chars
-  by default)
-- the computed policy inputs (the fields the LLM prompt is built from)
-
-No user notes or outcomes are sent. With the shipped Mistral default, this
-data leaves the machine and reaches Google's free tier; free-tier prompts
-sent to Mistral's Experiment tier (and other free tiers, e.g. Google Gemini's) may
-be used by the provider for model training. Provider terms around this can
-change, so check them before relying on any particular data-use posture.
-The local-Ollama option below is the no-egress alternative — with it,
-nothing in the list above leaves the machine.
-
-**2. A local model with Ollama (no API key, no data leaves the machine).**
-
-```bash
-ollama serve                 # in its own shell
-ollama pull qwen3:8b         # ~5 GB; qwen3:4b is the smaller alternative
-uv run rli agent run --url https://boards.greenhouse.io/<tenant>/jobs/<id> --db ./data/rli.db
-```
-
-```toml
-[llm]
-provider = "openai_compatible"
-base_url = "http://localhost:11434/v1"
-model_id = "qwen3:8b"
-```
-
-Pick a model that can hold a structured output format: both System C prompts
-demand a JSON object matching a schema. On a CPU-only machine expect tens of
-seconds per call, so raise `[llm].timeout_s` rather than lowering it.
-
-**3. Any other OpenAI-compatible endpoint** — vLLM, llama.cpp's server, LM
-Studio, OpenAI, an internal gateway. Set `base_url`, `model_id`, and
-`api_key_env` to whichever environment variable holds the credential
-(default `LLM_API_KEY`). The key itself never appears in `config.toml`, in
-a log line, or in an error message — `OpenAICompatibleClient` scrubs it from
-every message it raises.
-
-Structured output is requested as `response_format: json_schema` with the
-Pydantic model's own schema. A server that answers HTTP 400 to that is
-retried once with `response_format: json_object` and the schema inlined in
-the system prompt, and the client remembers that for the rest of the run
-rather than re-probing on every call.
-
-**Cost accounting is fully config-driven.** `[llm.prices."<model id>"]` maps
-a model id to `input_usd_per_mtok` / `output_usd_per_mtok` (USD per 1,000,000
-tokens), and that table is the only source of the `cost_usd` figures in
-`run_steps`, in `runs.total_cost_usd`, and in the `[budgets]` ledger the
-controller enforces.
-Local models are listed at `0.0` (they are free); a model id absent from the
-table costs `0.0` and does not raise, so a paid model you add must also be
-priced or it will look free to the budget cap. Prices are never sent to the
-API and are not part of the LLM cache key, so re-pricing does not invalidate
-any cached model output.
-
-A live end-to-end check of whatever you configured:
-
-```bash
-RLI_LLM_LIVE=1 uv run pytest tests/test_llm_live.py -q
-```
-
-It skips (never fails) when `RLI_LLM_LIVE` is unset or the endpoint does not
-answer.
-
-## Safety and reproducibility invariants, and how they're enforced
-
-| Invariant (spec.md §2/§9) | Enforced by |
+| Answer | Meaning |
 |---|---|
-| Untrusted job/news text is delimited, never trusted as instructions | `rli.llm.client.UntrustedBlock` — untrusted text can only travel through this wrapper, which a live delimiter string cannot enter |
-| Model outputs are schema-validated; probe arguments are Pydantic-validated | `rli.llm.client.LLMClient.complete_structured` (raises `LLMSchemaError` rather than returning free text); `rli.agent.controller.decide` validates `ProbeCandidate.args` against each probe's `ArgsModel` and then discards the model's values, rebuilding args itself via `rli.probes.registry.build_args` |
-| Per-probe network-domain allowlists; SSRF hardening | `rli.net.check_allowed` (https-only, no userinfo, no IP literals, no private hosts, exact host match per probe, `"*"` only for JSON-LD, redirects re-checked per hop) |
-| Structured probe failure, no uncontrolled retries | `rli.net.NetResult` (`ok`/`error`/`retryable`); `RETRYABLE_STATUS_CODES` gates bounded retry only when `retryable` |
-| Tool-result and LLM-output caching for exact replay | `rli.net.ToolCache` (append-only `tool_cache`, keyed by probe+args+fetch time); `rli.llm.client`'s cache keyed by `(model_id, prompt_hash, structured_input_hash)` — split so a changed prompt template invalidates globally without conflating it with per-case data |
-| Bounded agent budgets and step caps | `rli.agent.controller.decide` (cost/latency/step-cap hard stops, rejects a repeated identical probe+args, stops when no unresolved policy input `could_change_action`); `config.toml [thresholds].max_dynamic_steps = 4`, `[budgets]` |
-| One frozen action policy shared by A/B/C | `rli.policy.action` (called identically by `rli.eval.system_a`, `rli.eval.system_b`, and `rli.agent.loop.run_system_c` via `rli.eval.runner.decide_and_finish`) |
-| Point-in-time replay forbids live tool calls | `rli.replay.mode.ReplayNetClient` raises on any live-network attempt during replay; only `available_at <= T` evidence and dynamic results the replayed system actually selected are exposed; `rli.replay.leakage` audits every replay run and reports violations (target: 0) |
-| Every user-facing reason cites real evidence | `rli.agent.explanation.explain` validates every `reason.evidence_ids` against evidence actually in the case, with a fallback path when the model fails to comply |
+| **apply_now** | Strong, fresh evidence the role is real and wanted. Put in real effort. |
+| **quick_apply** | Probably open, but the evidence is thin. Apply with little tailoring. |
+| **wait** | Something is unresolved, for example news of a hiring freeze. Check again in N days. |
+| **skip** | Closed, or a long-running repost with signs the company is not really hiring. |
 
-## Limitations
+Every answer comes with short reasons, and each reason links to the dated
+source it is based on. The tool never claims a job is "fake". It only reports
+what the evidence shows and how strong that evidence is.
 
-This section states the current, honestly weaker parts of the system —
-per spec.md §9, the README must report both agent and product limitations
-even if the simpler system (rules) wins.
+## How it works
 
-**Evaluation data is far short of the spec.md §6 headline targets.** The
-last `rli eval run` (`reports/evaluation.md`, generated
-2026-09-08T00:04:21Z against replay dataset `m4-dev-20`) evaluated **20
-postings / 20 companies / 118 replay cases**, against spec §6's targets of
-≥300 postings, ≥40 companies, ≥100 observed closures. The **collection
-corpus** is much larger (13,396 postings, 78 companies, 5,697 closure
-events — the closure-events leg is corpus-wide and does clear its target),
-but the report is explicit that the corpus size and the evaluated-dataset
-size are not interchangeable, and grades postings/companies on the smaller,
-actually-evaluated dataset. **Headline gate: NOT MET.**
+1. **Collect.** Every day it records the job boards of 351 tech companies that
+   use Greenhouse, Ashby or Lever. It also pulls older copies of those boards
+   from the Wayback Machine, plus dated company news (funding, layoffs, freezes).
+   This history is what lets it spot reposts and long-open roles.
+2. **Investigate.** For a given link it runs small checks called *probes*, such
+   as "is it still on the board?", "has it been reposted?", "is the team
+   hiring?" and "any company news?". Each probe produces timestamped evidence.
+3. **Decide.** A fixed, rule-based policy turns the evidence into one of the
+   four answers. The decision is always made by these rules, never by an AI.
+4. **Explain.** The answer comes with reasons that cite the evidence.
 
-**Archive-era evidence is weak by construction.** For any replay case whose
-point-in-time `T` predates this project's own daily snapshots, the only
-observation available is a Wayback capture: `board_snapshot` evidence is
-sparse, `source_quality='archive'`, and often absent entirely, and archive
-derived closures are interval-censored (`last_seen_open`/`first_seen_absent`
-only — no exact `closed_at` is ever invented). PROGRESS.md's M4 note records
-that 117 of 118 dev-split cases were archive-era at the time replay was
-built, making A/B agreement close to trivial until more live-era snapshot
-history accumulates.
+There are three ways to choose which probes to run. They are compared in the
+evaluation:
 
-**`team_signal` is unlicensed and its policy branch is unreachable.** There
-is no licensed team/hiring-signal source configured
-(`[team_signal].enabled = false`), and `team_signal` is the only probe that
-can populate `corroborating_hiring_signal`. The policy's repost/long-lived
-→ `skip` branch (P4) is therefore never exercised by real evidence in any
-current report, and the agent's high-cost probe tier is effectively empty.
+- **A: full.** Runs every probe. This is the most thorough and most expensive option, and it is the reference the others are measured against.
+- **B: rules.** A fixed checklist decides which probes to run.
+- **C: agent.** An LLM decides which probes are worth running, then writes the explanation. A deterministic controller enforces budgets and allowed tools, and stops the agent once nothing left could change the answer.
 
-**Company-events coverage is headline-only.** All **78 of 78** target companies
-have been searched (15 via web search on 2026-09-07, the remaining 63 via
-Google News RSS feeds on 2026-09-08 after the web-search budget ran out), giving
-308 dated events. Event dates are article publication dates and materiality is
-judged from headlines, so some layoffs are recorded without a confirmed
-percentage or headcount. Events live in `data/events/company_events.csv` and
-must be loaded with `rli load-events` before any run or evaluation; an earlier
-evaluation was generated before that step existed and saw no events at all.
+The question the project answers is whether the agent (C) reaches the same
+answers as the full system (A) while running fewer expensive checks than the
+rules (B).
 
-**The shipped default sends data to Mistral, not a local model.**
-`config.toml`'s `[llm]` table defaults to Mistral's free Experiment tier
-(`generativelanguage.googleapis.com`); every System C call sends the
-posting URL/title, company name, evidence claim values (including
-third-party news headline text), the truncated raw excerpt, and the
-computed policy inputs to that endpoint, and free-tier prompts may be used
-by the provider for training. See "LLM setup (System C)" above — in
-particular "What is sent to the LLM endpoint" — for the full disclosure and
-for the no-egress local-Ollama alternative.
+## Key numbers
 
-**System C (the LLM agent) has not been exercised live in this
-environment.** No LLM endpoint was reachable during development or in the
-last evaluation run, so System C's investigator/controller loop has 1,103
-passing offline/mocked tests but zero recorded live model calls, and
-`reports/evaluation.md`'s agent gate reads **NOT RUN** rather than pass or
-fail — System C produced zero scoped runs, so it has not failed, it has
-never been graded. (The reports in `reports/` predate the move to an
-OpenAI-compatible client and still name the old provider's key; they are
-generated artifacts and were not rewritten by hand.) The product API
-(`POST /investigate`) probes the configured endpoint and transparently
-degrades to System B (`degraded: true`, with the probe's reason in
-`degraded_reason`), and also degrades if every System C model call in a run
-errors out.
+Status as of 2026-10-04.
 
-**System A is not a neutral upper bound on probe use.** `rli.eval.system_a`
-runs every dynamic probe that survives history/licensing gates regardless
-of whether it could change the action, while System C is gated by
-`rli.policy.inputs.could_change_action`. Every probe-count comparison
-against A is therefore biased toward the leaner system by construction, not
-by measurement — this is why spec §6's agent gate compares medium/high
-probe use against System B, not A.
+**Data collected**
 
-**Cron reliability is not guaranteed.** `docs/deploy-snapshot.md` documents
-a single daily invocation; a missed or failed day is recorded per-company
-as a `capture_attempts` coverage gap, never silently treated as "still
-open" or "closed", but the collection history is only as complete as the
-daily job's actual uptime — see `docs/deploy-snapshot.md`'s verification
-checklist (`rli snapshot-status`, the day's log file, and
-`board_snapshots` row-count growth) for how to check whether it is really
-running.
+| | |
+|---|---|
+| Companies tracked | 351 |
+| Job postings seen | 39,696 |
+| Posting closures observed | ~21,000 |
+| Days of own daily collection | 23 (since 2026-09-07) |
+| Wayback board captures | 1,452 |
+| Dated company events | 773 |
 
-**Repost/version match precision is not yet validated.** Spec §4 requires a
-hand-checked sample of 50 matches; `reports/evaluation.md` records that
-`data/match_precision.md` does not exist yet, so the repost-derived policy
-inputs (`repost_pattern`) carry an unquantified error rate.
+**Evaluation (2026-09-30).** This is a point-in-time replay. Each test case is
+a job at a past date, and the system sees only what was knowable on that date.
 
-**Probe cost points and model dollars are different units and are never
-summed** — `run_steps.cost_usd` holds placeholder cost points on probe
-steps (`[probe_costs]`: low=1, medium=3, high=10) and real USD on model
-steps; no report anywhere quotes one combined "total cost" figure.
+| | Time split (dev) | Company split (dev) |
+|---|---|---|
+| Postings / companies / cases | 300 / 246 / 7,905 | 200 / 138 / 2,683 |
+| Agent's expensive probes per case vs rules (C vs B) | 0.98 vs 1.43, **ratio 0.68** | 0.98 vs 1.55, **ratio 0.63** |
+| Agent's answers matching the full system | **100%** | **100%** |
+| Future-data leaks | 0 | 0 |
+| **Agent gate** (needs ratio ≤ 0.70 and agreement within 2 points of B) | **PASS** | **PASS** |
 
-## Agent go/no-go
+For the agent, C ran on Mistral `ministral-8b` at no cost on the free tier. Full
+reports are in `reports/evaluation.md` and `reports/evaluation_company_split.md`.
 
-**Status (2026-09-13): GO — the agent gate passes on both datasets under the amended policy (spec §5 amendments of 2026-09-10 and 2026-09-12).** See `reports/evaluation.md` (temporal dev split, 300 postings / 78 companies / 1,287 replay cases) and `reports/evaluation_company_split.md` (150 postings / 33 companies / 693 cases). System C ran on Mistral `ministral-14b-latest` (free Experiment tier); leakage checks are clean on both datasets, blob exposures 0.
+**Answers on recent cases**, from after daily collection began (all three
+systems agree):
 
-| measure | A (full probes) | B (rules, b2) | C (agent) |
-|---|---|---|---|
-| paired runs, temporal / company | 1,192 / 636 | 1,192 / 636 | 1,192 / 636 |
-| action distribution, temporal (pooled) | apply_now 94 · quick_apply 961 · skip 123 · wait 14 | identical | identical |
-| action distribution, company (pooled) | apply_now 48 · quick_apply 511 · skip 72 · wait 5 | identical | apply_now 47 · quick_apply 512 (one case differs) |
-| agreement with A, overall / macro | — | 100% / 100% both sets | 100% / 100% temporal; 99.2% / 99.5% company |
-| medium/high probes per run, temporal | 2.27 | 1.48 | 0.96 (ratio 0.65, gate ≤ 0.70) |
-| medium/high probes per run, company | — | 1.52 | 0.94 (ratio 0.62) |
-| model calls | 0 | 0 | ~2.0 per case (2,331 on the temporal set), $0 on the free tier |
+| | apply_now | quick_apply | wait | skip |
+|---|---|---|---|---|
+| Time split (503 cases) | 45 | 313 | 4 | 141 |
+| Company split (465 cases) | 60 | 327 | 25 | 53 |
 
-**Live-era view (the product-relevant slice; 295 of the 1,192 temporal cases fall after own collection began on 2026-09-07):** apply_now 94 · quick_apply 126 · skip 61 · wait 14, identical across A, B and C; C vs B probe ratio 0.68 (informational gate: pass). The remaining 897 cases are archive-era: their only evidence is Wayback captures, which spec §1 defines as weak, so they route to `quick_apply` or `skip` by construction. That block, not the policy, is what makes the pooled distribution look default-heavy.
+**What these numbers do not show yet**
 
-**Reading it honestly.** Both legs of the spec §6 gate pass: C reproduces the reference decisions while running about 35–38% fewer medium/high-cost probes than the rules baseline. Under the 2026-09-12 amendment, an open, strong-evidence role with observed team hiring activity now gets `apply_now` regardless of age; the agent reached all 94 such answers on the temporal set by choosing to run the team probe itself. The rules baseline (re-versioned to b2) reaches them too, so the agent still wins on cost, not on accuracy.
+- **Whether the advice is right.** Matching the full system shows the agent is consistent, not that its answers are correct. That needs real application outcomes, and none are logged yet, so **product value is unproven**.
+- **Most cases are rated "weak"**, so `quick_apply` dominates. The main cause was that publish dates were not being saved. This was fixed on 2026-10-03, and dated evidence is building up now. Datasets will be rebuilt and rerun on it.
+- **The rules (B) also match the full system 100%.** The agent wins on cost (fewer checks), not on accuracy.
+- **The policy is not frozen yet**, and the held-out test split has not been touched.
 
-**Loop efficiency:** a deterministic controller pre-check (2026-09-13) stops the loop before the investigator is called when every eligible probe has already run; this removed ~43% of investigator calls with decisions unchanged.
+## Run it yourself
 
-**Caveats that still stand:** System A is not a neutral upper bound (it runs every eligible probe, which is why the gate measures against B). The policy is tuned but not yet frozen on live-era evidence, and the untouched `test` split has not been evaluated. Product value is unproven (see below).
-## Product gate
+**Requirements:** Linux or macOS, Python 3.12, [uv](https://docs.astral.sh/uv/),
+and internet access. The agent (System C) also needs an LLM endpoint; see step 5.
 
-**UNPROVEN.** The `outcomes` table is empty. No claim about job-search outcomes is made. Record outcomes via `POST /outcomes` and re-run `rli eval gates`.
-
-## Product shell
-
-`PROGRESS.md` still lists M7 as "todo" as of this writing, but the code
-below exists, is exercised by `tests/test_api.py` (17 passing tests), and
-was manually verified against a scratch database while writing this
-document (see `docs/demo.md`).
-
-`uv run python -m rli.api` starts the FastAPI app (`rli.api.app:app`) via
-uvicorn.
-
-- `POST /investigate {url, system?: "A"|"B"|"C"}` — `system` defaults to
-  `"C"`; falls back to System B with `degraded: true` when the configured
-  LLM endpoint is unreachable (or has no credential and is not local), or
-  when every System-C model call fails. Returns
-  the spec §1 decision fields plus `run_id`, `system_used`, `degraded`,
-  `degraded_reason`.
-- `GET /runs/{run_id}` — the internal `run_steps` trace, only when header
-  `X-RLI-Debug: 1` is sent **and** `RLI_API_DEBUG_ROUTES` is on (**off** by
-  default); `404` otherwise.
-- `POST /outcomes {run_id|posting_id, outcome, occurred_at?, note?}` —
-  records one of `applied | reply | screen | interview | offer | rejection
-  | silence` against a posting.
-- `GET /watch`, `POST /watch {url}`, `GET /watch/due` — a simple role-watch
-  list (stored in a JSON file, not the SQLite schema) that reruns System B
-  (never C — a watch recheck is meant to be cheap) once a watched posting's
-  `recheck_after_days` has elapsed.
-- `GET /health`, `GET /` (serves `rli/ui/index.html`).
-
-Settings are environment variables, not `config.toml` (Phase 5 was not
-allowed to touch the frozen config system): `RLI_DB_PATH` (default
-`./data/rli.db`), `RLI_API_DEBUG_ROUTES` (default **off**),
-`RLI_WATCH_STORE_PATH` (default `./data/watches.json`), `RLI_API_HOST`
-(default `127.0.0.1`), `RLI_API_PORT` (default `8000`).
-
-- `RLI_API_TOKEN` — bearer token guarding the API. When set, every route
-  except `GET /health` and `GET /` requires `Authorization: Bearer
-  <token>`; requests without a matching header are rejected. When unset,
-  the API is open (no auth on any route) but `python -m rli.api` refuses to
-  start unless `RLI_API_HOST` is a loopback address (`127.0.0.1`,
-  `localhost`, or `::1`).
-- `RLI_API_RPM` — requests/minute per client IP allowed on `POST
-  /investigate` and `GET /watch/due` (the two routes that spend LLM/network
-  budget), default `10`; exceeding it returns `429`.
-- **Loopback rule, restated:** unset `RLI_API_TOKEN` + a non-loopback
-  `RLI_API_HOST` → the process refuses to start. Unset `RLI_API_TOKEN` +
-  a loopback `RLI_API_HOST` → the process starts, but logs a startup
-  warning that it is running unauthenticated.
-
-`rli/ui/index.html` is a single self-contained HTML+vanilla-JS page: a URL
-input with a system selector, the recommended action / posting state /
-recheck days / evidence quality, a hypotheses section kept visually and
-structurally separate from evidence, reasons linked to the evidence items
-that support them, an evidence timeline sorted by
-`source_event_at`/`available_at`, an outcome-submission form, and
-watch/check-due buttons.
-
-See `docs/demo.md` for worked clear/ambiguous/failure demos, each with both
-a CLI and an API form.
-
-## Tests
+### 1. Install and create the database
 
 ```bash
-uv run pytest -q
-uv run ruff check .
+git clone git@github.com:areebfazli/job_liveliness_investigator.git
+cd job_liveliness_investigator
+uv sync
+uv run rli init-db --path ./data/rli.db
+uv run rli load-targets --targets scripts/targets.csv --db ./data/rli.db
+uv run rli load-events --path data/events/company_events.csv --db ./data/rli.db
 ```
 
-1,103 tests pass, 1 is skipped by design (`tests/test_llm_live.py`: the
-live-LLM check, which runs only with `RLI_LLM_LIVE=1` and a reachable
-endpoint). `ruff check .` is clean. Per `PROGRESS.md`'s milestone table:
-M0–M5 done (M1–M3 "nearly done"/"in progress" with specific remaining items
-logged there), M6 "done (code), interim report", M7 "todo" as of the version
-read while writing this document — treat `PROGRESS.md` as the authoritative,
-continuously-updated milestone tracker and this README as a snapshot of what
-was verified at the time it was written.
+### 2. Collect data
 
-## Configuration
+```bash
+uv run rli snapshot --db ./data/rli.db                       # today's job boards (~4 min)
+uv run rli archive backfill --months 12 --db ./data/rli.db   # older copies from Wayback (slow)
+uv run rli history rebuild --db ./data/rli.db                # derive closures and reposts
+```
 
-Configuration lives in `config.toml` (thresholds, budgets, `[net]` retry
-and backoff knobs, per-host rate limits, per-probe domain allowlists, probe
-cost tiers, and action-policy freeze state). Most values there are still
-placeholders pending tuning on more collection data — see the Limitations
-section above and the comments in `config.toml` itself, which mark each
-untuned value explicitly.
+To collect every day automatically, run `scripts/setup_laptop_timer.sh`. It
+installs a systemd timer that runs at 00:05 and 12:05 and catches up after
+sleep. For an always-on machine, use `scripts/setup_cloud_vm.sh`. Both are
+described in `docs/deploy-snapshot.md`.
 
-`rli.config.load_config()` resolves the file relative to the **repo root**,
-not the process CWD, so a cron snapshot job and a test in a tmpdir load the
-same file. Precedence is: explicit `path` argument > `$RLI_CONFIG` > repo
-root. An installed (non-checkout) deployment has no repo root and must set
-`RLI_CONFIG`. Every config table is validated with `extra = "forbid"`: a
-misspelled key is a hard error, never a silently ignored line.
+### 3. Check a job link
 
-## Database
+```bash
+uv run rli run --system B --url https://boards.greenhouse.io/<company>/jobs/<id> --db ./data/rli.db
+uv run rli agent run --url https://boards.greenhouse.io/<company>/jobs/<id> --db ./data/rli.db   # agent (C)
+```
 
-`rli init-db` is idempotent and stamps `PRAGMA user_version`. `schema.sql`
-always describes the newest schema and is only used to create a fresh
-database; to change the schema for existing databases, bump
-`rli.db.SCHEMA_VERSION` and register the upgrade in `rli.db.MIGRATIONS`
-keyed by the *from* version. Connections are opened with WAL journaling, a
-busy timeout, and foreign keys enforced.
+### 4. Web page and API
 
-## Cron
+```bash
+RLI_DB_PATH=./data/rli.db uv run python -m rli.api    # then open http://localhost:8000/
+```
 
-Daily board snapshots are the long pole of the whole project — history
-gated evidence only exists for as long as this job has actually been
-running. The default deployment is a systemd user timer
-(`scripts/setup_laptop_timer.sh`), not cron — a laptop isn't always on, and
-unlike cron a systemd timer catches up a missed day on next boot/login. An
-optional always-on free-tier cloud VM setup (`scripts/setup_cloud_vm.sh`)
-is also available. See `docs/deploy-snapshot.md` for both setups and three
-independent ways to verify the job actually ran.
+- `POST /investigate {url, system}` returns the answer. If the LLM is unreachable, it falls back to the rules (B) and marks the response `degraded: true`.
+- `POST /outcomes` logs what happened after you applied: `applied`, `reply`, `screen`, `interview`, `offer`, `rejection` or `silence`. These outcomes are what can eventually show whether the advice works.
+- `/watch` lets you watch a role and have it rechecked when it is due.
+- The server runs on localhost only, unless you set `RLI_API_TOKEN`; then every request needs that token. `RLI_API_RPM` sets the per-IP rate limit.
 
-## Project layout
+### 5. LLM for the agent (System C)
+
+C works with any OpenAI-compatible endpoint. Set it in `config.toml` under `[llm]`.
+The default is Mistral:
+
+```bash
+echo 'MISTRAL_API_KEY=...' > .env    # free key at console.mistral.ai; .env is gitignored
+```
+
+The posting title, URL, company name, evidence snippets and news headlines
+are sent to that provider, and free tiers may train on them. To keep
+everything local, use Ollama (`base_url = "http://localhost:11434/v1"`) with a
+model that supports structured JSON output.
+
+### 6. Reproduce the evaluation
+
+```bash
+uv run rli replay build --dataset my-set --split dev --split-kind temporal --grid-days 7 --db ./data/rli.db
+uv run rli replay run --system A --dataset my-set --db ./data/rli.db
+uv run rli replay run --system B --dataset my-set --db ./data/rli.db
+WORKERS=4 TOTAL_RPM=160 scripts/replay_c_parallel.sh my-set   # agent, 4 workers in parallel
+uv run rli replay check --dataset my-set --db ./data/rli.db   # must report 0 leaks
+uv run rli eval run --dataset my-set --with-c --out reports/evaluation.md --db ./data/rli.db
+```
+
+`replay build` is the only replay step that uses the network. Every later step
+is replayed offline, with live calls blocked.
+
+### 7. Tests
+
+```bash
+uv run pytest -q && uv run ruff check .    # 1,446 tests
+```
+
+## Built-in safety rules
+
+- **No looking ahead.** Evidence is stamped with when it became available. Replay sees only data from on or before the test date, and every replay run is audited for leaks.
+- **The AI never decides.** It only picks probes and writes the explanation. Its output must match a schema, it can call only allow-listed sites, it has hard budget and step limits, and it cannot repeat the same call.
+- **Job and news text is treated as data**, never as instructions to the AI.
+- **No guessing.** A failed or missing capture is recorded as a gap, never as "job closed". Closure dates are kept as ranges, never invented.
+- **Every reason must cite real evidence**, and this is checked.
+- **Out of scope:** no "ghost job" verdicts, no LinkedIn scraping, no crowd scores, no made-up 0–100 scores.
+
+## More detail
+
+| File | What's in it |
+|---|---|
+| `spec.md` | Full requirements, including the action policy and its amendments |
+| `PLAN.md` | Build order |
+| `PROGRESS.md` | Running log of status and decisions |
+| `config.toml` | All thresholds, budgets, rate limits and allowlists |
+| `reports/` | Generated evaluation reports |
+| `docs/` | Deployment and demo walkthroughs |
 
 ```
-rli/
-  net/       allowlisted, rate-limited, cached HTTP access
-  resolvers/ Greenhouse / Ashby / Lever / JSON-LD adapters
-  snapshots/ daily board-snapshot capture
-  archive/   Wayback Machine backfill
-  history/   closures, repost/version matching, board-history features
-  events/    company-events collection/store
-  probes/    dynamic probes (repost_history, requirements_drift,
-             company_events, team_signal) + registry
-  policy/    evidence_quality, policy inputs, the frozen action policy
-  eval/      System A (full probes), System B (rules), metrics, gates,
-             evaluation report — shared by live runs and replay
-  agent/     System C: investigator, deterministic controller, bounded
-             loop, evidence-cited explanation
-  llm/       structured-output LLM client, prompt/cache machinery
-  replay/    point-in-time replay: build, run, leakage audit
-  api/       Phase 5 product shell: FastAPI app, settings, watch logic/store
-  ui/        the single-page product UI served at `/`
-  cli.py     the `rli` command-line entrypoint
-docs/        operational docs (cron.md, demo.md)
-tests/       pytest suite (respx-mocked network, scratch databases)
-reports/     generated evaluation/baseline/behavior reports
+rli/  net · resolvers · snapshots · archive · history · events · probes
+      policy · eval · agent · llm · replay · api · ui · cli.py
 ```
