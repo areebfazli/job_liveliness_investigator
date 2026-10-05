@@ -1,4 +1,4 @@
-# Role-Liveness Investigator (`rli`)
+# Job-Liveness Investigator (`rli`)
 
 > **Is this job worth applying to right now, and what should I do next?**
 
@@ -7,7 +7,7 @@
 Many job postings online are not what they seem. Some were filled months ago
 and never taken down. Some are reposted again and again. Some belong to
 companies that have just frozen hiring. Job seekers waste hours tailoring
-applications for roles that were never really open.
+applications for jobs that were never really open.
 
 `rli` takes a job link and checks the evidence before you spend that time:
 
@@ -20,7 +20,7 @@ It then gives one of four answers:
 
 | Answer | Meaning |
 |---|---|
-| **apply_now** | Strong, fresh evidence the role is real and wanted. Put in real effort. |
+| **apply_now** | Strong, fresh evidence the job is real and wanted. Put in real effort. |
 | **quick_apply** | Probably open, but the evidence is thin. Apply with little tailoring. |
 | **wait** | Something is unresolved, for example news of a hiring freeze. Check again in N days. |
 | **skip** | Closed, or a long-running repost with signs the company is not really hiring. |
@@ -34,7 +34,7 @@ what the evidence shows and how strong that evidence is.
 1. **Collect.** Every day it records the job boards of 351 tech companies that
    use Greenhouse, Ashby or Lever. It also pulls older copies of those boards
    from the Wayback Machine, plus dated company news (funding, layoffs, freezes).
-   This history is what lets it spot reposts and long-open roles.
+   This history is what lets it spot reposts and long-open jobs.
 2. **Investigate.** For a given link it runs small checks called *probes*, such
    as "is it still on the board?", "has it been reposted?", "is the team
    hiring?" and "any company news?". Each probe produces timestamped evidence.
@@ -141,7 +141,7 @@ RLI_DB_PATH=./data/rli.db uv run python -m rli.api    # then open http://localho
 
 - `POST /investigate {url, system}` returns the answer. If the LLM is unreachable, it falls back to the rules (B) and marks the response `degraded: true`.
 - `POST /outcomes` logs what happened after you applied: `applied`, `reply`, `screen`, `interview`, `offer`, `rejection` or `silence`. These outcomes are what can eventually show whether the advice works.
-- `/watch` lets you watch a role and have it rechecked when it is due.
+- `/watch` lets you watch a job and have it rechecked when it is due.
 - The server runs on localhost only, unless you set `RLI_API_TOKEN`; then every request needs that token. `RLI_API_RPM` sets the per-IP rate limit.
 
 ### 5. LLM for the agent (System C)
