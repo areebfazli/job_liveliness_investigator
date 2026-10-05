@@ -1,4 +1,4 @@
-# Job-Liveness Investigator (`rli`)
+# Job-Liveness Investigator
 
 > **Is this job worth applying to right now, and what should I do next?**
 
