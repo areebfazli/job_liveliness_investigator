@@ -42,20 +42,22 @@ what the evidence shows and how strong that evidence is.
    four answers. The decision is always made by these rules, never by an AI.
 4. **Explain.** The answer comes with reasons that cite the evidence.
 
-There are three ways to choose which probes to run. They are compared in the
+There are four ways to choose which probes to run. They are compared in the
 evaluation:
 
 - **A: full.** Runs every probe. This is the most thorough and most expensive option, and it is the reference the others are measured against.
 - **B: rules.** A fixed checklist decides which probes to run.
-- **C: agent.** An LLM decides which probes are worth running, then writes the explanation. A deterministic controller enforces budgets and allowed tools, and stops the agent once nothing left could change the answer.
+- **C: agent.** An LLM proposes which probes to run, then writes the explanation. A deterministic controller enforces budgets and allowed tools, and stops once nothing left could change the answer.
+- **R: controller without the LLM.** The same controller as C, but it simply runs every probe that could still change the answer. It makes no AI calls.
 
 The question the project answers is whether the agent (C) reaches the same
 answers as the full system (A) while running fewer expensive checks than the
-rules (B).
+rules (B), and whether the LLM adds anything over the same controller without
+it (R).
 
 ## Key numbers
 
-Status as of 2026-10-04.
+Status as of 2026-10-07.
 
 **Data collected**
 
@@ -68,34 +70,29 @@ Status as of 2026-10-04.
 | Wayback board captures | 1,452 |
 | Dated company events | 773 |
 
-**Evaluation (2026-09-30).** This is a point-in-time replay. Each test case is
-a job at a past date, and the system sees only what was knowable on that date.
+**Evaluation status: no valid result yet.** The first full evaluation
+(2026-09-30) reported that the agent passed its gate. Two independent reviews
+then found that result does not hold:
 
-| | Time split (dev) | Company split (dev) |
-|---|---|---|
-| Postings / companies / cases | 300 / 246 / 7,905 | 200 / 138 / 2,683 |
-| Agent's expensive probes per case vs rules (C vs B) | 0.98 vs 1.43, **ratio 0.68** | 0.98 vs 1.55, **ratio 0.63** |
-| Agent's answers matching the full system | **100%** | **100%** |
-| Future-data leaks | 0 | 0 |
-| **Agent gate** (needs ratio ≤ 0.70 and agreement within 2 points of B) | **PASS** | **PASS** |
+| Finding | What it means |
+|---|---|
+| A no-LLM run of the same controller reproduced the agent on 10,587 of 10,588 cases | The savings came from the controller's rules, not the LLM. The agent is not shown to add anything. |
+| Only 46 of 7,618 time-split cases (0.6%) depend on any probe result | The 100% agreement with the full system was close to automatic. |
+| 74 held-back test companies (2,000 cases) were also in the time split's tuning data | The company-split result is not an independent test. |
+| Some evidence was stamped earlier than it was fetched (by up to ~18 h) | The "0 leaks" result was wrong. The leak checker now catches this, and the old datasets fail it. |
+| Ashby's date is "last published", not "first published" | Re-posted jobs looked new. |
+| 286 postings were scored, not 300 | The time split misses its 300-posting target. |
+| Every strong-evidence case sits at the moment the dataset was built | There is no real history of strong evidence yet. Only 0.8% of time-split cases had a first-publish date. |
 
-For the agent, C ran on Mistral `ministral-8b` at no cost on the free tier. Full
-reports are in `reports/evaluation.md` and `reports/evaluation_company_split.md`.
+All of these are fixed in the code (2026-10-06/07). The datasets will be rebuilt
+on correctly dated data and A, B, C and R rerun. The old reports in `reports/`
+are kept for the record but should not be cited.
 
-**Answers on recent cases**, from after daily collection began (all three
-systems agree):
+**What is still unproven**
 
-| | apply_now | quick_apply | wait | skip |
-|---|---|---|---|---|
-| Time split (503 cases) | 45 | 313 | 4 | 141 |
-| Company split (465 cases) | 60 | 327 | 25 | 53 |
-
-**What these numbers do not show yet**
-
-- **Whether the advice is right.** Matching the full system shows the agent is consistent, not that its answers are correct. That needs real application outcomes, and none are logged yet, so **product value is unproven**.
-- **Most cases are rated "weak"**, so `quick_apply` dominates. The main cause was that publish dates were not being saved. This was fixed on 2026-10-03, and dated evidence is building up now. Datasets will be rebuilt and rerun on it.
-- **The rules (B) also match the full system 100%.** The agent wins on cost (fewer checks), not on accuracy.
-- **The policy is not frozen yet**, and the held-out test split has not been touched.
+- **Whether the advice is right.** No real application outcomes are logged yet, so **product value is unproven**.
+- **Whether the LLM adds value** over the same controller without it (R). If it does not, the spec says to prefer the simpler system.
+- **The policy is not frozen yet.** The time-based held-out test split has not been read.
 
 ## Run it yourself
 
