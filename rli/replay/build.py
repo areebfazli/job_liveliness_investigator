@@ -92,9 +92,11 @@ What an archive-era case deliberately does NOT get is the RESOLVER's
 backdated publish claim from it would be the single most damaging thing this
 module could do. What it DOES get, since schema version 4, is the publish
 evidence our own collection really held at `T` (`capture_date_claims`): the
-ATS-stated `first_published` / `updated_at` our daily board captures recorded
-(Greenhouse, Ashby), available from the earliest own capture at or before `T`
-that carried the value, and a Lever job page's JSON-LD `datePosted`,
+ATS-stated `first_published` / `updated_at` (Greenhouse) and `last_published`
+(Ashby `publishedAt`, a refresh candidate only, never first-publish evidence)
+our daily board captures recorded, available from the earliest own capture at
+or before `T` that carried the value, and a Lever job page's JSON-LD
+`datePosted`,
 available from the moment the collector fetched it. They ride in the same
 `ARCHIVE_BOARD_STATE_PROBE` record. When no capture at or before `T` carried
 a date (every capture taken before version 4, every Wayback capture, every
@@ -105,6 +107,35 @@ the honest cost of "we started collecting on day 0".
 --------------------------------------------------------------------------
 Judgment calls
 --------------------------------------------------------------------------
+
+* **The build-time grid point is the posting's OWN observation time, not
+  the build's start.** Each posting's live System A run reads a real clock:
+  every claim it produces is stamped when its fetch returned, every stored
+  record's `observed_at` is when its probe returned, and the grid endpoint of
+  a still-open posting (`min(first_seen_absent, now)` = the build start, as
+  planned) is replaced by the moment that posting's live run finished. A
+  build that ran for two hours used to stamp every live observation, and
+  place every open posting's last case, at the build's START — so a case at
+  `T` = build start was shown evidence fetched up to two hours after `T`.
+  Now no build-time case can see an observation made after its own `T`, and
+  the cases of different postings simply carry different build-time `T`s.
+  `rli.replay.leakage`'s `evidence_fetched_after_t` rule catches the old
+  stamping in datasets built before this change.
+
+* **Splits are frozen at build time.** Each case stores the split its
+  posting was assigned (`replay_cases.split`) and the dataset stores how
+  (`split_method`, `split_seed`, `split_cutoff`, `split_validation_cutoff`),
+  so evaluation reads the assignment back instead of recomputing it over a
+  corpus that has grown since (`rli.eval.metrics.split_map_for_dataset`).
+  A company split uses the STABLE per-company hash
+  (`rli.policy.splits.company_split_stable`), so a company never changes
+  sides as postings accumulate; `company_split_method="greedy"` reproduces
+  the old balanced-but-drifting assignment. A company-split build also
+  excludes every company with a posting assigned to `test` (defensive: a
+  company split never splits a company, but an injected or mixed map could),
+  and `exclude_companies_from` drops every company that appears in the named
+  datasets — the way to make a company-holdout dataset company-DISJOINT from
+  the temporal dev dataset (`rli replay build --exclude-companies-from`).
 
 * **The grid endpoint is always included, even when it is not on the step.**
   `grid_times` walks `first_observed, +N days, ...` up to
@@ -207,9 +238,11 @@ Judgment calls
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
+import json
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Collection, Iterator, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -220,15 +253,27 @@ from pydantic import BaseModel, ConfigDict
 
 from rli.config import Config
 from rli.eval.baseline import HoldoutSplitRequestedError, load_split_map
-from rli.eval.case import CaseState, build_case_state, extend_case_state
+from rli.eval.case import CaseState, build_case_state, extend_case_state, guard_first_published
 from rli.eval.runner import ProbeRunner, Run, config_hash, decide_and_finish, open_probe_runner
 from rli.eval.system_a import ALL_DYNAMIC_INPUTS
 from rli.history.closures import Capture, load_captures
 from rli.models.probe import ProbeResult
 from rli.models.time import ensure_aware, now_utc, parse_utc, to_utc_z
 from rli.net import hash_args
-from rli.policy.inputs import CLAIM_BOARD_ABSENT, CLAIM_FIRST_PUBLISHED, CLAIM_POSTING_STATE
-from rli.policy.splits import DEFAULT_SEED, Split
+from rli.policy.inputs import (
+    CLAIM_BOARD_ABSENT,
+    CLAIM_FIRST_PUBLISHED,
+    CLAIM_LAST_PUBLISHED,
+    CLAIM_POSTING_STATE,
+)
+from rli.policy.splits import (
+    DEFAULT_SEED,
+    SPLIT_METHOD_COMPANY_GREEDY,
+    SPLIT_METHOD_COMPANY_HASH,
+    SPLIT_METHOD_TEMPORAL,
+    CompanySplitMethod,
+    Split,
+)
 from rli.probes.base import Probe, ProbeClaim, ProbeContext
 from rli.probes.company_events import CompanyEventsProbe
 from rli.probes.lookups import posting_row
@@ -488,13 +533,18 @@ def capture_date_claims(
 ) -> list[ProbeClaim]:
     """Publish evidence our OWN collection already held at `T`.
 
-    Up to three claims, each available from the moment we really had it:
+    Up to four claims, each available from the moment we really had it:
 
-    * `first_published` / `updated_at` (`ats_native`) — the ATS's own stated
-      dates as recorded in `board_snapshot_jobs` by our daily captures
-      (Greenhouse `first_published`/`updated_at`, Ashby `publishedAt`), with
-      `available_at` = the capture time of the EARLIEST own capture at or
-      before `T` that carried the stated value (`_capture_dated_claim`).
+    * `first_published` / `updated_at` (`ats_native`) — Greenhouse's own
+      stated dates as recorded in `board_snapshot_jobs` by our daily
+      captures, with `available_at` = the capture time of the EARLIEST own
+      capture at or before `T` that carried the stated value
+      (`_capture_dated_claim`).
+    * `last_published` (`ats_native`) — Ashby `publishedAt`, stored in
+      `board_snapshot_jobs.last_published` (schema v5) and cited the same
+      way. Ashby documents it as "when the job was LAST published", so it is
+      never a `first_published` claim: `rli.eval.case._refresh_claim` reads
+      it only as a refresh candidate.
     * `first_published` (`page_structured`) — the JSON-LD `datePosted` read
       once from the posting's job page (Lever; `rli.snapshots.page_dates`),
       with `available_at` = that page fetch's time, and only when it is at or
@@ -505,6 +555,11 @@ def capture_date_claims(
     when no capture at or before `T` carried the date — that is "we did not
     have it yet", which must stay UNKNOWN. The event date is `source_event_at`
     only; nothing here is backdated to it.
+
+    A `first_published` date LATER than the posting's first sighting at or
+    before `T` cannot be the first publication, so it is re-labelled by
+    `rli.eval.case.guard_first_published` (the same guard the case builder
+    applies to every always-run claim, live and replayed).
 
     These ride in the same `ARCHIVE_BOARD_STATE_PROBE` record as
     `archive_state_claims`, reach the run through
@@ -527,12 +582,14 @@ def capture_date_claims(
         rows = conn.execute(
             """
             SELECT s.captured_at AS captured_at, j.url AS url,
-                   j.first_published AS first_published, j.updated_at AS updated_at
+                   j.first_published AS first_published, j.updated_at AS updated_at,
+                   j.last_published AS last_published
             FROM board_snapshots AS s
             JOIN board_snapshot_jobs AS j ON j.board_snapshot_id = s.id
             WHERE s.company_id = ? AND s.source = 'own' AND s.captured_at <= ?
               AND j.job_id = ?
-              AND (j.first_published IS NOT NULL OR j.updated_at IS NOT NULL)
+              AND (j.first_published IS NOT NULL OR j.updated_at IS NOT NULL
+                   OR j.last_published IS NOT NULL)
             ORDER BY s.captured_at, j.id
             """,
             (company_id, stamp, job_id),
@@ -541,6 +598,7 @@ def capture_date_claims(
         for column, claim_type in (
             ("first_published", CLAIM_FIRST_PUBLISHED),
             ("updated_at", _CLAIM_UPDATED_AT),
+            ("last_published", CLAIM_LAST_PUBLISHED),
         ):
             claim = _capture_dated_claim(
                 rows, column=column, claim_type=claim_type, fallback_url=fallback_url
@@ -574,7 +632,25 @@ def capture_date_claims(
                 fetched_at=fetched,
             )
         )
-    return claims
+    return guard_first_published(claims, _first_seen_at(row, replay_at))
+
+
+def _first_seen_at(row: sqlite3.Row, replay_at: datetime) -> datetime | None:
+    """The posting's first sighting as of `T`, or None if we had not seen it.
+
+    `postings.first_observed` is a minimum over a growing set of captures, so
+    a stored value at or before `T` IS the at-`T` value, and one after `T`
+    means no capture at or before `T` listed the job (the monotonicity
+    `rli.history.features` documents for `team_activity`).
+    """
+    raw = row["first_observed"]
+    if raw is None:
+        return None
+    try:
+        first = parse_utc(str(raw))
+    except ValueError:
+        return None
+    return first if first <= replay_at else None
 
 
 # ---------------------------------------------------------------------------
@@ -593,6 +669,10 @@ class CasePlan(BaseModel):
     first_observed: datetime
     end: datetime
     times: tuple[datetime, ...]
+    # The split this posting was drawn from, frozen onto every case
+    # (`replay_cases.split`). Always the requested split name, since only
+    # postings assigned to it are planned.
+    split: str | None = None
 
 
 def _candidate_rows(
@@ -629,8 +709,13 @@ def plan_cases(
     grid_step_days: int = DEFAULT_GRID_STEP_DAYS,
     limit_postings: int | None = None,
     seed: int = DEFAULT_SEED,
+    exclude_companies: Collection[str] = (),
 ) -> list[CasePlan]:
     """Pick postings from `split` and lay the evaluation grid over each.
+
+    `exclude_companies` drops every posting of those companies BEFORE the
+    round-robin and the `limit_postings` cap, so an excluded company never
+    costs the dataset a slot.
 
     Only postings with a `first_observed` and a fetchable `canonical_url` are
     eligible: without the first there is no grid start, and without the second
@@ -640,7 +725,10 @@ def plan_cases(
 
     Selection is round-robin across companies — see the module docstring.
     """
-    rows = _candidate_rows(conn, splits, split)
+    excluded = set(exclude_companies)
+    rows = [
+        row for row in _candidate_rows(conn, splits, split) if row["company_id"] not in excluded
+    ]
 
     by_company: dict[str, list[sqlite3.Row]] = {}
     for row in rows:
@@ -691,6 +779,7 @@ def plan_cases(
                 first_observed=first_observed,
                 end=end,
                 times=tuple(times),
+                split=split,
             )
         )
     return plans
@@ -723,14 +812,26 @@ class _RecordingProbeRunner(ProbeRunner):
     """
 
     observations: dict[tuple[str, str], _Observation] = field(default_factory=dict)
+    # The REAL clock (module docstring: "The build-time grid point ..."). Read
+    # right after each probe returns, so `observed_at` is never earlier than
+    # the fetches it records.
+    clock: Callable[[], datetime] = now_utc
 
     def execute(self, probe_cls: type[Probe], args: BaseModel) -> ProbeResult:
         result = super().execute(probe_cls, args)
+        observed = self.clock()
+        # Stamp the result itself too, exactly as `ReplayProbeStore.save` will:
+        # `rli.eval.case.observed_at` then dates the claims this build run
+        # synthesizes from it (`posting_state`, `board_present`/`absent`) by
+        # when the observation was made rather than by the run's start.
+        result = result.model_copy(
+            update={"data": {**(result.data or {}), "observed_at": to_utc_z(observed)}}
+        )
         args_hash_value = hash_args(probe_cls.name, **args.model_dump(mode="json"))
         self.observations[(probe_cls.name, args_hash_value)] = _Observation(
             probe_name=probe_cls.name,
             args_hash=args_hash_value,
-            observed_at=self.now,
+            observed_at=observed,
             result=result,
         )
         return result
@@ -745,6 +846,7 @@ def _recording_runner(
     *,
     use_tool_cache: bool,
     collection_status_csv: str | Path | None = None,
+    clock: Callable[[], datetime] = now_utc,
 ) -> Iterator[_RecordingProbeRunner]:
     with open_probe_runner(
         conn,
@@ -754,8 +856,16 @@ def _recording_runner(
         use_tool_cache=use_tool_cache,
         collection_status_csv=collection_status_csv,
     ) as base:
+        # The probes read the real clock (`ProbeContext.now`), so every claim
+        # a live fetch produces is stamped when that fetch returned; the RUN
+        # clock (`now`: trace rows, the decision) stays the run's start.
         yield _RecordingProbeRunner(
-            run=base.run, ctx=base.ctx, cfg=base.cfg, now=base.now, pool=base.pool
+            run=base.run,
+            ctx=dataclasses.replace(base.ctx, now=clock),
+            cfg=base.cfg,
+            now=base.now,
+            pool=base.pool,
+            clock=clock,
         )
 
 
@@ -900,11 +1010,15 @@ class BuildSummary(BaseModel):
     live_probe_executions: int = 0
     postings_failed: int = 0
     failures: tuple[str, ...] = ()
+    split_method: str = ""
+    companies_excluded: int = 0
 
     def describe(self) -> str:
         lines = [
             f"replay dataset {self.dataset_id!r}: split={self.split_kind}/{self.split_name} "
             f"grid={self.grid_step_days}d created_at={self.created_at}",
+            f"  split method={self.split_method or '(unrecorded)'} (frozen on every case); "
+            f"companies excluded={self.companies_excluded}",
             f"  postings={self.postings} companies={self.companies} cases={self.cases}",
             f"  probe records={self.probe_records} (live executions={self.live_probe_executions})",
             f"  archive board-state records={self.archive_state_records} "
@@ -932,6 +1046,11 @@ def _upsert_dataset(
     companies: int,
     cases: int,
     notes: str | None,
+    split_method: str | None = None,
+    split_seed: int | None = None,
+    split_cutoff: datetime | None = None,
+    split_validation_cutoff: datetime | None = None,
+    exclude_companies_from: Sequence[str] = (),
 ) -> None:
     """Write the `replay_datasets` header, creating or updating it in place.
 
@@ -949,8 +1068,9 @@ def _upsert_dataset(
         """
         INSERT INTO replay_datasets
             (dataset_id, created_at, split_kind, split_name, grid_step_days,
-             postings, companies, cases, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             postings, companies, cases, notes, split_method, split_seed,
+             split_cutoff, split_validation_cutoff, exclude_companies_from)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (dataset_id) DO UPDATE SET
             created_at = excluded.created_at,
             split_kind = excluded.split_kind,
@@ -959,7 +1079,12 @@ def _upsert_dataset(
             postings = excluded.postings,
             companies = excluded.companies,
             cases = excluded.cases,
-            notes = excluded.notes
+            notes = excluded.notes,
+            split_method = excluded.split_method,
+            split_seed = excluded.split_seed,
+            split_cutoff = excluded.split_cutoff,
+            split_validation_cutoff = excluded.split_validation_cutoff,
+            exclude_companies_from = excluded.exclude_companies_from
         """,
         (
             dataset_id,
@@ -971,6 +1096,11 @@ def _upsert_dataset(
             companies,
             cases,
             notes,
+            split_method,
+            split_seed,
+            None if split_cutoff is None else to_utc_z(split_cutoff),
+            None if split_validation_cutoff is None else to_utc_z(split_validation_cutoff),
+            json.dumps(list(exclude_companies_from)) if exclude_companies_from else None,
         ),
     )
     conn.commit()
@@ -987,8 +1117,8 @@ def _insert_case(
     conn.execute(
         """
         INSERT OR REPLACE INTO replay_cases
-            (dataset_id, posting_id, replay_at, company_id, canonical_url, built_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+            (dataset_id, posting_id, replay_at, company_id, canonical_url, built_at, split)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (
             dataset_id,
@@ -997,6 +1127,7 @@ def _insert_case(
             plan.company_id,
             plan.canonical_url,
             to_utc_z(built_at),
+            plan.split,
         ),
     )
     conn.commit()
@@ -1011,8 +1142,13 @@ def _observe_live(
     now: datetime,
     use_tool_cache: bool,
     collection_status_csv: str | Path | None,
+    clock: Callable[[], datetime] = now_utc,
 ) -> tuple[dict[tuple[str, str], _Observation], CaseState]:
     """Run System A live, once, and return everything it executed.
+
+    `now` is the run clock (the trace, the decision); `clock` is the real
+    clock the probes and the recorder read, so every observation is dated by
+    when it was really made (module docstring).
 
     This is `rli.eval.system_a.run_system_a`'s body with a recording runner
     substituted; it is written out rather than called because the point of
@@ -1034,6 +1170,7 @@ def _observe_live(
             now,
             use_tool_cache=use_tool_cache,
             collection_status_csv=collection_status_csv,
+            clock=clock,
         ) as probes:
             case = build_case_state(
                 conn,
@@ -1213,8 +1350,19 @@ def build_dataset(
     use_tool_cache: bool = True,
     collection_status_csv: str | Path | None = None,
     notes: str | None = None,
+    clock: Callable[[], datetime] | None = None,
+    exclude_companies_from: Sequence[str] = (),
+    company_split_method: CompanySplitMethod = "hash",
 ) -> BuildSummary:
     """Build (or rebuild) the replay dataset `dataset_id` (PLAN.md M4).
+
+    `clock` is the real clock live observations are dated by (module
+    docstring: "The build-time grid point ..."). Default: the wall clock, or,
+    when an explicit `now` is given and no `clock`, a clock frozen at `now`
+    (a test's fixed timeline). `exclude_companies_from` names datasets whose
+    companies this one must not contain (`ValueError` if one has no cases);
+    `company_split_method` picks the company-split assignment (`"hash"`, the
+    stable default, or the legacy `"greedy"`).
 
     Makes LIVE network calls — one System A run per selected posting — and is
     the only function in `rli.replay` that does. Everything downstream
@@ -1240,13 +1388,30 @@ def build_dataset(
         raise ValueError(f"unknown split {split!r}; expected 'dev' or 'validation'")
 
     moment = ensure_aware(now, "now") if now is not None else now_utc()
+    if clock is None:
+        clock = (lambda: moment) if now is not None else now_utc
+    split_cutoff = cutoff if cutoff is not None else moment
     splits = load_split_map(
         conn,
-        cutoff=cutoff if cutoff is not None else moment,
+        cutoff=split_cutoff,
         validation_cutoff=validation_cutoff,
         seed=seed,
         split_kind=split_kind,
+        company_method=company_split_method,
     )
+    if split_kind == "temporal":
+        split_method = SPLIT_METHOD_TEMPORAL
+    elif company_split_method == "hash":
+        split_method = SPLIT_METHOD_COMPANY_HASH
+    else:
+        split_method = SPLIT_METHOD_COMPANY_GREEDY
+
+    excluded = _companies_of_datasets(conn, exclude_companies_from, building=dataset_id)
+    if split_kind == "company":
+        # A company split never puts one company on two sides, so this is
+        # empty in practice; it is the structural guarantee that a company
+        # holding any `test` posting can never enter a non-test build.
+        excluded |= _companies_with_split(conn, splits, "test")
     plans = plan_cases(
         conn,
         splits=splits,
@@ -1255,7 +1420,15 @@ def build_dataset(
         grid_step_days=grid_step_days,
         limit_postings=limit_postings,
         seed=seed,
+        exclude_companies=excluded,
     )
+    split_record = {
+        "split_method": split_method,
+        "split_seed": seed,
+        "split_cutoff": split_cutoff if split_kind == "temporal" else None,
+        "split_validation_cutoff": validation_cutoff if split_kind == "temporal" else None,
+        "exclude_companies_from": tuple(exclude_companies_from),
+    }
 
     # The header first: `replay_cases.dataset_id` is a foreign key into it.
     # A rebuild also clears the previous cases here, so a dataset rebuilt with
@@ -1273,6 +1446,7 @@ def build_dataset(
         companies=0,
         cases=0,
         notes=notes,
+        **split_record,
     )
     conn.execute("DELETE FROM replay_cases WHERE dataset_id = ?", (dataset_id,))
     conn.execute("DELETE FROM replay_probe_results WHERE dataset_id = ?", (dataset_id,))
@@ -1295,9 +1469,10 @@ def build_dataset(
                 cfg,
                 plan,
                 dataset_id=dataset_id,
-                now=moment,
+                now=clock(),
                 use_tool_cache=use_tool_cache,
                 collection_status_csv=collection_status_csv,
+                clock=clock,
             )
         except Exception as exc:  # noqa: BLE001 - one bad posting must not stop a build
             # A probe that raises is a contract violation (`rli.probes.base`),
@@ -1309,13 +1484,22 @@ def build_dataset(
         live_executions += len(observations)
         built_postings.append(plan)
 
-        for replay_at in plan.times:
+        # The moment this posting's live observation was complete: the
+        # build-time grid point of a still-open posting (module docstring).
+        observed_by = max(
+            [clock(), *(observation.observed_at for observation in observations.values())]
+        )
+        times = plan.times
+        if times and times[-1] == moment and observed_by > moment:
+            times = (*times[:-1], observed_by)
+
+        for replay_at in times:
             _insert_case(
                 conn,
                 dataset_id=dataset_id,
                 plan=plan,
                 replay_at=replay_at,
-                built_at=moment,
+                built_at=observed_by,
             )
             cases += 1
 
@@ -1338,7 +1522,7 @@ def build_dataset(
                     args_hash=observation.args_hash,
                     observed_at=observation.observed_at,
                     result=observation.result,
-                    created_at=moment,
+                    created_at=observed_by,
                 )
                 probe_records += 1
 
@@ -1355,7 +1539,7 @@ def build_dataset(
                     args_hash=events.args_hash,
                     observed_at=events.observed_at,
                     result=events.result,
-                    created_at=moment,
+                    created_at=observed_by,
                 )
                 probe_records += 1
 
@@ -1375,7 +1559,7 @@ def build_dataset(
                     args_hash=team.args_hash,
                     observed_at=team.observed_at,
                     result=team.result,
-                    created_at=moment,
+                    created_at=observed_by,
                 )
                 probe_records += 1
 
@@ -1405,7 +1589,7 @@ def build_dataset(
                         "evidence": [*claims, *dated],
                     },
                 ),
-                created_at=moment,
+                created_at=observed_by,
             )
             archive_records += 1
             if claims:
@@ -1425,6 +1609,7 @@ def build_dataset(
         companies=companies,
         cases=cases,
         notes=notes,
+        **split_record,
     )
 
     return BuildSummary(
@@ -1443,7 +1628,45 @@ def build_dataset(
         live_probe_executions=live_executions,
         postings_failed=len(failures),
         failures=tuple(failures),
+        split_method=split_method,
+        companies_excluded=len(excluded),
     )
+
+
+def _companies_of_datasets(
+    conn: sqlite3.Connection, dataset_ids: Sequence[str], *, building: str
+) -> set[str]:
+    """Every `company_id` appearing in the cases of `dataset_ids`.
+
+    Raises `ValueError` for a dataset with no cases (a typo must not silently
+    exclude nothing) and for the dataset being built (excluding a dataset
+    from itself is meaningless and would read a half-cleared case table).
+    """
+    companies: set[str] = set()
+    for other in dataset_ids:
+        if other == building:
+            raise ValueError(f"dataset {building!r} cannot exclude its own companies")
+        rows = conn.execute(
+            "SELECT DISTINCT company_id FROM replay_cases WHERE dataset_id = ?", (other,)
+        ).fetchall()
+        if not rows:
+            raise ValueError(f"cannot exclude the companies of dataset {other!r}: it has no cases")
+        companies.update(str(row["company_id"]) for row in rows)
+    return companies
+
+
+def _companies_with_split(
+    conn: sqlite3.Connection, splits: dict[str, Split] | dict[str, str], name: str
+) -> set[str]:
+    """Companies with at least one posting assigned to split `name`."""
+    wanted = {posting_id for posting_id, split in splits.items() if split == name}
+    if not wanted:
+        return set()
+    return {
+        str(row["company_id"])
+        for row in conn.execute("SELECT posting_id, company_id FROM postings")
+        if row["posting_id"] in wanted
+    }
 
 
 def dataset_case_rows(conn: sqlite3.Connection, dataset_id: str) -> list[sqlite3.Row]:

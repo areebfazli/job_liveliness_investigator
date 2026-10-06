@@ -10,7 +10,8 @@ from rli.agent.cli import app as agent_app
 from rli.archive.cli import app as archive_app
 from rli.config import load_config
 from rli.db import connect, init_db
-from rli.eval.baseline import baseline_report, load_split_map, write_baseline_report
+from rli.eval.baseline import baseline_report, write_baseline_report
+from rli.eval.metrics import split_map_for_dataset
 from rli.eval.report import summarize_runs
 from rli.eval.system_a import run_system_a
 from rli.eval.system_b import run_system_b
@@ -135,7 +136,7 @@ def snapshot_command(
         loaded = load_targets(targets)
         filtered = [t for t in loaded if _matches_only(t.tenant, only)]
         upsert_companies(conn, filtered, now=now_utc())
-        summary = run_daily_snapshot(conn, cfg, filtered, now=now_utc())
+        summary = run_daily_snapshot(conn, cfg, filtered, now=now_utc(), clock=now_utc)
         typer.echo(summary.describe())
     finally:
         conn.close()
@@ -326,6 +327,19 @@ def replay_build_command(
         None, "--validation-cutoff", help="Temporal-split validation cutoff (ISO 8601 UTC)."
     ),
     notes: str | None = typer.Option(None, "--notes", help="Free text stored on the dataset."),
+    exclude_companies_from: list[str] = typer.Option(
+        [],
+        "--exclude-companies-from",
+        help="Dataset id whose companies this dataset must not contain (repeatable). Build "
+        "the company-holdout dataset with --split-kind company --exclude-companies-from "
+        "<temporal dev dataset> so the two are company-disjoint.",
+    ),
+    company_split_method: str = typer.Option(
+        "hash",
+        "--company-split-method",
+        help="hash (stable per company; default) or greedy (legacy, balanced by posting "
+        "count, drifts as the corpus grows).",
+    ),
     db: str = typer.Option(_DEFAULT_DB_PATH, "--db", help="Path to the SQLite database file."),
 ) -> None:
     """Collect the cached full-probe record for a point-in-time replay dataset.
@@ -334,11 +348,23 @@ def replay_build_command(
     run per selected posting (spec.md §6: "results come only from the cached
     full-probe record" — this is where that record comes from). Every later
     step reads it and reaches the network never.
+
+    The split each case was drawn from is frozen onto the dataset, so later
+    evaluation reads it back rather than re-splitting a grown corpus. The
+    company holdout is built company-disjoint from the temporal dev dataset:
+
+        rli replay build --dataset company-dev --split-kind company \\
+            --exclude-companies-from dev-temporal
     """
     if split_kind not in ("temporal", "company"):
         raise typer.BadParameter(
             f"unknown split kind {split_kind!r}; expected 'temporal' or 'company'",
             param_hint="--split-kind",
+        )
+    if company_split_method not in ("hash", "greedy"):
+        raise typer.BadParameter(
+            f"unknown company split method {company_split_method!r}; expected 'hash' or 'greedy'",
+            param_hint="--company-split-method",
         )
     cfg = load_config()
     init_db(db)
@@ -355,6 +381,8 @@ def replay_build_command(
             cutoff=_optional_moment(cutoff, "--cutoff"),
             validation_cutoff=_optional_moment(validation_cutoff, "--validation-cutoff"),
             notes=notes,
+            exclude_companies_from=tuple(exclude_companies_from),
+            company_split_method=company_split_method,  # type: ignore[arg-type]
         )
         typer.echo(summary.describe())
     finally:
@@ -570,8 +598,8 @@ def eval_baseline_command(
     cutoff: str | None = typer.Option(
         None,
         "--cutoff",
-        help="Temporal-split cutoff (ISO 8601 UTC). Defaults to the dataset's created_at, "
-        "which reproduces the assignment the build used.",
+        help="Temporal-split cutoff (ISO 8601 UTC), for a deliberate re-split. By default "
+        "the split assignment frozen on the dataset at build time is used.",
     ),
     validation_cutoff: str | None = typer.Option(
         None, "--validation-cutoff", help="Temporal-split validation cutoff (ISO 8601 UTC)."
@@ -581,31 +609,27 @@ def eval_baseline_command(
     """Write the A/B baseline report for one replay dataset (PLAN.md M4).
 
     Never touches the `test` split: `rli.eval.baseline` refuses it outright
-    (PLAN.md M4: "keep final holdouts untouched until M6").
+    (PLAN.md M4: "keep final holdouts untouched until M6"). Splits come from
+    `rli.eval.metrics.split_map_for_dataset`: the assignment frozen on the
+    dataset at build time (or, for an older dataset, reconstructed as of its
+    build), unless `--split-kind` / `--cutoff` / `--validation-cutoff` ask for
+    a deliberate re-split.
     """
     cfg = load_config()
     init_db(db)
     conn = connect(db)
     try:
-        row = conn.execute(
-            "SELECT split_kind, created_at FROM replay_datasets WHERE dataset_id = ?",
-            (dataset,),
-        ).fetchone()
-        kind = split_kind or (row["split_kind"] if row is not None else "company")
-        if kind not in ("temporal", "company"):
+        if split_kind is not None and split_kind not in ("temporal", "company"):
             raise typer.BadParameter(
-                f"unknown split kind {kind!r}; expected 'temporal' or 'company'",
+                f"unknown split kind {split_kind!r}; expected 'temporal' or 'company'",
                 param_hint="--split-kind",
             )
-        moment = _optional_moment(cutoff, "--cutoff")
-        if moment is None:
-            moment = parse_utc(row["created_at"]) if row is not None else now_utc()
-
-        splits = load_split_map(
+        splits, _kind = split_map_for_dataset(
             conn,
-            cutoff=moment,
+            dataset_id=dataset,
+            split_kind=split_kind,  # type: ignore[arg-type]
+            cutoff=_optional_moment(cutoff, "--cutoff"),
             validation_cutoff=_optional_moment(validation_cutoff, "--validation-cutoff"),
-            split_kind=kind,  # type: ignore[arg-type]
         )
         report = baseline_report(conn, cfg, dataset_id=dataset, splits=splits)
         path = write_baseline_report(out, report)

@@ -144,7 +144,13 @@ from rli.eval.report import cost_tier_for
 from rli.eval.runner import STEP_PROBE_RUN
 from rli.models.time import now_utc, parse_utc, to_utc_z
 from rli.policy.action import policy_version
-from rli.policy.splits import DEFAULT_SEED, Split, SplitRow, assign_splits
+from rli.policy.splits import (
+    DEFAULT_SEED,
+    CompanySplitMethod,
+    Split,
+    SplitRow,
+    assign_splits,
+)
 from rli.probes.board_snapshot import BoardSnapshotProbe
 from rli.probes.resolve_posting import ResolvePostingProbe
 
@@ -237,27 +243,50 @@ def load_split_map(
     seed: int = DEFAULT_SEED,
     fractions: tuple[float, float, float] = (0.6, 0.2, 0.2),
     split_kind: Literal["temporal", "company"],
+    company_method: CompanySplitMethod = "greedy",
+    as_of: datetime | None = None,
 ) -> dict[str, Split]:
     """Read every posting's `(company_id, first_observed)` and split it.
 
     Delegates entirely to `rli.policy.splits.assign_splits` — this function
     only supplies the rows and picks which of the two computed splits
-    (`temporal_split` or `company_split`) the caller asked for. A posting
-    with a NULL `first_observed` cannot be assigned (there is no cutoff to
-    compare against) and is simply omitted from the returned mapping; a
-    caller that looks it up gets a missing key, which `collect_cases` then
-    correctly treats as `unassigned` rather than guessing a split for it.
+    (`temporal_split` or `company_split` / `company_split_stable`, by
+    `company_method`) the caller asked for. A posting with a NULL
+    `first_observed` cannot be assigned (there is no cutoff to compare
+    against) and is simply omitted from the returned mapping; a caller that
+    looks it up gets a missing key, which `collect_cases` then correctly
+    treats as `unassigned` rather than guessing a split for it.
+
+    `as_of` restricts the rows to postings that already existed then (row
+    `created_at` and `first_observed` both at or before it). The greedy
+    company split is a function of the whole row set, so this is what
+    reproduces an assignment computed at an earlier moment
+    (`rli.eval.metrics.split_map_for_dataset` for a dataset built before
+    splits were frozen). `postings` rows are never deleted, so the
+    reconstruction is exact except where a later history rebuild moved a
+    posting's `first_observed` earlier.
     """
     if split_kind not in ("temporal", "company"):
         raise ValueError(f"split_kind must be 'temporal' or 'company', got {split_kind!r}")
 
-    rows = conn.execute(
-        """
-        SELECT posting_id, company_id, first_observed
-        FROM postings
-        WHERE first_observed IS NOT NULL
-        """
-    ).fetchall()
+    if as_of is None:
+        rows = conn.execute(
+            """
+            SELECT posting_id, company_id, first_observed
+            FROM postings
+            WHERE first_observed IS NOT NULL
+            """
+        ).fetchall()
+    else:
+        stamp = to_utc_z(as_of)
+        rows = conn.execute(
+            """
+            SELECT posting_id, company_id, first_observed
+            FROM postings
+            WHERE first_observed IS NOT NULL AND first_observed <= ? AND created_at <= ?
+            """,
+            (stamp, stamp),
+        ).fetchall()
 
     split_rows = [
         SplitRow(
@@ -273,6 +302,7 @@ def load_split_map(
         validation_cutoff=validation_cutoff,
         seed=seed,
         fractions=fractions,
+        company_method=company_method,
     )
     if split_kind == "temporal":
         return {a.posting_id: a.temporal_split for a in assignments}

@@ -16,10 +16,11 @@ Rules, each load-bearing:
   earlier" — `date_posted` is the EVENT time (`source_event_at`), never the
   availability time.
 * **Only postings today's capture listed.** Candidates are Lever postings of
-  companies captured successfully in THIS run whose `last_seen_open` is this
-  run's `now`. So the pass only ever reads a page we just saw listed, and a
-  same-day rerun (every company skipped) makes zero page fetches — the
-  collector's idempotency-by-skip contract (`rli.snapshots.daily`) holds.
+  companies captured successfully in THIS run whose `last_seen_open` is that
+  company's capture stamp from this run (stamps are per company: see
+  `rli.snapshots.daily`). So the pass only ever reads a page we just saw
+  listed, and a same-day rerun (every company skipped) makes zero page
+  fetches — the collector's idempotency-by-skip contract holds.
 * **Fetched once.** A row with status `ok` (date obtained) or `no_date`
   (page fetched fine, no usable `datePosted`) is never refetched.
 * **A failed fetch is a coverage gap, nothing more.** It is recorded as
@@ -41,7 +42,7 @@ rate limit and the retry/backoff policy are shared with the board fetches.
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -74,35 +75,38 @@ class PageDateSummary:
 def page_date_candidates(
     conn: sqlite3.Connection,
     *,
-    company_ids: Iterable[str],
-    now: datetime,
+    captures: Mapping[str, datetime],
     limit: int,
     max_attempts: int,
 ) -> list[sqlite3.Row]:
-    """Lever postings listed in this run's capture that still need a page date.
+    """Lever postings listed in this run's captures that still need a page date.
 
-    Newest `first_observed` first; `posting_id` breaks ties so the order never
-    depends on the query plan. A posting is a candidate when it has no
-    `posting_page_dates` row yet, or only a `failed` one with attempts left.
+    `captures` maps each company captured this run to its capture stamp; a
+    posting qualifies only if its `last_seen_open` is its company's stamp,
+    i.e. this run's capture listed it. Newest `first_observed` first;
+    `posting_id` breaks ties so the order never depends on the query plan. A
+    posting is a candidate when it has no `posting_page_dates` row yet, or
+    only a `failed` one with attempts left.
     """
-    ids = sorted(set(company_ids))
-    if not ids or limit <= 0:
+    pairs = sorted((company_id, to_utc_z(stamp)) for company_id, stamp in captures.items())
+    if not pairs or limit <= 0:
         return []
-    placeholders = ",".join("?" for _ in ids)
+    values = ",".join("(?, ?)" for _ in pairs)
     return conn.execute(
         f"""
+        WITH captured (company_id, captured_at) AS (VALUES {values})
         SELECT p.posting_id, p.canonical_url
         FROM postings AS p
+        JOIN captured AS c
+          ON c.company_id = p.company_id AND c.captured_at = p.last_seen_open
         LEFT JOIN posting_page_dates AS d ON d.posting_id = p.posting_id
         WHERE p.ats = 'lever'
-          AND p.company_id IN ({placeholders})
-          AND p.last_seen_open = ?
           AND p.canonical_url LIKE 'https://%'
           AND (d.posting_id IS NULL OR (d.status = 'failed' AND d.attempts < ?))
         ORDER BY p.first_observed DESC, p.posting_id
         LIMIT ?
         """,
-        (*ids, to_utc_z(now), max_attempts, limit),
+        (*[value for pair in pairs for value in pair], max_attempts, limit),
     ).fetchall()
 
 
@@ -157,7 +161,7 @@ def collect_lever_page_dates(
     cfg: Config,
     net: NetClient,
     *,
-    company_ids: Iterable[str],
+    captures: Mapping[str, datetime],
     now: datetime,
 ) -> PageDateSummary:
     """Fetch and store JSON-LD `datePosted` for this run's Lever candidates.
@@ -175,8 +179,7 @@ def collect_lever_page_dates(
     try:
         candidates = page_date_candidates(
             conn,
-            company_ids=company_ids,
-            now=now,
+            captures=captures,
             limit=settings.max_fetches_per_run,
             max_attempts=settings.max_attempts_per_posting,
         )

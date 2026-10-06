@@ -155,6 +155,13 @@ Three details that are judgment calls, and are load-bearing:
   have known. Taking the latest would postpone the claim past the point it
   became knowable, i.e. hide it from replays that should see it.
 
+Ashby's `publishedAt` is held to the same rule. Ashby documents it as "when
+the job was LAST published", so it is not first-publish evidence (it arrives
+as a `last_published` claim, never `first_published`); a re-publish is an
+update of the posting, so it is a refresh CANDIDATE exactly like Greenhouse's
+`updated_at` — corroborated by an observed content-hash change it counts, on
+its own it never makes an old posting recent.
+
 When several `updated_at` claims match, ONE claim is emitted, for the LATEST
 of them: the question the policy asks is "when did this posting last show a
 sign of life". When nothing matches, NOTHING is emitted — silence, never a
@@ -329,6 +336,7 @@ Other judgment calls
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Sequence
 from datetime import datetime, timedelta
@@ -347,7 +355,10 @@ from rli.models.time import ensure_aware, parse_utc, to_utc_z
 from rli.policy.action import PolicyThresholds
 from rli.policy.inputs import (
     CLAIM_BOARD_ABSENT,
+    CLAIM_FIRST_PUBLISHED,
+    CLAIM_LAST_PUBLISHED,
     CLAIM_POSTING_STATE,
+    CLAIM_PUBLISH_AFTER_FIRST_SEEN,
     CLAIM_REFRESHED_AT,
     best_publish_claim,
     derive_policy_inputs,
@@ -367,6 +378,7 @@ __all__ = [
     "CaseState",
     "build_case_state",
     "extend_case_state",
+    "guard_first_published",
     "observed_at",
 ]
 
@@ -395,6 +407,74 @@ REFRESH_MATCH_PROBE = "refresh_match"
 # The claim type the resolver emits for an ATS-reported last-modified time.
 # Only `rli.probes.resolve_posting` emits it, and only for Greenhouse today.
 _CLAIM_UPDATED_AT = "updated_at"
+
+# ATS update timestamps the refresh match may corroborate: Greenhouse
+# `updated_at`, and Ashby `publishedAt` (`last_published`: "when the job was
+# last published"). A re-publish is an update of the posting, so it is held
+# to exactly the same rule — it counts toward recency only when an observed
+# content-hash change coincides with it, never by itself.
+_REFRESH_CANDIDATE_TYPES = frozenset({_CLAIM_UPDATED_AT, CLAIM_LAST_PUBLISHED})
+
+
+def guard_first_published(
+    claims: Sequence[ProbeClaim], first_observed: datetime | None
+) -> list[ProbeClaim]:
+    """Re-label every `first_published` claim dated AFTER `first_observed`.
+
+    `first_observed` is our own earliest sighting of the posting open. A
+    stated first-publication date later than that cannot be the first
+    publication — we had already seen the job listed — so it is not
+    first-publish evidence, whatever its source (an ATS that re-dates a job,
+    a JSON-LD `datePosted` that tracks the last edit). Citing it would make an
+    old posting look recent, the anti-conservative direction for
+    `publish_recency`.
+
+    The claim is kept (source-linked, same timestamps, still subject to the
+    replay gate) under `CLAIM_PUBLISH_AFTER_FIRST_SEEN`, which no policy input
+    reads, rather than dropped: the evidence list then still shows what the
+    source said. Strictly later only — a date equal to the first sighting is
+    consistent with it. A bare calendar date (`"2026-10-02"`, the usual
+    JSON-LD `datePosted`) names a day in the publisher's own time zone and is
+    parsed as UTC midnight, so it is held against `first_observed` only to its
+    precision: it is refused when even the earliest instant that day could
+    start (UTC+14) is after the first sighting. With no `first_observed` (a
+    posting we never collected, or a replay `T` before our first sighting)
+    there is nothing to compare against and every claim passes unchanged.
+    """
+    if first_observed is None:
+        return list(claims)
+    first_observed = ensure_aware(first_observed, "first_observed")
+    guarded: list[ProbeClaim] = []
+    for claim in claims:
+        if claim.claim_type == CLAIM_FIRST_PUBLISHED and claim.source_event_at is not None:
+            earliest = claim.source_event_at
+            if _DATE_ONLY.fullmatch(claim.value.strip()):
+                earliest -= _MAX_UTC_OFFSET
+            if earliest > first_observed:
+                claim = claim.model_copy(update={"claim_type": CLAIM_PUBLISH_AFTER_FIRST_SEEN})
+        guarded.append(claim)
+    return guarded
+
+
+# A calendar date with no time: day precision, in an unknown time zone.
+_DATE_ONLY = re.compile(r"\d{4}-\d{2}-\d{2}")
+# The furthest-ahead civil time zone (UTC+14): the earliest UTC instant at
+# which a local calendar date can begin is its UTC midnight minus this.
+_MAX_UTC_OFFSET = timedelta(hours=14)
+
+
+def _first_observed(row: sqlite3.Row | None) -> datetime | None:
+    """`postings.first_observed` of a collected row, or None.
+
+    Under replay this is read inside `rli.replay.pit.point_in_time`, so it is
+    the first sighting as of `T`, not as of today.
+    """
+    if row is None or row["first_observed"] is None:
+        return None
+    try:
+        return parse_utc(str(row["first_observed"]))
+    except ValueError:
+        return None
 
 
 class CaseState(BaseModel):
@@ -756,7 +836,7 @@ def _refresh_claim(
     candidates = [
         item
         for item in evidence
-        if item.claim_type == _CLAIM_UPDATED_AT
+        if item.claim_type in _REFRESH_CANDIDATE_TYPES
         # "an ATS `updated_at` claim" (spec.md §5 amendment): a page-scraped
         # or archive-derived modification time is not the ATS's own answer,
         # and an unparsed timestamp cannot be placed against an interval.
@@ -799,7 +879,8 @@ def _refresh_claim(
         # The ATS record the timestamp came from — a real, fetchable URL.
         source_url=claim.source_url,
         raw_excerpt=(
-            f"ATS updated_at {to_utc_z(stamp)} coincides (within {refresh_match_days}d) "
+            f"ATS {claim.claim_type} {to_utc_z(stamp)} coincides "
+            f"(within {refresh_match_days}d) "
             f"with a content change observed in {change.source} between "
             f"{to_utc_z(change.start)} (hash {change.old_hash[:12]}) and "
             f"{to_utc_z(change.end)} (hash {change.new_hash[:12]})"
@@ -871,7 +952,11 @@ def build_case_state(
         # one claim without which the observed state is not evidence-backed.
         claims=[
             _posting_state_claim(data, canonical_url, now),
-            *list(data.get("evidence") or []),
+            # A stated first-publication date later than our own first
+            # sighting cannot be one (`guard_first_published`).
+            *guard_first_published(
+                list(data.get("evidence") or []), _first_observed(collected_row)
+            ),
         ],
         posting_id=evidence_posting_id,
     )
@@ -924,7 +1009,9 @@ def build_case_state(
     # claims `resolve_posting` said something it did not.
     for extra_probe, extra_claims in probes.always_run_extra():
         evidence += probes.save_evidence(
-            probe=extra_probe, claims=extra_claims, posting_id=evidence_posting_id
+            probe=extra_probe,
+            claims=guard_first_published(extra_claims, _first_observed(collected_row)),
+            posting_id=evidence_posting_id,
         )
 
     # -- the refresh match (module docstring: "The refresh match") --------

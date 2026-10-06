@@ -112,7 +112,7 @@ def test_greenhouse_board_listing_dates_reach_boardjob(ctx_factory) -> None:
 
 
 @respx.mock
-def test_ashby_published_at_maps_to_first_published(ctx_factory) -> None:
+def test_ashby_published_at_maps_to_last_published_never_first(ctx_factory) -> None:
     respx.get(ASHBY_BOARD_URL).mock(
         return_value=httpx.Response(
             200,
@@ -130,7 +130,9 @@ def test_ashby_published_at_maps_to_first_published(ctx_factory) -> None:
     )
     result = board_snapshot("ashby", "acme", ctx_factory())
     (only,) = result.data["jobs"]
-    assert only.first_published == "2026-08-01T12:00:00.000Z"
+    # Ashby documents `publishedAt` as "when the job was LAST published".
+    assert only.last_published == "2026-08-01T12:00:00.000Z"
+    assert only.first_published is None
     assert only.updated_at is None  # Ashby documents no updatedAt
 
 
@@ -210,12 +212,12 @@ def test_daily_snapshot_persists_greenhouse_and_ashby_dates(
     assert summary.companies_ok == 2
 
     stored = {
-        row["job_id"]: (row["first_published"], row["updated_at"])
+        row["job_id"]: (row["first_published"], row["updated_at"], row["last_published"])
         for row in conn.execute("SELECT * FROM board_snapshot_jobs")
     }
     assert stored == {
-        "11": ("2026-08-20T10:00:00.000000Z", "2026-08-30T10:00:00.000000Z"),
-        "ab-1": ("2026-08-01T00:00:00.000000Z", None),
+        "11": ("2026-08-20T10:00:00.000000Z", "2026-08-30T10:00:00.000000Z", None),
+        "ab-1": (None, None, "2026-08-01T00:00:00.000000Z"),
     }
     # No Lever target -> no page fetch was even considered.
     assert summary.page_dates.attempted == 0
@@ -244,7 +246,8 @@ def _build_v3_database(path: Path) -> None:
     columns = (
         "    url                 TEXT,\n"
         "    first_published     TEXT,\n"
-        "    updated_at          TEXT\n"
+        "    updated_at          TEXT,\n"
+        "    last_published      TEXT\n"
     )
     assert columns in sql
     sql = sql.replace(columns, "    url                 TEXT\n")
@@ -292,8 +295,8 @@ def test_version_3_database_upgrades_to_4_and_a_second_run_is_a_no_op(tmp_path: 
 
     conn = connect(path)
     try:
-        assert SCHEMA_VERSION == 4
-        assert schema_version(conn) == 4
+        assert SCHEMA_VERSION >= 4
+        assert schema_version(conn) == SCHEMA_VERSION
         assert {"first_published", "updated_at"} <= _columns(conn, "board_snapshot_jobs")
         assert "attempts" in _columns(conn, "posting_page_dates")
         row = conn.execute("SELECT * FROM board_snapshot_jobs").fetchone()
@@ -316,7 +319,7 @@ def test_migration_skips_a_column_a_previous_attempt_already_added(tmp_path: Pat
 
     conn = connect(path)
     try:
-        assert schema_version(conn) == 4
+        assert schema_version(conn) == SCHEMA_VERSION
         assert {"first_published", "updated_at"} <= _columns(conn, "board_snapshot_jobs")
     finally:
         conn.close()
@@ -347,12 +350,12 @@ def _seed_dated(conn: sqlite3.Connection) -> None:
     add_capture(
         conn,
         NOW - timedelta(days=20),
-        [_dated(OPEN_JOB, "2026-08-10T09:00:00Z", "2026-08-15T09:00:00Z")],
+        [_dated(OPEN_JOB, "2026-07-01T09:00:00Z", "2026-08-15T09:00:00Z")],
     )
     add_capture(
         conn,
         NOW - timedelta(days=5),
-        [_dated(OPEN_JOB, "2026-08-10T09:00:00Z", "2026-09-01T09:00:00Z")],
+        [_dated(OPEN_JOB, "2026-07-01T09:00:00Z", "2026-09-01T09:00:00Z")],
     )
 
 
@@ -370,7 +373,7 @@ def test_date_claim_is_available_from_the_earliest_capture_that_carried_it(
 
     published = claims["first_published"]
     assert published.source_quality == "ats_native"
-    assert published.source_event_at == datetime(2026, 8, 10, 9, tzinfo=UTC)
+    assert published.source_event_at == datetime(2026, 7, 1, 9, tzinfo=UTC)
     # Carried by both the -20 and the -5 capture: the EARLIEST wins.
     assert published.available_at == NOW - timedelta(days=20)
     assert published.source_url == f"https://boards.greenhouse.io/{TENANT}/jobs/{OPEN_JOB}"
@@ -394,7 +397,7 @@ def test_archive_captures_never_supply_a_date(conn: sqlite3.Connection) -> None:
     add_capture(
         conn,
         NOW - timedelta(days=20),
-        [_dated(OPEN_JOB, "2026-08-10T09:00:00Z")],
+        [_dated(OPEN_JOB, "2026-07-01T09:00:00Z")],
         source="archive",
     )
     assert capture_date_claims(conn, OPEN_POSTING, NOW) == []
@@ -499,7 +502,8 @@ def test_q2_turns_strong_at_an_archive_era_t_once_a_capture_carried_the_date(
     ]
     verdict = evidence_quality_detail(case.evidence, case.inputs, case.failures)
     assert verdict.quality == "strong", verdict.detail
-    assert case.inputs.publish_recency == "recent"  # 2026-08-10 is 13 days before T
+    # 2026-07-01 is 53 days before T: decided (not UNKNOWN), and not recent.
+    assert case.inputs.publish_recency == "not_recent"
 
     # T = -30: no capture at or before T carried a date -> still weak by Q2.
     early = case_state_at(conn, cfg, OPEN_POSTING, NOW - timedelta(days=30), DATASET)
@@ -711,3 +715,34 @@ def test_an_unexpected_page_error_never_fails_the_snapshot(lever_conn, cfg) -> N
     assert (summary.companies_ok, summary.postings_new) == (1, 1)
     row = _page_rows(lever_conn)["lever:lev:a"]
     assert row["status"] == "failed"
+
+
+@respx.mock
+def test_page_date_pass_finds_postings_by_their_own_company_capture_stamp(lever_conn, cfg) -> None:
+    """Captures are stamped per company (real fetch time), not with the run start.
+
+    The pass must still find the postings this run's capture listed — their
+    `last_seen_open` is their company's stamp — and the page date it stores is
+    available from the page fetch's own time, after that capture.
+    """
+    respx.get(LEVER_BOARD_URL).mock(return_value=httpx.Response(200, json=[_lever_job("a")]))
+    page = respx.get("https://jobs.lever.co/lev/a").mock(
+        return_value=httpx.Response(200, text=_jsonld_page("2026-08-25"))
+    )
+    fetched = DAY1 + timedelta(hours=6)
+    ticks = iter([DAY1, fetched])
+
+    def clock() -> datetime:
+        return next(ticks, fetched)
+
+    summary = run_daily_snapshot(
+        lever_conn, _fast(cfg), [LEVER_TARGET], DAY1, sleep=_no_sleep, clock=clock
+    )
+    assert (summary.page_dates.attempted, summary.page_dates.dated) == (1, 1)
+    assert page.call_count == 1
+    posting = lever_conn.execute(
+        "SELECT last_seen_open FROM postings WHERE posting_id = 'lever:lev:a'"
+    ).fetchone()
+    assert posting["last_seen_open"] == to_utc_z(fetched)
+    row = _page_rows(lever_conn)["lever:lev:a"]
+    assert parse_utc(row["fetched_at"]) > fetched  # the real page fetch, after the capture

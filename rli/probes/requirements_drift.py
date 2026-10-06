@@ -337,8 +337,6 @@ def _insufficient_history(
 
 def requirements_drift(posting_id: str, ctx: ProbeContext) -> ProbeResult:
     """Pure function backing `RequirementsDriftProbe.run` (spec.md §4)."""
-    now = ctx.now()
-
     row = posting_row(ctx.conn, posting_id)
     if row is None:
         return ProbeResult(
@@ -361,6 +359,9 @@ def requirements_drift(posting_id: str, ctx: ProbeContext) -> ProbeResult:
     archive_body, archive_status = _fetch_archive_body(
         archive_row["capture_url"] if archive_row is not None else None, ctx
     )
+    # Read the clock AFTER both fetches: the comparison is available once we
+    # hold what it compares (spec.md §3), not from when the probe started.
+    now = ctx.now()
 
     prior_hash, prior_captured_at = _prior_description(ctx.conn, company_id, row["ats_job_id"])
 

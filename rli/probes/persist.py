@@ -101,8 +101,8 @@ def save_board_snapshot(
         """
         INSERT INTO board_snapshot_jobs
             (board_snapshot_id, job_id, title, team, location, description_hash, url,
-             first_published, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             first_published, updated_at, last_published)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             (
@@ -115,6 +115,7 @@ def save_board_snapshot(
                 job.url,
                 _normalized_stamp(job.first_published),
                 _normalized_stamp(job.updated_at),
+                _normalized_stamp(job.last_published),
             )
             for job in jobs
         ],

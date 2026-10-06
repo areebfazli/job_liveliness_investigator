@@ -4,10 +4,14 @@ Steps (spec.md §4 "Always run" table + this task's spec):
 
 1. `detect_ats(url)` to classify the ATS and extract tenant/job id.
 2. If the ATS has an adapter (Greenhouse/Ashby/Lever), fetch it and look for
-   the target job — its documented `ats_native` publish date (Greenhouse,
-   Ashby) becomes evidence; Lever's undocumented dates never do (spec.md §3).
+   the target job — its documented `ats_native` dates become evidence:
+   Greenhouse `first_published` / `updated_at`, and Ashby `publishedAt` as
+   `last_published` (Ashby documents it as "when the job was LAST
+   published", so it is never a first-publish claim); Lever's undocumented
+   dates never do (spec.md §3).
 3. Fetch the canonical job page and look for `JobPosting` JSON-LD regardless
-   of ATS, since it can carry `datePosted` (`page_structured`),
+   of ATS, since it can carry `datePosted` (`page_structured`; on an Ashby
+   page it is `publishedAt` again, so it is labelled `last_published`),
    `validThrough` (`declared_expiry`), and a company-domain candidate that
    the ATS APIs never provide.
 4. Emit `ProbeClaim`s (ids are assigned by the caller, not here) plus the
@@ -68,9 +72,12 @@ def _claim(
     )
 
 
-def _resolve_greenhouse(ref: AtsRef, ctx: ProbeContext, now):
+def _resolve_greenhouse(ref: AtsRef, ctx: ProbeContext):
     net = ctx.net_client("resolve_posting")
     fetch = greenhouse.fetch_job(net, ref.tenant, ref.job_id)  # type: ignore[arg-type]
+    # Read the clock AFTER the fetch: a claim is available once we hold it
+    # (spec.md §3), never from the moment we set out to fetch it.
+    now = ctx.now()
     claims: list[ProbeClaim] = []
     title: str | None = None
     canonical_url = ref.canonical_url
@@ -114,9 +121,12 @@ def _resolve_greenhouse(ref: AtsRef, ctx: ProbeContext, now):
     return posting_state, title, canonical_url, claims, ok, retryable, error
 
 
-def _resolve_ashby(ref: AtsRef, ctx: ProbeContext, now):
+def _resolve_ashby(ref: AtsRef, ctx: ProbeContext):
     net = ctx.net_client("resolve_posting")
     fetch = ashby.fetch_board(net, ref.tenant)  # type: ignore[arg-type]
+    # Read the clock AFTER the fetch: a claim is available once we hold it
+    # (spec.md §3), never from the moment we set out to fetch it.
+    now = ctx.now()
     claims: list[ProbeClaim] = []
     title: str | None = None
     canonical_url = ref.canonical_url
@@ -131,10 +141,15 @@ def _resolve_ashby(ref: AtsRef, ctx: ProbeContext, now):
             posting_state = "open"
             title = job.title
             canonical_url = job.job_url or canonical_url
+            # Ashby documents `publishedAt` as "when the job was LAST
+            # published": a re-publish moves it, so it is NOT first-publish
+            # evidence. It is emitted as `last_published`, an ATS update
+            # timestamp that `rli.eval.case._refresh_claim` may turn into a
+            # refresh only when an observed content change corroborates it.
             if job.published_at_dt is not None:
                 claims.append(
                     _claim(
-                        claim_type="first_published",
+                        claim_type="last_published",
                         value=job.published_at,
                         source_url=canonical_url,
                         source_quality="ats_native",
@@ -150,9 +165,12 @@ def _resolve_ashby(ref: AtsRef, ctx: ProbeContext, now):
     return posting_state, title, canonical_url, claims, ok, retryable, error
 
 
-def _resolve_lever(ref: AtsRef, ctx: ProbeContext, now):
+def _resolve_lever(ref: AtsRef, ctx: ProbeContext):
     net = ctx.net_client("resolve_posting")
     fetch = lever.fetch_board(net, ref.tenant)  # type: ignore[arg-type]
+    # Read the clock AFTER the fetch: a claim is available once we hold it
+    # (spec.md §3), never from the moment we set out to fetch it.
+    now = ctx.now()
     claims: list[ProbeClaim] = []
     title: str | None = None
     canonical_url = ref.canonical_url
@@ -193,9 +211,12 @@ def _resolve_lever(ref: AtsRef, ctx: ProbeContext, now):
     return posting_state, title, canonical_url, claims, ok, retryable, error
 
 
-def _resolve_jsonld(canonical_url: str, ctx: ProbeContext, now):
+def _resolve_jsonld(canonical_url: str, ctx: ProbeContext, *, date_posted_claim: str):
     net = ctx.net_client("json_ld")
     fetch = jsonld.fetch_job_posting(net, canonical_url)
+    # Read the clock AFTER the fetch: a claim is available once we hold it
+    # (spec.md §3), never from the moment we set out to fetch it.
+    now = ctx.now()
     claims: list[ProbeClaim] = []
     company_domain: str | None = None
     title: str | None = None
@@ -207,7 +228,7 @@ def _resolve_jsonld(canonical_url: str, ctx: ProbeContext, now):
         if posting.date_posted is not None:
             claims.append(
                 _claim(
-                    claim_type="first_published",
+                    claim_type=date_posted_claim,
                     value=posting.date_posted_raw or posting.date_posted.isoformat(),
                     source_url=fetch.url,
                     source_quality="page_structured",
@@ -232,7 +253,6 @@ def _resolve_jsonld(canonical_url: str, ctx: ProbeContext, now):
 
 def resolve_posting(url: str, ctx: ProbeContext) -> ProbeResult:
     """Pure function backing `ResolvePostingProbe.run` (spec.md §4)."""
-    now = ctx.now()
     ref = detect_ats(url)
     if ref is None:
         return ProbeResult(
@@ -259,23 +279,30 @@ def resolve_posting(url: str, ctx: ProbeContext) -> ProbeResult:
 
     if ref.ats == "greenhouse":
         posting_state, title, canonical_url, ats_claims, ok, retryable, error = _resolve_greenhouse(
-            ref, ctx, now
+            ref, ctx
         )
         claims.extend(ats_claims)
     elif ref.ats == "ashby":
         posting_state, title, canonical_url, ats_claims, ok, retryable, error = _resolve_ashby(
-            ref, ctx, now
+            ref, ctx
         )
         claims.extend(ats_claims)
     elif ref.ats == "lever":
         posting_state, title, canonical_url, ats_claims, ok, retryable, error = _resolve_lever(
-            ref, ctx, now
+            ref, ctx
         )
         claims.extend(ats_claims)
     # generic: no ATS adapter; JSON-LD below is the only signal.
 
+    # An Ashby-hosted job page renders `publishedAt` as its JSON-LD
+    # `datePosted` (the same calendar day on every one of 1,160 resolver runs
+    # that recorded both), so on an Ashby page it is the LAST publish date
+    # too, and is labelled as such. Everywhere else it stays a first-publish
+    # claim, still subject to `rli.eval.case.guard_first_published`.
     jsonld_fetch, jsonld_title, company_domain, jsonld_claims = _resolve_jsonld(
-        canonical_url, ctx, now
+        canonical_url,
+        ctx,
+        date_posted_claim="last_published" if ref.ats == "ashby" else "first_published",
     )
     claims.extend(jsonld_claims)
     if title is None:

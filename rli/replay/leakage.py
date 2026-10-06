@@ -22,6 +22,25 @@ The five checks, and why each is the right question
   store are different code paths and only the store is what a later report
   reads.
 
+* **`evidence_fetched_after_t`** — an `evidence` row of a replay run that
+  passed the gate (`available_at <= T`) although the network fetch behind it
+  really completed AFTER `T`. `evidence_after_t` cannot see this: it trusts
+  the stamp, and the stamp is exactly what was wrong in datasets built before
+  the builder read a real clock — every live observation of a two-hour build
+  was stamped with the build's START, so a case at `T` = build start was
+  shown data fetched up to two hours later. The truth is in `tool_cache`,
+  which records each fetch's real `fetched_at`. For every network probe
+  (`resolve_posting`, `board_snapshot`, `requirements_drift`) whose evidence
+  a run kept, the checker rebuilds the `tool_cache` keys the stored record's
+  fetches used (the adapters' own URL construction, through a recorder that
+  fetches nothing), and asks: could a cached row have served the fetch at the
+  claim's `available_at` (`fetched_at <= available_at < expires_at`)? If
+  not, the first row written within `_FETCH_MATCH_WINDOW` after
+  `available_at` is the real fetch; if that is after `T`, the run saw the
+  future. One finding per `(run, probe)`. With no matching `tool_cache` row
+  (a build with the tool cache off) the rule is silent — it can only convict
+  on a record that exists.
+
 * **`cache_miss`** — a `run_steps` row of a replay run with
   `cache_status = 'miss'` on a TOOL row, i.e. on any `component` other than
   `'model'`. `rli.eval.runner` defines `'miss'` as "at least one call
@@ -332,6 +351,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from pydantic import BaseModel, ConfigDict
@@ -342,6 +362,8 @@ from rli.events.policy_signals import (
     COMPANY_EVENTS_PROBE,
     EVENT_CLAIM_TYPES,
 )
+from rli.models.time import parse_utc, to_utc_z
+from rli.net import NetResult, hash_args
 from rli.policy.action import PRECEDENCE
 from rli.policy.inputs import (
     CLAIM_DECLARED_EXPIRY,
@@ -350,8 +372,13 @@ from rli.policy.inputs import (
     CLAIM_REFRESHED_AT,
     CLAIM_TEAM_SIGNAL,
 )
+from rli.probes.board_snapshot import BoardSnapshotProbe
+from rli.probes.lookups import posting_row
+from rli.probes.requirements_drift import RequirementsDriftProbe
+from rli.probes.resolve_posting import ResolvePostingProbe
 from rli.probes.team_signal import TeamSignalProbe
 from rli.replay.mode import STEP_REPLAY_VIOLATION
+from rli.resolvers import ashby, greenhouse, jsonld, lever
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from rli.replay.mode import ReplayNetPool
@@ -371,12 +398,114 @@ ViolationKind = str
 #: assert on the set rather than restate the strings.
 VIOLATION_KINDS: tuple[str, ...] = (
     "evidence_after_t",
+    "evidence_fetched_after_t",
     "cache_miss",
     "net_call",
     "missing_probe_result",
     "missing_replay_at",
     "input_without_evidence",
 )
+
+#: Probes whose stored record was made by LIVE fetches during the build, and
+#: whose evidence `evidence_fetched_after_t` therefore checks against
+#: `tool_cache`. Every other probe reads only local tables.
+_NETWORK_PROBES: tuple[str, ...] = (
+    ResolvePostingProbe.name,
+    BoardSnapshotProbe.name,
+    RequirementsDriftProbe.name,
+)
+
+#: How long after a claim's `available_at` a `tool_cache` row may be written
+#: and still be taken as THE fetch behind it. A build makes each fetch within
+#: minutes to hours of its (old, build-start) stamp; a day bounds that with
+#: room while keeping an unrelated live run days later from being blamed.
+_FETCH_MATCH_WINDOW = timedelta(hours=24)
+
+_RECORDER_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+class _FetchKeyRecorder:
+    """A stand-in `NetClient` that fetches nothing and records cache keys.
+
+    Handed to the `rli.resolvers` adapters so the `tool_cache` key of every
+    GET is computed by the adapters' OWN URL construction and by
+    `NetClient.get`'s own `hash_args(probe, url=, params=)` — never restated
+    here. Every call fails, so an adapter never proceeds past its first GET.
+    """
+
+    def __init__(self, probe: str) -> None:
+        self.probe = probe
+        self.keys: list[tuple[str, str]] = []
+
+    def get(self, url: str, *, params: dict[str, str] | None = None, **_: Any) -> NetResult:
+        self.keys.append((self.probe, hash_args(self.probe, url=url, params=params or {})))
+        return NetResult(
+            ok=False, status=None, body=None, url=url, fetched_at=_RECORDER_EPOCH, error="x"
+        )
+
+
+def _ats_fetch_keys(
+    probe: str, ats: object, tenant: object, job_id: object
+) -> list[tuple[str, str]]:
+    """The `tool_cache` keys of the ATS fetch `probe` makes for one posting."""
+    if not isinstance(tenant, str) or not tenant:
+        return []
+    recorder = _FetchKeyRecorder(probe)
+    if ats == "greenhouse":
+        if isinstance(job_id, str) and job_id:
+            greenhouse.fetch_job(recorder, tenant, job_id)  # type: ignore[arg-type]
+        else:
+            greenhouse.fetch_board(recorder, tenant)  # type: ignore[arg-type]
+    elif ats == "ashby":
+        ashby.fetch_board(recorder, tenant)  # type: ignore[arg-type]
+    elif ats == "lever":
+        lever.fetch_board(recorder, tenant)  # type: ignore[arg-type]
+    return recorder.keys
+
+
+def _record_fetch_keys(
+    conn: sqlite3.Connection, probe_name: str, fields: dict[str, Any]
+) -> list[tuple[str, str]]:
+    """The `tool_cache` keys of the fetches behind one stored record.
+
+    `fields` are the record's top-level `data` values the fetches were built
+    from (`ats`, `tenant`, `job_id`, `canonical_url`, `posting_id`).
+    """
+    if probe_name == ResolvePostingProbe.name:
+        keys = _ats_fetch_keys(
+            probe_name, fields.get("ats"), fields.get("tenant"), fields.get("job_id")
+        )
+        canonical = fields.get("canonical_url")
+        if isinstance(canonical, str) and canonical.startswith("http"):
+            recorder = _FetchKeyRecorder("json_ld")
+            jsonld.fetch_job_posting(recorder, canonical)  # type: ignore[arg-type]
+            keys += recorder.keys
+        return keys
+    if probe_name == BoardSnapshotProbe.name:
+        return _ats_fetch_keys(probe_name, fields.get("ats"), fields.get("tenant"), None)
+    if probe_name == RequirementsDriftProbe.name:
+        posting_id = fields.get("posting_id")
+        row = posting_row(conn, posting_id) if isinstance(posting_id, str) else None
+        if row is None:
+            return []
+        return _ats_fetch_keys(probe_name, row["ats"], row["ats_tenant_id"], row["ats_job_id"])
+    return []
+
+
+def _real_fetch_after(rows: list[tuple[str, str]], available_at: str) -> str | None:
+    """When the fetch behind a claim stamped `available_at` really happened, if later.
+
+    `rows` are one key's `(fetched_at, expires_at)` `tool_cache` rows. `None`
+    when a row could have served the fetch from cache at `available_at` (the
+    data was then genuinely held by that time) or when no row was written
+    within `_FETCH_MATCH_WINDOW` after it (nothing to convict on).
+    """
+    if any(fetched <= available_at < expires for fetched, expires in rows):
+        return None
+    limit = to_utc_z(parse_utc(available_at) + _FETCH_MATCH_WINDOW)
+    later = [fetched for fetched, _ in rows if available_at < fetched <= limit]
+    return min(later) if later else None
+
 
 #: The one `run_steps.component` spec.md §6 exempts from the `cache_miss`
 #: rule ("live **LLM** calls are allowed on cache miss"). See the docstring.
@@ -763,6 +892,92 @@ def check_dataset(
             f"({row['claim_type']}) has available_at={row['available_at']} > "
             f"T={row['replay_at']}",
         )
+
+    # -- rule 1b: the stamp itself was backdated ------------------------------
+    # See `evidence_fetched_after_t` in the module docstring.
+    cases_by_identity = {
+        (str(row["canonical_url"]), str(row["replay_at"])): str(row["posting_id"])
+        for row in conn.execute(
+            "SELECT posting_id, replay_at, canonical_url FROM replay_cases WHERE dataset_id = ?",
+            (dataset_id,),
+        ).fetchall()
+    }
+    network_placeholders = ",".join("?" for _ in _NETWORK_PROBES)
+    record_fields: dict[tuple[str, str, str], dict[str, Any]] = {
+        (str(row["posting_id"]), str(row["replay_at"]), str(row["probe_name"])): {
+            "ats": row["ats"],
+            "tenant": row["tenant"],
+            "job_id": row["job_id"],
+            "canonical_url": row["canonical_url"],
+            "posting_id": row["record_posting_id"],
+        }
+        for row in conn.execute(
+            f"""
+            SELECT posting_id, replay_at, probe_name,
+                   json_extract(data, '$.ats') AS ats,
+                   json_extract(data, '$.tenant') AS tenant,
+                   json_extract(data, '$.job_id') AS job_id,
+                   json_extract(data, '$.canonical_url') AS canonical_url,
+                   json_extract(data, '$.posting_id') AS record_posting_id
+            FROM replay_probe_results
+            WHERE dataset_id = ? AND probe_name IN ({network_placeholders})
+            """,
+            (dataset_id, *_NETWORK_PROBES),
+        ).fetchall()
+    }
+    cache_rows: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    keys_by_record: dict[tuple[str, str, str], list[tuple[str, str]]] = {}
+    for row in conn.execute(
+        f"""
+        SELECT e.run_id AS run_id, e.probe AS probe, COUNT(*) AS n,
+               MAX(e.available_at) AS available_at
+        FROM evidence AS e
+        JOIN runs AS r ON r.id = e.run_id
+        WHERE e.run_id IN ({placeholders})
+          AND r.replay_at IS NOT NULL
+          AND e.available_at <= r.replay_at
+          AND e.probe IN ({network_placeholders})
+        GROUP BY e.run_id, e.probe
+        ORDER BY e.run_id, e.probe
+        """,
+        (*run_ids, *_NETWORK_PROBES),
+    ).fetchall():
+        run = by_id[row["run_id"]]
+        replay_at = str(run["replay_at"])
+        posting_id = cases_by_identity.get((str(run["input_url"]), replay_at))
+        if posting_id is None:
+            continue
+        record_key = (posting_id, replay_at, str(row["probe"]))
+        fields = record_fields.get(record_key)
+        if fields is None:
+            continue
+        keys = keys_by_record.get(record_key)
+        if keys is None:
+            keys = _record_fetch_keys(conn, record_key[2], fields)
+            keys_by_record[record_key] = keys
+        stamp = str(row["available_at"])
+        real: list[str] = []
+        for key in keys:
+            if key not in cache_rows:
+                cache_rows[key] = [
+                    (str(c["fetched_at"]), str(c["expires_at"]))
+                    for c in conn.execute(
+                        "SELECT fetched_at, expires_at FROM tool_cache "
+                        "WHERE probe = ? AND args_hash = ? ORDER BY fetched_at",
+                        key,
+                    ).fetchall()
+                ]
+            fetched = _real_fetch_after(cache_rows[key], stamp)
+            if fetched is not None:
+                real.append(fetched)
+        if real and max(real) > replay_at:
+            record(
+                "evidence_fetched_after_t",
+                run,
+                f"{row['n']} evidence row(s) from probe {row['probe']!r} are stamped "
+                f"available_at={stamp} <= T={replay_at}, but tool_cache shows the fetch "
+                f"behind them completed at {max(real)}, after T",
+            )
 
     # -- rules 3 and the dataset-gap check --------------------------------
     steps_checked = int(

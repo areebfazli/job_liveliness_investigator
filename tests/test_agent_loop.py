@@ -68,7 +68,9 @@ from rli.agent.loop import (
     STEP_EXPLANATION,
     STEP_INVESTIGATOR,
     STEP_PROBE_RETRY,
+    STEP_RUN_FLAG_INVESTIGATOR_ERROR,
     c_config_hash,
+    investigator_error_run_ids,
     make_system_c,
     parse_tokens,
     run_system_c,
@@ -167,7 +169,7 @@ def test_step_cap_stops_the_loop_after_exactly_max_steps_probes(
     """
     job_id = "9101"
     posting_id = seed_reposted_history(conn, job_id, now=NOW)
-    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
+    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=61))
     llm = scripted_llm([propose("repost_history", posting_id=posting_id)] * 3, cfg=cfg)
 
     result = _run_c(conn, cfg, job_id, llm, max_steps=1)
@@ -195,7 +197,7 @@ def test_step_cap_of_zero_stops_before_paying_for_an_investigator_call(
     """
     job_id = "9102"
     posting_id = seed_reposted_history(conn, job_id, now=NOW)
-    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
+    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=61))
     llm = scripted_llm([propose("repost_history", posting_id=posting_id)] * 3, cfg=cfg)
 
     result = _run_c(conn, cfg, job_id, llm, max_steps=0)
@@ -251,7 +253,7 @@ def test_cost_cap_stops_the_loop_and_bounds_what_the_loop_spends(
     capped = cfg.model_copy(update={"agent": cfg.agent.model_copy(update={"max_cost_usd": 0.018})})
     job_id = "9103"
     posting_id = seed_reposted_history(conn, job_id, now=NOW)
-    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
+    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=61))
     llm = scripted_llm(
         [
             propose("repost_history", posting_id=posting_id),
@@ -323,7 +325,7 @@ def test_the_loop_refuses_an_investigator_call_it_cannot_afford(
     capped = cfg.model_copy(update={"agent": cfg.agent.model_copy(update={"max_cost_usd": 0.014})})
     job_id = "9116"
     posting_id = seed_reposted_history(conn, job_id, now=NOW)
-    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
+    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=61))
     llm = scripted_llm(
         [
             propose("repost_history", posting_id=posting_id),
@@ -365,7 +367,7 @@ def test_invalid_probe_arguments_are_rejected_and_the_probe_never_runs(
     """
     job_id = "9104"
     seed_reposted_history(conn, job_id, now=NOW)
-    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
+    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=61))
     llm = scripted_llm([propose("repost_history")], cfg=cfg)
 
     result = _run_c(conn, cfg, job_id, llm)
@@ -410,7 +412,7 @@ def test_proposing_the_same_probe_and_arguments_twice_is_rejected_as_duplicate(
     """
     job_id = "9105"
     posting_id = seed_reposted_history(conn, job_id, now=NOW)
-    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
+    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=61))
     llm = scripted_llm([propose("repost_history", posting_id=posting_id)] * 2, cfg=cfg)
 
     result = _run_c(conn, cfg, job_id, llm)
@@ -465,7 +467,7 @@ def test_the_loop_skips_the_wasted_second_call_when_one_probe_exhausts_the_case(
     )
     job_id = "9106"
     seed_history(conn, job_id, now=NOW)
-    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
+    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=61))
     llm = scripted_llm(
         [propose("company_events", company_id=COMPANY, as_of=NOW.isoformat())], cfg=disabled
     )
@@ -505,7 +507,7 @@ def test_a_second_new_eligible_probe_still_earns_a_second_investigator_call(
     job_id = "9142"
     posting_id = seed_history(conn, job_id, now=NOW)
     add_posting(conn, job_id=f"{job_id}-hire", first_observed=NOW - timedelta(days=5))
-    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
+    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=61))
     llm = scripted_llm(
         [
             propose(
@@ -555,7 +557,7 @@ def test_an_ineligible_probe_is_rejected_even_with_valid_arguments(
     )
     job_id = "9106"
     posting_id = seed_reposted_history(conn, job_id, now=NOW)
-    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
+    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=61))
     llm = scripted_llm(
         [propose("team_signal", posting_id=posting_id, company_id=COMPANY, as_of=NOW.isoformat())],
         cfg=disabled_cfg,
@@ -644,7 +646,7 @@ def test_an_investigator_failure_still_yields_the_frozen_policy_decision(
     """
     job_id = "9108"
     seed_reposted_history(conn, job_id, now=NOW)
-    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
+    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=61))
     llm = scripted_llm([failure], cfg=cfg)
 
     result = _run_c(conn, cfg, job_id, llm)
@@ -668,7 +670,15 @@ def test_an_investigator_failure_still_yields_the_frozen_policy_decision(
     assert row["status"] == "completed"
     assert Decision.model_validate(result.decision.model_dump()) == result.decision
 
+    # The run still COMPLETES with an ordinary-looking decision, so it must be
+    # countable from the trace alone: one run-level flag row (no error text of
+    # its own — the failure is already on the model step above).
+    flags = [r for r in steps if r["decision_type"] == STEP_RUN_FLAG_INVESTIGATOR_ERROR]
+    assert [(r["component"], r["error"]) for r in flags] == [("controller", None)]
+    assert investigator_error_run_ids(conn) == {result.run_id}
+
     baseline = _run_c(conn, cfg, job_id, scripted_llm(cfg=cfg), max_steps=0)
+    assert investigator_error_run_ids(conn, [result.run_id, baseline.run_id]) == {result.run_id}
     assert result.decision.recommended_action == baseline.decision.recommended_action
     assert result.decision.posting_state == baseline.decision.posting_state
     assert result.decision.recheck_after_days == baseline.decision.recheck_after_days
@@ -707,7 +717,7 @@ def test_a_second_identical_run_is_served_entirely_from_llm_cache(
     """
     job_id = "9109"
     posting_id = seed_reposted_history(conn, job_id, now=NOW)
-    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
+    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=61))
     inner = scripted_llm(
         [
             propose("repost_history", posting_id=posting_id),
@@ -766,7 +776,7 @@ def test_a_healthy_run_writes_the_full_ordered_trace(conn: sqlite3.Connection, c
     """
     job_id = "9110"
     posting_id = seed_reposted_history(conn, job_id, now=NOW)
-    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
+    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=61))
     llm = scripted_llm(
         [
             propose("repost_history", posting_id=posting_id),
@@ -877,7 +887,7 @@ def test_c_agrees_with_a_when_it_chooses_the_same_probes(
     """
     job_id = "9111"
     posting_id = seed_reposted_history(conn, job_id, now=NOW)
-    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
+    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=61))
     llm = scripted_llm(
         [
             propose("repost_history", posting_id=posting_id),
@@ -935,7 +945,7 @@ def test_make_system_c_has_the_exact_ab_call_shape_and_the_same_result(
 
     job_id = "9112"
     posting_id = seed_reposted_history(conn, job_id, now=NOW)
-    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
+    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=61))
 
     direct = _run_c(
         conn, cfg, job_id, scripted_llm([propose("repost_history", posting_id=posting_id)], cfg=cfg)
@@ -994,7 +1004,7 @@ def test_a_retryable_probe_failure_is_retried_exactly_max_probe_retries_times(
 
     def flaky(job_id: str) -> Callable[[httpx.Request], httpx.Response]:
         """200 for the always-run resolver's one call, then 503 for everything after."""
-        payload = gh_job(job_id, now=NOW, first_published_days_ago=40)
+        payload = gh_job(job_id, now=NOW, first_published_days_ago=61)
         seen: list[int] = []
 
         def responder(_request: httpx.Request) -> httpx.Response:
@@ -1011,7 +1021,7 @@ def test_a_retryable_probe_failure_is_retried_exactly_max_probe_retries_times(
         posting_ids[job_id] = seed_reposted_history(conn, job_id, now=NOW)
         mock_greenhouse(
             job_id,
-            gh_job(job_id, now=NOW, first_published_days_ago=40),
+            gh_job(job_id, now=NOW, first_published_days_ago=61),
             job_api_side_effect=flaky(job_id),
         )
 
@@ -1090,7 +1100,7 @@ def test_the_investigator_prompt_is_a_pure_function_of_the_case(
     """
     job_id = "9115"
     posting_id = seed_reposted_history(conn, job_id, now=NOW)
-    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
+    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=61))
 
     def script() -> ScriptedClient:
         return scripted_llm(
@@ -1195,7 +1205,7 @@ def test_p5b_hiring_activity_runs_team_signal_and_reaches_apply_now(
     uses the PLAIN `seed_history` corpus instead: a posting with no repost
     link at all (`repost_pattern` resolves to `'none'`, and the posting is
     not long-lived), which made P4 — and therefore `team_signal` — permanently
-    unreachable under the old policy. `first_published_days_ago=40` also
+    unreachable under the old policy. `first_published_days_ago=61` also
     keeps `publish_recency` at `'not_recent'` (over the 30-day
     `recent_publish_days` bar), so P5's recency `apply_now` cannot fire
     either. The only way left to `apply_now` is P5b, and the only way to
@@ -1213,7 +1223,7 @@ def test_p5b_hiring_activity_runs_team_signal_and_reaches_apply_now(
     job_id = "9140"
     posting_id = seed_history(conn, job_id, now=NOW)
     add_posting(conn, job_id=f"{job_id}-hire", first_observed=NOW - timedelta(days=5))
-    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
+    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=61))
     llm = scripted_llm(
         [
             propose(
@@ -1249,7 +1259,7 @@ def test_the_same_case_without_a_positive_team_signal_stays_at_quick_apply(
     """Paired with the P5b test above: the probe's answer is what moves the action.
 
     Identical evidence-producing setup (`seed_history`, the same
-    `first_published_days_ago=40`, so open + strong + not-recent + no known
+    `first_published_days_ago=61`, so open + strong + not-recent + no known
     material negative event) but no team hire seeded and no `team_signal`
     proposal — the investigator stops immediately. With
     `corroborating_hiring_signal` left UNKNOWN, no branch of spec.md §5's
@@ -1259,7 +1269,7 @@ def test_the_same_case_without_a_positive_team_signal_stays_at_quick_apply(
     """
     job_id = "9141"
     seed_history(conn, job_id, now=NOW)
-    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
+    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=61))
     llm = scripted_llm(
         [InvestigatorOutput(stop=True, stop_reason="nothing left worth running")],
         cfg=cfg,
@@ -1311,7 +1321,7 @@ def test_the_skipped_investigator_call_is_not_charged_and_the_ledger_is_unchange
     )
     job_id = "9152"
     seed_history(conn, job_id, now=NOW)
-    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
+    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=61))
     llm = scripted_llm(
         [propose("company_events", company_id=COMPANY, as_of=NOW.isoformat())], cfg=disabled
     )
@@ -1495,7 +1505,7 @@ def test_no_new_eligible_probe_does_not_change_which_probes_run_or_the_final_act
     # -- stays eligible in the background, unproposed -----------------------
     job_id = "9500"
     add_posting(conn, job_id=job_id)  # a posting row, no board captures at all
-    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
+    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=61))
     posting_id = f"greenhouse:{COMPANY}:{job_id}"
     llm = scripted_llm([propose("repost_history", posting_id=posting_id)], cfg=cfg)
     result = _run_c(conn, cfg, job_id, llm)
@@ -1509,7 +1519,7 @@ def test_no_new_eligible_probe_does_not_change_which_probes_run_or_the_final_act
     # -- history-gated probes ineligible: same mechanism, requirements_drift -
     job_id = "9503"
     add_posting(conn, job_id=job_id)  # a posting row, no board captures at all
-    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
+    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=61))
     posting_id = f"greenhouse:{COMPANY}:{job_id}"
     llm = scripted_llm([propose("requirements_drift", posting_id=posting_id)], cfg=cfg)
     result = _run_c(conn, cfg, job_id, llm)
@@ -1536,7 +1546,7 @@ def test_no_new_eligible_probe_does_not_change_which_probes_run_or_the_final_act
     # -- the investigator stopping early on its own --------------------------
     job_id = "9505"
     seed_history(conn, job_id, now=NOW)
-    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=40))
+    mock_greenhouse(job_id, gh_job(job_id, now=NOW, first_published_days_ago=61))
     llm = scripted_llm(
         [InvestigatorOutput(stop=True, stop_reason="nothing left worth running")], cfg=cfg
     )

@@ -33,7 +33,12 @@ CLAIM_FAMILIES: dict[str, frozenset[str]] = {
     # `updated_at` corroborated by an observed content-hash change); it is a
     # publish-family claim because it is what spec.md §5's amended `recent`
     # rule reads alongside `first_published`.
-    "publish": frozenset({"first_published", "updated_at", "refreshed_at"}),
+    # `last_published` (Ashby `publishedAt`, "last published") is an ATS
+    # update timestamp like `updated_at`, read only as a refresh candidate. A
+    # `publish_date_after_first_seen` claim (a stated publish date the
+    # first-published guard in `rli.eval.case` refused) is deliberately NOT
+    # here: it supports no publish statement.
+    "publish": frozenset({"first_published", "updated_at", "refreshed_at", "last_published"}),
     "expiry": frozenset({"declared_expiry"}),
     "repost": frozenset({"disappeared_interval", "reappeared", "version_change", "board_listing"}),
     "requirements": frozenset({"requirements_changed", "requirements_unchanged", "version_change"}),

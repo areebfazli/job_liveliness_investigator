@@ -189,8 +189,25 @@ def test_migration_2_is_registered_and_reaches_the_current_version() -> None:
     assert max(MIGRATIONS) + 1 == SCHEMA_VERSION
 
 
+# Columns schema version 5 added to the replay tables (rli.db.MIGRATIONS[4]
+# adds them to an existing database). MIGRATIONS[2] is frozen at version 3, so
+# the comparison below removes exactly these from the fresh-schema text.
+_V5_REPLAY_COLUMNS = (
+    ", split_method TEXT, split_seed INTEGER, split_cutoff TEXT, "
+    "split_validation_cutoff TEXT, exclude_companies_from TEXT",
+    " split TEXT CHECK (split IN ('dev', 'validation', 'test')),",
+)
+
+
+def _without_v5_columns(ddl: str) -> str:
+    for fragment in _V5_REPLAY_COLUMNS:
+        assert fragment in ddl, fragment
+        ddl = ddl.replace(fragment, "")
+    return ddl
+
+
 def test_the_replay_ddl_is_identical_in_both_places() -> None:
-    from_schema = _normalized_ddl(_schema_sql())
+    from_schema = _without_v5_columns(_normalized_ddl(_schema_sql()))
     from_migration = _normalized_ddl(MIGRATIONS[2])
 
     assert from_schema == from_migration

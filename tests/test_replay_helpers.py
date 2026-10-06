@@ -44,7 +44,11 @@ _BOARD_API = "https://boards-api.greenhouse.io/v1/boards"
 NO_JSONLD_PAGE = "<html><body>no structured data</body></html>"
 
 
-def gh_job(job_id: str, url: str, *, published_days_ago: int = 5) -> dict:
+def gh_job(job_id: str, url: str, *, published_days_ago: int = 65) -> dict:
+    """A Greenhouse job payload. `first_published` defaults to BEFORE the
+    seeded postings' `first_observed` (-60 days): a stated first publication
+    after our own first sighting is re-labelled by
+    `rli.eval.case.guard_first_published` and would not be publish evidence."""
     return {
         "id": int(job_id),
         "title": "Backend Engineer",

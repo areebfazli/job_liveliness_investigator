@@ -53,6 +53,7 @@ from rli.policy.splits import (
     SplitRow,
     assign_splits,
     company_split,
+    company_split_stable,
     temporal_split,
     write_splits_csv,
 )
@@ -75,6 +76,7 @@ __all__ = [
     "SplitRow",
     "assign_splits",
     "company_split",
+    "company_split_stable",
     "could_change_action",
     "decide",
     "derive_policy_inputs",

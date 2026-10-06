@@ -30,6 +30,7 @@ __all__ = [
     "BUSY_TIMEOUT_MS",
     "MIGRATIONS",
     "POSTING_PAGE_DATES_DDL",
+    "RUNS_V5_DDL",
     "SCHEMA_VERSION",
     "connect",
     "init_db",
@@ -51,7 +52,13 @@ BUSY_TIMEOUT_MS = 5000
 #         own stated dates, kept per daily capture) and the
 #         `posting_page_dates` table (JSON-LD `datePosted` read once from a
 #         Lever job page) — point-in-time publish evidence for replay.
-SCHEMA_VERSION = 4
+# 4 -> 5: `board_snapshot_jobs.last_published` (Ashby `publishedAt` is the
+#         LAST publish time, not the first; v4 rows that carried it in
+#         `first_published` are moved), frozen split assignment on the replay
+#         tables (`replay_cases.split`, `replay_datasets.split_*`,
+#         `.exclude_companies_from`), and `runs.system` also accepts 'R' (the
+#         table is rebuilt: SQLite cannot alter a CHECK constraint in place).
+SCHEMA_VERSION = 5
 
 # from-version -> SQL script (or idempotent callable) that upgrades that
 # version to version + 1. `schema.sql` describes only the newest version;
@@ -190,6 +197,142 @@ def _migrate_3_to_4(conn: sqlite3.Connection) -> None:
 
 
 MIGRATIONS[3] = _migrate_3_to_4
+
+
+# 4 -> 5. Every ADD COLUMN below is nullable with no default (schema-only, no
+# table rewrite), except `replay_cases.split`, whose CHECK SQLite verifies
+# against the existing rows — a scan of `replay_cases` only (~10^4 rows).
+_V5_ADD_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("board_snapshot_jobs", "last_published", "TEXT"),
+    ("replay_datasets", "split_method", "TEXT"),
+    ("replay_datasets", "split_seed", "INTEGER"),
+    ("replay_datasets", "split_cutoff", "TEXT"),
+    ("replay_datasets", "split_validation_cutoff", "TEXT"),
+    ("replay_datasets", "exclude_companies_from", "TEXT"),
+    ("replay_cases", "split", "TEXT CHECK (split IN ('dev', 'validation', 'test'))"),
+)
+
+# The `runs` table as of version 5: identical to version 4 except that the
+# `system` CHECK also admits 'R' (a no-LLM, eligibility-gated baseline). The
+# same DDL lives in rli/db/schema.sql (the fresh-database path);
+# tests/test_db_v5_migration.py asserts the two stay in sync. Frozen once
+# shipped. `{name}` is the table name, so the migration can build it under a
+# temporary name first (SQLite's documented table-rebuild procedure).
+RUNS_V5_DDL = """
+CREATE TABLE IF NOT EXISTS {name} (
+    id                  TEXT PRIMARY KEY,
+    posting_id          TEXT REFERENCES postings (posting_id),
+    input_url           TEXT NOT NULL,
+    system              TEXT NOT NULL CHECK (system IN ('A', 'B', 'C', 'C2', 'R')),
+    mode                TEXT NOT NULL CHECK (mode IN ('live', 'replay')),
+    replay_at           TEXT,    -- historical time T for replay runs; null for live runs
+    policy_version      TEXT,
+    config_hash         TEXT,
+    started_at          TEXT NOT NULL,
+    finished_at         TEXT,
+    status              TEXT NOT NULL CHECK (
+        status IN ('running', 'completed', 'failed', 'stopped')
+    ),
+    final_decision      TEXT,    -- JSON-encoded Decision (spec.md §1), null until finished
+    total_cost_usd      REAL,
+    total_latency_ms    INTEGER
+)
+"""
+
+_RUNS_COLUMNS = (
+    "id, posting_id, input_url, system, mode, replay_at, policy_version, config_hash, "
+    "started_at, finished_at, status, final_decision, total_cost_usd, total_latency_ms"
+)
+
+
+def _runs_accepts_r(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'runs'"
+    ).fetchone()
+    return row is not None and "'R'" in str(row[0])
+
+
+def _rebuild_runs_for_r(conn: sqlite3.Connection) -> None:
+    """Widen `runs.system`'s CHECK via SQLite's table-rebuild procedure.
+
+    https://www.sqlite.org/lang_altertable.html#otheralter, steps 4-8 and 10:
+    create the new table under a temporary name, copy every row, drop the old
+    table, rename the new one into place, recreate its index, and verify
+    foreign keys. The caller has already turned `foreign_keys` OFF (step 1:
+    the implicit `DELETE` of a `DROP TABLE` would otherwise trip the
+    `evidence`/`run_steps` references) and opened the transaction (step 2).
+    `evidence.run_id` / `run_steps.run_id` reference `runs` BY NAME, so they
+    point at the rebuilt table once it is renamed.
+    """
+    conn.execute("DROP TABLE IF EXISTS runs_v5_new")
+    conn.execute(RUNS_V5_DDL.format(name="runs_v5_new"))
+    conn.execute(f"INSERT INTO runs_v5_new ({_RUNS_COLUMNS}) SELECT {_RUNS_COLUMNS} FROM runs")
+    conn.execute("DROP TABLE runs")
+    conn.execute("ALTER TABLE runs_v5_new RENAME TO runs")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_posting_id ON runs (posting_id)")
+    problems = conn.execute("PRAGMA foreign_key_check").fetchall()
+    if problems:
+        raise RuntimeError(
+            f"runs table rebuild left {len(problems)} foreign-key violation(s); "
+            f"first: {tuple(problems[0])!r}"
+        )
+
+
+def _migrate_4_to_5(conn: sqlite3.Connection) -> None:
+    """Version 5, atomically and idempotently (see `SCHEMA_VERSION`'s notes).
+
+    * Adds the columns in `_V5_ADD_COLUMNS` that are missing (a table created
+      from a newer `schema.sql` already has them).
+    * Moves Ashby's `publishedAt` out of `board_snapshot_jobs.first_published`
+      into `last_published`. Ashby documents it as "when the job was last
+      published", so it was never first-publish evidence. A v4 row is
+      recognisable structurally: the v4 writer (`rli.probes.board_snapshot`)
+      stored Ashby's single date in `first_published` and never set
+      `updated_at`, while Greenhouse always carries both. A re-run finds no
+      such row, so the move is idempotent.
+    * Rebuilds `runs` so its `system` CHECK admits 'R' — skipped when the
+      stored DDL already admits it.
+
+    `PRAGMA foreign_keys` is a no-op inside a transaction, so it is switched
+    OFF before `BEGIN IMMEDIATE` and restored afterwards whatever happens.
+    Everything else, including the `user_version` stamp, is ONE transaction:
+    an interrupted upgrade leaves the database exactly at version 4.
+    """
+    if conn.in_transaction:
+        raise RuntimeError(
+            "migration 4->5 must start outside a transaction (PRAGMA foreign_keys "
+            "cannot change inside one)"
+        )
+    fk_was_on = bool(conn.execute("PRAGMA foreign_keys").fetchone()[0])
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for table, name, sql_type in _V5_ADD_COLUMNS:
+                existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+                if name not in existing:
+                    # Names/types come from the fixed tuple above, never from input.
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
+            conn.execute(
+                """
+                UPDATE board_snapshot_jobs
+                SET last_published = first_published, first_published = NULL
+                WHERE first_published IS NOT NULL AND updated_at IS NULL
+                """
+            )
+            if not _runs_accepts_r(conn):
+                _rebuild_runs_for_r(conn)
+            _set_schema_version(conn, 5)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+    finally:
+        if fk_was_on:
+            conn.execute("PRAGMA foreign_keys = ON")
+
+
+MIGRATIONS[4] = _migrate_4_to_5
 
 
 def _schema_sql() -> str:

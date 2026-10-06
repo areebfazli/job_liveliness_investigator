@@ -26,7 +26,7 @@ def posting_row(conn: sqlite3.Connection, posting_id: str) -> sqlite3.Row | None
     return conn.execute(
         """
         SELECT posting_id, company_id, ats, ats_tenant_id, ats_job_id, canonical_url,
-               title, team, location
+               title, team, location, first_observed
         FROM postings
         WHERE posting_id = ?
         """,

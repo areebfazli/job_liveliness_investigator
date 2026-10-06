@@ -41,14 +41,20 @@ class BoardJob(BaseModel):
     description_hash: str | None = None
     # The ATS's own stated dates, as the raw strings the listing returned
     # (spec.md §3 source policy): Greenhouse `first_published` / `updated_at`
-    # and Ashby `publishedAt` (mapped onto `first_published`) are documented
-    # `ats_native` fields and are present on every job in the BOARD listing,
-    # not only on the single-job endpoint. Lever's dates are undocumented and
-    # untrusted, so a Lever job always leaves both None. Persisted to
-    # `board_snapshot_jobs` (normalized to UTC-Z) so a replay at `T` can cite
-    # the date as our own capture saw it, available from that capture's time.
+    # and Ashby `publishedAt` are documented `ats_native` fields and are
+    # present on every job in the BOARD listing, not only on the single-job
+    # endpoint. Lever's dates are undocumented and untrusted, so a Lever job
+    # leaves all three None. Persisted to `board_snapshot_jobs` (normalized to
+    # UTC-Z) so a replay at `T` can cite the date as our own capture saw it,
+    # available from that capture's time.
     first_published: str | None = None
     updated_at: str | None = None
+    # Ashby `publishedAt`. Ashby documents it as "when the job was LAST
+    # published" (https://developers.ashbyhq.com/docs/public-job-posting-api):
+    # a re-publish moves it forward, so it is NOT first-publish evidence and
+    # must never land in `first_published`. It is a refresh signal only
+    # (`rli.eval.case._refresh_claim`).
+    last_published: str | None = None
 
 
 def _from_greenhouse(job: greenhouse.GreenhouseJob) -> BoardJob:
@@ -72,8 +78,9 @@ def _from_ashby(job: ashby.AshbyJob) -> BoardJob:
         location=job.location,
         url=job.job_url,
         description_hash=job.content_hash,
-        # Ashby documents only `publishedAt` (no updatedAt).
-        first_published=job.published_at,
+        # Ashby documents only `publishedAt` ("last published"; no updatedAt,
+        # no first-publish date). See `BoardJob.last_published`.
+        last_published=job.published_at,
     )
 
 

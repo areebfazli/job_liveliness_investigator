@@ -414,7 +414,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from dataclasses import replace as dataclasses_replace
 from datetime import datetime
@@ -462,7 +462,9 @@ __all__ = [
     "STEP_EXPLANATION",
     "STEP_INVESTIGATOR",
     "STEP_PROBE_RETRY",
+    "STEP_RUN_FLAG_INVESTIGATOR_ERROR",
     "c_config_hash",
+    "investigator_error_run_ids",
     "make_system_c",
     "parse_tokens",
     "run_system_c",
@@ -482,6 +484,16 @@ STEP_CONTROLLER_DECISION = "controller_decision"  # component='controller'
 STEP_CANDIDATE_REJECTED = "candidate_rejected"  # component='controller'
 STEP_PROBE_RETRY = "probe_retry"  # component='controller'
 STEP_ARGS_MISMATCH = "args_mismatch"  # component='controller'; must never appear
+# component='controller', error NULL; written ONCE per run whose investigator
+# call failed (unusable output: not JSON, schema-invalid, provider error).
+# The run still completes — the controller stops (`investigator_error`) and
+# the frozen policy decides on the evidence so far, so its status and action
+# look like any other run's. This flag is what makes such a run COUNTABLE:
+# `SELECT DISTINCT run_id FROM run_steps WHERE decision_type = ?`
+# (`investigator_error_run_ids`). Its `error` column is left NULL on purpose:
+# the failure itself is already recorded once, on the `component='model'`
+# investigator step, and `rli.eval.report` counts error rows.
+STEP_RUN_FLAG_INVESTIGATOR_ERROR = "run_flag:investigator_error"
 
 # The `decision_type` token suffix (see the module docstring). Kept as a
 # constant so `with_tokens` and `parse_tokens` cannot drift apart.
@@ -1276,6 +1288,11 @@ def _run_loop(
             investigator_error=investigator_error,
         )
         _trace_decision(probes, decision)
+        if investigator_error is not None:
+            # Decision logic untouched; this only marks the run (see
+            # `STEP_RUN_FLAG_INVESTIGATOR_ERROR`). An investigator error is
+            # always a stop, so the flag is written at most once per run.
+            probes.note(STEP_RUN_FLAG_INVESTIGATOR_ERROR)
 
         if decision.decision == "stop":
             break
@@ -1328,6 +1345,37 @@ def _trace_decision(probes: ProbeRunner, decision: ControllerDecision) -> None:
         probe_name=decision.chosen_probe,
         args_hash=decision.chosen_args_hash,
     )
+
+
+def investigator_error_run_ids(
+    conn: sqlite3.Connection, run_ids: Sequence[str] | None = None
+) -> set[str]:
+    """Runs whose investigator call failed (`STEP_RUN_FLAG_INVESTIGATOR_ERROR`).
+
+    `run_ids=None` searches every run. Runs traced before the flag existed are
+    not found here; for those, `controller_decision:stop:investigator_error`
+    marks the same event.
+    """
+    if run_ids is None:
+        rows = conn.execute(
+            "SELECT DISTINCT run_id FROM run_steps WHERE decision_type = ?",
+            (STEP_RUN_FLAG_INVESTIGATOR_ERROR,),
+        ).fetchall()
+        return {str(row[0]) for row in rows}
+    found: set[str] = set()
+    ids = list(run_ids)
+    for start in range(0, len(ids), 500):
+        chunk = ids[start : start + 500]
+        placeholders = ",".join("?" for _ in chunk)
+        found.update(
+            str(row[0])
+            for row in conn.execute(
+                f"SELECT DISTINCT run_id FROM run_steps "
+                f"WHERE decision_type = ? AND run_id IN ({placeholders})",
+                (STEP_RUN_FLAG_INVESTIGATOR_ERROR, *chunk),
+            )
+        )
+    return found
 
 
 # ---------------------------------------------------------------------------

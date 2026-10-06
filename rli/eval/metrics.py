@@ -177,8 +177,9 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import warnings
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
@@ -192,7 +193,7 @@ from rli.eval.runner import STEP_PROBE_RUN
 from rli.models.time import now_utc, parse_utc
 from rli.policy.claim_families import CLAIM_FAMILIES, FAMILY_KEYWORDS
 from rli.policy.claim_families import classify_reason as _classify_reason
-from rli.policy.splits import DEFAULT_SEED
+from rli.policy.splits import DEFAULT_SEED, SPLIT_METHOD_COMPANY_HASH
 from rli.probes.board_snapshot import BoardSnapshotProbe
 from rli.probes.registry import DYNAMIC_PROBES
 from rli.probes.resolve_posting import ResolvePostingProbe
@@ -222,6 +223,7 @@ __all__ = [
     "resolve_allowed_splits",
     "split_case_set_by_era",
     "split_map_for_dataset",
+    "FrozenSplitWarning",
 ]
 
 #: Every split name `rli.policy.splits` can assign.
@@ -363,6 +365,118 @@ def resolve_allowed_splits(
     return tuple(name for name in ALL_SPLITS if name in requested)
 
 
+# Datasets built before schema version 5 recorded their temporal cutoffs only
+# in free-text notes ("7-day grid, test cutoff 2026-09-15, validation cutoff
+# 2026-09-07"); this is how those are recovered.
+_NOTES_TEST_CUTOFF = re.compile(r"\btest cutoff\s+([0-9][0-9T:.\-+Z]*)", re.IGNORECASE)
+_NOTES_VALIDATION_CUTOFF = re.compile(r"\bvalidation cutoff\s+([0-9][0-9T:.\-+Z]*)", re.IGNORECASE)
+
+
+class FrozenSplitWarning(UserWarning):
+    """A dataset's split assignment had to be RECONSTRUCTED, not read back."""
+
+
+def _dataset_split_row(conn: sqlite3.Connection, dataset_id: str) -> dict[str, object] | None:
+    """The dataset header as a dict, tolerant of a pre-version-5 table.
+
+    Returns `None` when there is no row (or no `replay_datasets` table at all,
+    a database predating schema version 3). Columns a version-3/4 table lacks
+    simply read as `None`.
+    """
+    try:
+        row = conn.execute(
+            "SELECT * FROM replay_datasets WHERE dataset_id = ?", (dataset_id,)
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    return {key: row[key] for key in row.keys()}
+
+
+def _parse_optional(value: object) -> datetime | None:
+    text = _str_or_none(value)
+    if not text:
+        return None
+    try:
+        return parse_utc(text)
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_noted(text: str) -> datetime | None:
+    """A cutoff written in dataset notes: a timestamp, or a bare date at UTC midnight.
+
+    `rli replay build --cutoff` only accepts a full UTC timestamp, so a bare
+    `2026-09-15` in hand-written notes is read as that day's UTC midnight.
+    """
+    parsed = _parse_optional(text)
+    if parsed is not None:
+        return parsed
+    try:
+        return datetime.fromisoformat(text.strip()).replace(tzinfo=UTC)
+    except ValueError:
+        return None
+
+
+def _frozen_case_splits(conn: sqlite3.Connection, dataset_id: str) -> dict[str, str] | None:
+    """`posting_id -> split` as stored on `replay_cases`, or None if not frozen.
+
+    `None` unless EVERY case of the dataset carries a split: a half-frozen
+    dataset (impossible from `rli.replay.build`, but a hand edit could make
+    one) is treated as not frozen rather than silently mixed with a
+    recomputation.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT posting_id, split FROM replay_cases WHERE dataset_id = ?", (dataset_id,)
+        ).fetchall()
+    except sqlite3.Error:  # no `split` column: a pre-version-5 database
+        return None
+    if not rows or any(row["split"] is None for row in rows):
+        return None
+    return {str(row["posting_id"]): str(row["split"]) for row in rows}
+
+
+def _run_posting_aliases(
+    conn: sqlite3.Connection, dataset_id: str, case_splits: Mapping[str, str]
+) -> dict[str, str]:
+    """`runs.posting_id -> split` for replay runs whose id differs from the case's.
+
+    `rli.eval.metrics.collect_system_runs` keys a case by the posting id the
+    RUNNING system derived (`runs.posting_id`), which can differ from the
+    dataset's own id (`rli.replay.mode.ReplayProbeRunner` explains when). A
+    run IS its case, identified by `(input_url, replay_at)` exactly as
+    `rli.replay.run` matches it, so the run's id inherits the case's split.
+    Joined in Python: there is no index on `runs.input_url`.
+    """
+    try:
+        cases = {
+            (str(row["canonical_url"]), str(row["replay_at"])): str(row["posting_id"])
+            for row in conn.execute(
+                "SELECT posting_id, replay_at, canonical_url FROM replay_cases "
+                "WHERE dataset_id = ?",
+                (dataset_id,),
+            )
+        }
+        runs = conn.execute(
+            "SELECT DISTINCT posting_id, input_url, replay_at FROM runs "
+            "WHERE mode = 'replay' AND posting_id IS NOT NULL AND replay_at IS NOT NULL"
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    aliases: dict[str, str] = {}
+    for row in runs:
+        case_posting = cases.get((str(row["input_url"]), str(row["replay_at"])))
+        run_posting = str(row["posting_id"])
+        if case_posting is None or case_posting == run_posting:
+            continue
+        split = case_splits.get(case_posting)
+        if split is not None and run_posting not in case_splits:
+            aliases.setdefault(run_posting, split)
+    return aliases
+
+
 def split_map_for_dataset(
     conn: sqlite3.Connection,
     *,
@@ -375,56 +489,122 @@ def split_map_for_dataset(
     """`(posting_id -> split, split_kind_used)`, reproducing the dataset's own assignment.
 
     A replay dataset was built against one particular split assignment, and
-    an evaluation that re-derived a *different* assignment would silently
-    move cases between dev, validation and holdout — the exact failure the
-    split exists to prevent. So the defaults come from the `replay_datasets`
-    row: its `split_kind` column, and its `created_at` as the cutoff, which
-    is the clock `rli.replay.build` itself used. Explicit arguments override
-    both, for the case where a caller is re-splitting deliberately.
+    an evaluation that re-derived a *different* one would silently move cases
+    between dev, validation and holdout — the exact failure the split exists
+    to prevent. And re-deriving is NOT reproducing: the corpus grows every
+    day, the greedy company split is a function of the whole corpus, and the
+    temporal cutoffs a build used are not its `created_at`. So, in order:
+
+    1. **Explicit arguments** (`split_kind` / `cutoff` / `validation_cutoff`)
+       mean a deliberate re-split over today's corpus, exactly as before.
+    2. **A frozen dataset** (schema version 5: every `replay_cases.split` set
+       by `rli.replay.build`): those per-case splits are returned as stored.
+       Postings outside the dataset (e.g. `rli.eval.gates.product_gate`'s
+       outcome postings) get the dataset's recorded method/seed/cutoffs
+       applied to today's corpus underneath — the stable company hash or the
+       temporal cutoffs, both of which are fixed per posting.
+    3. **An older dataset** (no stored splits): the build-time assignment is
+       RECONSTRUCTED — the greedy split those builds used, over the postings
+       that existed at the dataset's `created_at` (`load_split_map(as_of=)`),
+       with the temporal cutoffs recovered from the dataset's notes when it
+       recorded them there, else `created_at` as the old code did. A
+       `FrozenSplitWarning` says so. The reconstruction is exact unless a
+       later history rebuild moved a posting's `first_observed`.
+
+    In cases 2 and 3 a replay run whose own `posting_id` differs from its
+    case's inherits the case's split (`_run_posting_aliases`).
 
     Falls back to `("company", now_utc())` when the dataset row is absent
     (or the table has not been migrated in): a company-held-out split is the
     stricter of the two — it also keeps same-company postings together — so
     an unknown provenance degrades toward *more* separation, not less.
-    Delegates the assignment itself to `rli.eval.baseline.load_split_map`;
-    postings with a NULL `first_observed` are simply absent from the result
+    Postings with a NULL `first_observed` are simply absent from the result
     and every caller treats a missing key as `unassigned`.
     """
-    row = None
-    try:
-        row = conn.execute(
-            "SELECT split_kind, created_at FROM replay_datasets WHERE dataset_id = ?",
-            (dataset_id,),
-        ).fetchone()
-    except sqlite3.Error:
-        # No `replay_datasets` table (a database predating schema version 3).
-        # Treated exactly like a missing row: fall back, never raise.
-        row = None
+    row = _dataset_split_row(conn, dataset_id)
 
     kind = split_kind
     if kind is None:
-        stored = None if row is None else _str_or_none(row["split_kind"])
+        stored = None if row is None else _str_or_none(row.get("split_kind"))
         kind = stored if stored in ("temporal", "company") else "company"
 
-    resolved_cutoff = cutoff
-    if resolved_cutoff is None:
-        created_at = None if row is None else _str_or_none(row["created_at"])
-        if created_at:
-            try:
-                resolved_cutoff = parse_utc(created_at)
-            except (ValueError, TypeError):
-                resolved_cutoff = None
-    if resolved_cutoff is None:
-        resolved_cutoff = now_utc()
+    created_at = None if row is None else _parse_optional(row.get("created_at"))
+    overridden = split_kind is not None or cutoff is not None or validation_cutoff is not None
 
-    mapping = load_split_map(
+    if overridden or row is None:
+        resolved_cutoff = cutoff if cutoff is not None else created_at
+        mapping = load_split_map(
+            conn,
+            cutoff=resolved_cutoff if resolved_cutoff is not None else now_utc(),
+            validation_cutoff=validation_cutoff,
+            seed=seed,
+            split_kind=kind,  # type: ignore[arg-type]
+        )
+        return {posting_id: str(split) for posting_id, split in mapping.items()}, str(kind)
+
+    frozen = _frozen_case_splits(conn, dataset_id)
+    method = _str_or_none(row.get("split_method"))
+    if frozen is not None and method is not None:
+        stored_seed = row.get("split_seed")
+        stored_cutoff = _parse_optional(row.get("split_cutoff")) or created_at or now_utc()
+        base = load_split_map(
+            conn,
+            cutoff=stored_cutoff,
+            validation_cutoff=_parse_optional(row.get("split_validation_cutoff")),
+            seed=int(stored_seed) if stored_seed is not None else seed,  # type: ignore[arg-type]
+            split_kind=kind,  # type: ignore[arg-type]
+            company_method="hash" if method == SPLIT_METHOD_COMPANY_HASH else "greedy",
+        )
+        mapping = {posting_id: str(split) for posting_id, split in base.items()}
+        mapping.update(frozen)
+        mapping.update(_run_posting_aliases(conn, dataset_id, frozen))
+        return mapping, str(kind)
+
+    # 3. A dataset built before splits were frozen: reconstruct.
+    notes = _str_or_none(row.get("notes")) or ""
+    test_match = _NOTES_TEST_CUTOFF.search(notes)
+    validation_match = _NOTES_VALIDATION_CUTOFF.search(notes)
+    noted_cutoff = _parse_noted(test_match.group(1)) if test_match else None
+    noted_validation = _parse_noted(validation_match.group(1)) if validation_match else None
+    resolved_cutoff = noted_cutoff or created_at or now_utc()
+    warnings.warn(
+        f"replay dataset {dataset_id!r} predates frozen splits (schema v5): its "
+        f"{kind} split assignment is RECONSTRUCTED from the postings that existed at "
+        f"its build time ({_str_or_none(row.get('created_at'))}) with the greedy "
+        f"method, test cutoff {resolved_cutoff.isoformat()} "
+        f"({'from its notes' if noted_cutoff else 'its created_at'}) and validation "
+        f"cutoff {noted_validation.isoformat() if noted_validation else 'none'}; a later "
+        "history rebuild that moved a posting's first_observed can still change it. "
+        "Rebuild the dataset to freeze its splits.",
+        FrozenSplitWarning,
+        stacklevel=2,
+    )
+    base = load_split_map(
         conn,
         cutoff=resolved_cutoff,
-        validation_cutoff=validation_cutoff,
+        validation_cutoff=noted_validation,
         seed=seed,
         split_kind=kind,  # type: ignore[arg-type]
     )
-    return {posting_id: str(split) for posting_id, split in mapping.items()}, str(kind)
+    rebuilt = load_split_map(
+        conn,
+        cutoff=resolved_cutoff,
+        validation_cutoff=noted_validation,
+        seed=seed,
+        split_kind=kind,  # type: ignore[arg-type]
+        as_of=created_at,
+    )
+    mapping = {posting_id: str(split) for posting_id, split in base.items()}
+    mapping.update({posting_id: str(split) for posting_id, split in rebuilt.items()})
+    case_splits = {
+        str(r["posting_id"]): mapping[str(r["posting_id"])]
+        for r in conn.execute(
+            "SELECT DISTINCT posting_id FROM replay_cases WHERE dataset_id = ?", (dataset_id,)
+        )
+        if str(r["posting_id"]) in mapping
+    }
+    mapping.update(_run_posting_aliases(conn, dataset_id, case_splits))
+    return mapping, str(kind)
 
 
 # ---------------------------------------------------------------------------

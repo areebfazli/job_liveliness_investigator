@@ -145,8 +145,11 @@ def test_ashby_job_found_is_open_with_ats_native_evidence(ctx_factory) -> None:
     assert result.data["title"] == "Product Designer"
     claims = result.data["evidence"]
     assert len(claims) == 1
-    assert claims[0].claim_type == "first_published"
+    # Ashby documents `publishedAt` as "when the job was LAST published": it
+    # is an ATS update timestamp, never first-publish evidence.
+    assert claims[0].claim_type == "last_published"
     assert claims[0].source_quality == "ats_native"
+    assert not [c for c in claims if c.claim_type == "first_published"]
 
 
 @respx.mock

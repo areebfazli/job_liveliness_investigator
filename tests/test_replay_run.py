@@ -230,7 +230,9 @@ def test_a_case_at_the_build_instant_does_see_the_live_resolver_evidence(
     )
     assert resolver_state.value == "open"
     assert case.inputs.posting_state == "open"
-    assert case.inputs.publish_recency == "recent"
+    # The resolver's publish date (-65 days, `gh_job`) is visible here, so the
+    # input is DECIDED — not UNKNOWN, which is what an archive-era T sees.
+    assert case.inputs.publish_recency == "not_recent"
 
 
 def test_an_archive_era_case_of_a_closed_posting_reads_closed(

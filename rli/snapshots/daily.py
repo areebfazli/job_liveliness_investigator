@@ -14,9 +14,27 @@ the header. A same-day rerun therefore makes zero network calls and zero
 lifecycle writes for companies already captured — it does not "top up" or
 overwrite that day's capture.
 
+Timestamps are PER COMPANY, never the run's start (spec.md §3: `available_at`
+is when the system could verifiably have the data; never backdate). A run
+over ~350 boards has taken from minutes to 18 hours, and stamping every
+capture with the run-start instant dated some captures up to 18 hours before
+their data was fetched. So each company's `board_snapshots.captured_at` —
+and the `first_observed` / `last_seen_open` / `first_seen_absent` /
+`reappeared_at` / `posting_snapshots.captured_at` values derived from it, and
+a failed fetch's `capture_attempts.attempted_at` — is the clock read right
+AFTER that company's board request returned.
+
+"Today" is likewise per company. The skip check reads the clock just before
+the company's fetch, so a run that crosses UTC midnight checks a company
+reached after midnight against the NEW day (and captures it, if that day has
+no capture yet) instead of against the day the run started in. Because the
+capture is stamped after the fetch, the two can straddle midnight; in that
+case the capture's own day is checked again before anything is written, so
+the one-capture-per-company-per-UTC-day invariant holds on the stamp itself.
+
 Each capture also keeps the ATS's own stated dates per job (Greenhouse
-`first_published` / `updated_at`, Ashby `publishedAt`) in
-`board_snapshot_jobs`, and after all captures a bounded pass reads JSON-LD
+`first_published` / `updated_at`, Ashby `publishedAt` as `last_published`)
+in `board_snapshot_jobs`, and after all captures a bounded pass reads JSON-LD
 `datePosted` from the job pages of Lever postings captured this run that have
 no date yet (`rli.snapshots.page_dates`; `[page_dates]` in config.toml). A
 page that cannot be fetched is a coverage gap only — the pass never fails the
@@ -86,6 +104,10 @@ def _day_bounds_utc_z(now: datetime) -> tuple[str, str]:
     start = now.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
     end = start + timedelta(days=1)
     return to_utc_z(start), to_utc_z(end)
+
+
+def _utc_day(moment: datetime) -> str:
+    return _day_bounds_utc_z(moment)[0]
 
 
 def _already_captured_today(conn: sqlite3.Connection, company_id: str, now: datetime) -> bool:
@@ -229,8 +251,15 @@ def run_daily_snapshot(
     now: datetime,
     *,
     sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], datetime] | None = None,
 ) -> DailySnapshotSummary:
     """Capture today's board for every target and update posting lifecycle state.
+
+    `clock` is read per company: just before its fetch (the "already captured
+    today" check) and right after it (the capture's `captured_at`, see the
+    module docstring). The CLI passes the real clock. When omitted, the clock
+    is frozen at `now` — every company is stamped `now`, which is only right
+    for a test that wants fixed timestamps; production must pass a clock.
 
     Builds exactly ONE `NetClient` for the whole run via
     `NetClient.from_config(cfg, probe="board_snapshot", sleep=sleep)`,
@@ -242,13 +271,16 @@ def run_daily_snapshot(
     across companies on the same ATS host.
     """
     summary = DailySnapshotSummary()
+    read_clock: Callable[[], datetime] = clock if clock is not None else (lambda: now)
     net_client = NetClient.from_config(cfg, probe="board_snapshot", sleep=sleep)
-    # Lever companies captured successfully THIS run: the only ones whose
-    # postings the page-date pass may visit (see rli.snapshots.page_dates).
-    lever_captured: list[str] = []
+    # Lever companies captured successfully THIS run, with each one's capture
+    # stamp: the only postings the page-date pass may visit (see
+    # rli.snapshots.page_dates).
+    lever_captured: dict[str, datetime] = {}
     try:
         for target in targets:
-            if _already_captured_today(conn, target.company_id, now):
+            checked_at = read_clock()
+            if _already_captured_today(conn, target.company_id, checked_at):
                 summary.companies_skipped += 1
                 continue
 
@@ -256,16 +288,26 @@ def run_daily_snapshot(
                 conn=conn,
                 config=cfg,
                 net_client_factory=lambda _name: net_client,
-                now=lambda: now,
+                now=read_clock,
             )
             result = board_snapshot(target.ats, target.tenant, ctx)
+            # The moment we actually held this company's board (module
+            # docstring): every timestamp written for it below.
+            captured_at = read_clock()
+            if _utc_day(captured_at) != _utc_day(checked_at) and _already_captured_today(
+                conn, target.company_id, captured_at
+            ):
+                # The fetch straddled UTC midnight into a day that already has
+                # a capture: keep one capture per company per UTC day.
+                summary.companies_skipped += 1
+                continue
 
             if not result.ok:
                 record_capture_attempt(
                     conn,
                     company_id=target.company_id,
                     target=f"{target.ats}:{target.tenant}",
-                    attempted_at=now,
+                    attempted_at=captured_at,
                     source="own",
                     ok=False,
                     error=result.error,
@@ -278,23 +320,25 @@ def run_daily_snapshot(
             save_board_snapshot(
                 conn,
                 company_id=target.company_id,
-                captured_at=now,
+                captured_at=captured_at,
                 coverage_status="complete",
                 jobs=jobs,
                 source="own",
             )
-            _apply_posting_lifecycle(conn, target=target, jobs=jobs, now=now, summary=summary)
+            _apply_posting_lifecycle(
+                conn, target=target, jobs=jobs, now=captured_at, summary=summary
+            )
             conn.commit()
             summary.companies_ok += 1
             if target.ats == "lever":
-                lever_captured.append(target.company_id)
+                lever_captured[target.company_id] = captured_at
 
         # After every board capture is committed, so nothing here can delay
         # or undo one. Contained: a page-date problem is a coverage gap, never
         # a failed snapshot (rli.snapshots.page_dates).
         try:
             summary.page_dates = collect_lever_page_dates(
-                conn, cfg, net_client, company_ids=lever_captured, now=now
+                conn, cfg, net_client, captures=lever_captured, now=read_clock()
             )
         except Exception:  # noqa: BLE001 - belt to page_dates' own braces
             conn.rollback()

@@ -245,11 +245,13 @@ def test_the_dataset_shards_cover_every_case_exactly_once(db_copy: Path) -> None
 
 def test_a_sharded_walk_must_resume(conn: sqlite3.Connection, cfg: Config) -> None:
     conn.execute(
-        "INSERT INTO replay_datasets VALUES ('d', '2026-01-01T00:00:00.000000Z', "
-        "'temporal', 'dev', 7, 1, 1, 1, NULL)"
+        "INSERT INTO replay_datasets (dataset_id, created_at, split_kind, split_name, "
+        "grid_step_days, postings, companies, cases, notes) "
+        "VALUES ('d', '2026-01-01T00:00:00.000000Z', 'temporal', 'dev', 7, 1, 1, 1, NULL)"
     )
     conn.execute(
-        "INSERT INTO replay_cases VALUES ('d', 'p', '2026-01-01T00:00:00.000000Z', 'c', 'u', "
+        "INSERT INTO replay_cases (dataset_id, posting_id, replay_at, company_id, "
+        "canonical_url, built_at) VALUES ('d', 'p', '2026-01-01T00:00:00.000000Z', 'c', 'u', "
         "'2026-01-01T00:00:00.000000Z')"
     )
     conn.commit()

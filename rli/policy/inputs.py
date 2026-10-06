@@ -164,7 +164,9 @@ __all__ = [
     "CLAIM_BOARD_LISTING",
     "CLAIM_DECLARED_EXPIRY",
     "CLAIM_FIRST_PUBLISHED",
+    "CLAIM_LAST_PUBLISHED",
     "CLAIM_POSTING_STATE",
+    "CLAIM_PUBLISH_AFTER_FIRST_SEEN",
     "CLAIM_REFRESHED_AT",
     "CLAIM_TEAM_SIGNAL",
     "PRIMARY_PUBLISH_QUALITIES",
@@ -185,6 +187,19 @@ CLAIM_BOARD_LISTING = "board_listing"
 CLAIM_BOARD_ABSENT = "board_absent"
 CLAIM_TEAM_SIGNAL = "corroborating_hiring_signal"
 CLAIM_REFRESHED_AT = "refreshed_at"
+# Ashby `publishedAt`: documented as "when the job was LAST published", so a
+# re-publish moves it. It is never a `first_published` claim (it would make an
+# old posting look new); it is an ATS update timestamp, read only as a refresh
+# candidate by `rli.eval.case._refresh_claim` (spec.md §5 amendment
+# 2026-09-10: it counts toward recency only when it coincides with an observed
+# content-hash change).
+CLAIM_LAST_PUBLISHED = "last_published"
+# A `first_published` claim whose stated date is LATER than our own
+# `first_observed` for the posting. It cannot be the first publication — we
+# had already seen the job open — so `rli.eval.case.guard_first_published`
+# re-labels it to this type: kept as source-linked evidence, never read as
+# publish evidence by the policy.
+CLAIM_PUBLISH_AFTER_FIRST_SEEN = "publish_date_after_first_seen"
 
 # spec.md §3 source ranking, best first. Only these two count as "primary
 # publish evidence" for spec.md §5's `apply_now` branch.

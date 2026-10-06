@@ -214,7 +214,9 @@ __all__ = [
     "replay_run_shape",
 ]
 
-SystemName = Literal["A", "B", "C", "C2"]
+# "R" (schema version 5): a no-LLM, eligibility-gated baseline; `runs.system`
+# accepts it from rli.db.MIGRATIONS[4] on.
+SystemName = Literal["A", "B", "C", "C2", "R"]
 CacheStatus = Literal["hit", "miss", "n/a"]
 
 # `run_steps.decision_type` prefixes; see the module docstring's vocabulary.

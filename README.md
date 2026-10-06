@@ -162,6 +162,8 @@ model that supports structured JSON output.
 
 ```bash
 uv run rli replay build --dataset my-set --split dev --split-kind temporal --grid-days 7 --db ./data/rli.db
+# company holdout: same command with --split-kind company, company-disjoint from my-set
+uv run rli replay build --dataset my-company-set --split dev --split-kind company --grid-days 7 --exclude-companies-from my-set --db ./data/rli.db
 uv run rli replay run --system A --dataset my-set --db ./data/rli.db
 uv run rli replay run --system B --dataset my-set --db ./data/rli.db
 WORKERS=4 TOTAL_RPM=160 scripts/replay_c_parallel.sh my-set   # agent, 4 workers in parallel
@@ -170,12 +172,13 @@ uv run rli eval run --dataset my-set --with-c --out reports/evaluation.md --db .
 ```
 
 `replay build` is the only replay step that uses the network. Every later step
-is replayed offline, with live calls blocked.
+is replayed offline, with live calls blocked. Each case's split is frozen when
+the dataset is built, so evaluation never re-splits a corpus that has grown since.
 
 ### 7. Tests
 
 ```bash
-uv run pytest -q && uv run ruff check .    # 1,446 tests
+uv run pytest -q && uv run ruff check .    # 1,476 tests
 ```
 
 ## Built-in safety rules

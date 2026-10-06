@@ -62,16 +62,24 @@ def _gh_job(job_id: str, *, first_published_days_ago: int) -> dict:
     }
 
 
-def _seed_history(conn: sqlite3.Connection, job_id: str) -> None:
-    """50-day board history: usable (>=30) but not long-lived (<180)."""
+def _seed_history(conn: sqlite3.Connection, job_id: str, *, first_seen_days_ago: int = 60) -> None:
+    """50-day board history: usable (>=30) but not long-lived (<180).
+
+    The company's captures always span 60 days (so history is usable); the
+    posting itself is listed only from `first_seen_days_ago` on, so a fixture
+    can make a role whose stated publish date is recent AND consistent with
+    our own first sighting (`rli.eval.case.guard_first_published` re-labels a
+    first-publish date later than `first_observed`).
+    """
     add_posting(
         conn,
         job_id=job_id,
-        first_observed=NOW - timedelta(days=60),
-        last_seen_open=NOW - timedelta(days=10),
+        first_observed=NOW - timedelta(days=first_seen_days_ago),
+        last_seen_open=NOW - timedelta(days=min(10, first_seen_days_ago)),
     )
-    for offset in (60, 45, 30, 10):
-        add_capture(conn, NOW - timedelta(days=offset), [job(job_id)], company_id=COMPANY)
+    for offset in sorted({60, 45, 30, 10, first_seen_days_ago}, reverse=True):
+        listed = [job(job_id)] if offset <= first_seen_days_ago else [job(f"{job_id}-older")]
+        add_capture(conn, NOW - timedelta(days=offset), listed, company_id=COMPANY)
 
 
 def _mock_greenhouse(job_id: str, gh_job: dict) -> None:
@@ -91,7 +99,7 @@ def test_system_b_fires_r2_healthy_and_runs_only_company_events(
 ) -> None:
     job_id = "7001"
     url = f"https://boards.greenhouse.io/acme/jobs/{job_id}"
-    _seed_history(conn, job_id)
+    _seed_history(conn, job_id, first_seen_days_ago=4)
     gh_job = _gh_job(job_id, first_published_days_ago=5)  # recent
     _mock_greenhouse(job_id, gh_job)
 
@@ -155,7 +163,7 @@ def test_system_b_fires_r1_repost_suspicious_on_a_stale_publish_date(
     job_id = "7002"
     url = f"https://boards.greenhouse.io/acme/jobs/{job_id}"
     _seed_history(conn, job_id)
-    gh_job = _gh_job(job_id, first_published_days_ago=40)  # not recent (> 14 days)
+    gh_job = _gh_job(job_id, first_published_days_ago=61)  # not recent (> 30 days)
     _mock_greenhouse(job_id, gh_job)
 
     result = run_system_b(conn, cfg, url, now=NOW, sleep=lambda _s: None, use_tool_cache=False)

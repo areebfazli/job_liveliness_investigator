@@ -72,6 +72,21 @@ each one shapes what "correct" means for a downstream policy-tuning run:
   extreme, exactly one), some splits can end up with zero companies and
   therefore zero postings.
 
+* **Two company-split methods: `"greedy"` (balanced, but DRIFTS) and
+  `"hash"` (stable).** `company_split` (the greedy balancer above) is a
+  function of the whole row set: a company's split depends on every other
+  company's posting count, so as the collector adds postings day by day a
+  company can move between dev, validation and test. That is fine for one
+  frozen computation and fatal for anything recomputed later — a company
+  tuned on as `dev` could resurface as `test`. `company_split_stable` assigns
+  each company from `blake2b(seed:company_id)` alone, mapped onto
+  `fractions` as cumulative thresholds: the assignment of a company never
+  changes as the corpus grows, at the price of balancing COMPANY counts (in
+  expectation) rather than posting counts. spec.md §6 asks only that "test
+  companies [be] absent from training", which both satisfy; the stable one is
+  what new replay datasets use (`rli.replay.build`), and the greedy one stays
+  for reconstructing datasets built before it (`rli.eval.metrics`).
+
 * **Empty input.** All four functions accept an empty `rows` sequence and
   return an empty mapping/list rather than raising; `write_splits_csv`
   still writes the header row so the output file is always valid CSV.
@@ -97,13 +112,19 @@ from pydantic import BaseModel, ConfigDict, ValidationInfo, field_validator
 from rli.models.time import ensure_aware, to_utc_z
 
 __all__ = [
+    "COMPANY_SPLIT_METHODS",
     "DEFAULT_SEED",
     "SPLITS_COLUMNS",
+    "SPLIT_METHOD_COMPANY_GREEDY",
+    "SPLIT_METHOD_COMPANY_HASH",
+    "SPLIT_METHOD_TEMPORAL",
+    "CompanySplitMethod",
     "Split",
     "SplitAssignment",
     "SplitRow",
     "assign_splits",
     "company_split",
+    "company_split_stable",
     "temporal_split",
     "write_splits_csv",
 ]
@@ -118,6 +139,18 @@ Split = Literal["dev", "validation", "test"]
 DEFAULT_SEED = 20260607
 
 _SPLIT_NAMES: tuple[Split, Split, Split] = ("dev", "validation", "test")
+
+#: `"greedy"` = `company_split` (balanced by posting count, drifts as the
+#: corpus grows); `"hash"` = `company_split_stable` (fixed per company).
+CompanySplitMethod = Literal["greedy", "hash"]
+COMPANY_SPLIT_METHODS: tuple[str, ...] = ("greedy", "hash")
+
+#: How a replay dataset's split was assigned, as recorded on
+#: `replay_datasets.split_method` (schema version 5) by `rli.replay.build`
+#: and read back by `rli.eval.metrics.split_map_for_dataset`.
+SPLIT_METHOD_TEMPORAL = "temporal"
+SPLIT_METHOD_COMPANY_HASH = "company-hash"
+SPLIT_METHOD_COMPANY_GREEDY = "company-greedy"
 
 SPLITS_COLUMNS = ["posting_id", "company_id", "first_observed", "temporal_split", "company_split"]
 
@@ -298,6 +331,43 @@ def company_split(
     return result
 
 
+def company_split_stable(
+    rows: Sequence[SplitRow],
+    *,
+    seed: int = DEFAULT_SEED,
+    fractions: tuple[float, float, float] = (0.6, 0.2, 0.2),
+) -> dict[str, Split]:
+    """Assign each posting to its COMPANY's fixed split (module docstring).
+
+    A company's split is a pure function of `(seed, company_id, fractions)`:
+    the first 64 bits of `blake2b(f"{seed}:{company_id}")` as a fraction of
+    2**64, compared against the cumulative `fractions` (dev, then validation,
+    then test). Adding or removing other rows never moves a company, which is
+    what lets a replay dataset be extended or rebuilt later without a company
+    changing sides. Same validation as `company_split`.
+    """
+    _check_unique_posting_ids(rows)
+    _validate_fractions(fractions)
+    dev_edge = fractions[0]
+    validation_edge = fractions[0] + fractions[1]
+    by_company: dict[str, Split] = {}
+    result: dict[str, Split] = {}
+    for row in rows:
+        split = by_company.get(row.company_id)
+        if split is None:
+            digest = hashlib.blake2b(f"{seed}:{row.company_id}".encode(), digest_size=8).digest()
+            position = int.from_bytes(digest, "big") / 2.0**64
+            if position < dev_edge:
+                split = "dev"
+            elif position < validation_edge:
+                split = "validation"
+            else:
+                split = "test"
+            by_company[row.company_id] = split
+        result[row.posting_id] = split
+    return result
+
+
 def assign_splits(
     rows: Sequence[SplitRow],
     *,
@@ -305,15 +375,24 @@ def assign_splits(
     validation_cutoff: datetime | None = None,
     seed: int = DEFAULT_SEED,
     fractions: tuple[float, float, float] = (0.6, 0.2, 0.2),
+    company_method: CompanySplitMethod = "greedy",
 ) -> list[SplitAssignment]:
     """Compute both splits for `rows` and combine them, preserving order.
 
     One `SplitAssignment` is produced per input row, in the same order as
-    `rows`. See `temporal_split` and `company_split` for the individual
-    semantics and their `ValueError` conditions.
+    `rows`. See `temporal_split` and `company_split` / `company_split_stable`
+    (`company_method`) for the individual semantics and their `ValueError`
+    conditions.
     """
+    if company_method not in COMPANY_SPLIT_METHODS:
+        raise ValueError(
+            f"company_method must be one of {COMPANY_SPLIT_METHODS}, got {company_method!r}"
+        )
     temporal = temporal_split(rows, cutoff, validation_cutoff=validation_cutoff)
-    company = company_split(rows, seed=seed, fractions=fractions)
+    if company_method == "hash":
+        company = company_split_stable(rows, seed=seed, fractions=fractions)
+    else:
+        company = company_split(rows, seed=seed, fractions=fractions)
     return [
         SplitAssignment(
             posting_id=row.posting_id,

@@ -112,14 +112,21 @@ CREATE INDEX IF NOT EXISTS idx_board_snapshots_company_captured
 --
 -- first_published / updated_at (schema version 4): the ATS's OWN stated
 -- dates for the job as this capture's listing reported them, normalized to
--- UTC-Z — Greenhouse `first_published` / `updated_at`, Ashby `publishedAt`
--- (-> first_published). Both documented `ats_native` (spec.md §3). NULL for
--- Lever (undocumented dates, untrusted), for archive captures, for every
--- capture taken before version 4, and whenever the listing omitted or
--- garbled the field. `updated_at` here is the ATS's last-modified time, NOT
--- a row-maintenance timestamp. The replay builder cites them point-in-time:
--- available from the capture's `captured_at`, never earlier.
+-- UTC-Z — Greenhouse `first_published` / `updated_at`. Both documented
+-- `ats_native` (spec.md §3). NULL for Lever (undocumented dates, untrusted),
+-- for archive captures, for every capture taken before version 4, and
+-- whenever the listing omitted or garbled the field. `updated_at` here is the
+-- ATS's last-modified time, NOT a row-maintenance timestamp. The replay
+-- builder cites them point-in-time: available from the capture's
+-- `captured_at`, never earlier.
 -- Version-3 databases gain both columns via rli.db.MIGRATIONS[3].
+--
+-- last_published (schema version 5): Ashby `publishedAt`, which Ashby
+-- documents as "when the job was LAST published" — a re-publish moves it, so
+-- it is never first-publish evidence. It is cited only as a refresh
+-- candidate (spec.md §5 amendment 2026-09-10: it counts toward recency only
+-- when it coincides with an observed content-hash change). Version 4 stored
+-- it in `first_published`; rli.db.MIGRATIONS[4] moves those rows here.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS board_snapshot_jobs (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -131,7 +138,8 @@ CREATE TABLE IF NOT EXISTS board_snapshot_jobs (
     description_hash    TEXT,
     url                 TEXT,
     first_published     TEXT,
-    updated_at          TEXT
+    updated_at          TEXT,
+    last_published      TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_board_snapshot_jobs_board_snapshot_id
@@ -215,12 +223,17 @@ CREATE INDEX IF NOT EXISTS idx_evidence_run_id ON evidence (run_id);
 --
 -- posting_id is nullable: an unresolved-URL run (resolution failed before a
 -- posting could be identified) must still be recordable.
+--
+-- system 'R' (schema version 5): a no-LLM, eligibility-gated baseline. A
+-- version-4 database gains it via rli.db.MIGRATIONS[4], which REBUILDS this
+-- table (SQLite cannot alter a CHECK in place); the same DDL lives in
+-- rli.db.RUNS_V5_DDL and tests assert the two stay in sync.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS runs (
     id                  TEXT PRIMARY KEY,
     posting_id          TEXT REFERENCES postings (posting_id),
     input_url           TEXT NOT NULL,
-    system              TEXT NOT NULL CHECK (system IN ('A', 'B', 'C', 'C2')),
+    system              TEXT NOT NULL CHECK (system IN ('A', 'B', 'C', 'C2', 'R')),
     mode                TEXT NOT NULL CHECK (mode IN ('live', 'replay')),
     replay_at           TEXT,    -- historical time T for replay runs; null for live runs
     policy_version      TEXT,
@@ -392,6 +405,15 @@ CREATE TABLE IF NOT EXISTS posting_page_dates (
 --                          (spec.md §3 forbids backdating a current discovery
 --                          onto the replay timeline).
 --
+-- Frozen split assignment (schema version 5): `replay_cases.split` is the
+-- split each case's posting was assigned to AT BUILD TIME, and
+-- `replay_datasets.split_method` / `split_seed` / `split_cutoff` /
+-- `split_validation_cutoff` record how; `exclude_companies_from` is the JSON
+-- list of datasets whose companies the build excluded. Evaluation reads these
+-- instead of re-splitting the (growing) corpus. NULL on datasets built before
+-- version 5 (rli.eval.metrics.split_map_for_dataset reconstructs those).
+-- Version-4 databases gain the columns via rli.db.MIGRATIONS[4].
+--
 -- posting_id deliberately carries NO foreign key to `postings`: a replay
 -- subject may be a posting the collector has not committed a row for, and the
 -- eval layer is forbidden from creating one (rli/eval/runner.py's write
@@ -408,7 +430,12 @@ CREATE TABLE IF NOT EXISTS replay_datasets (
     postings        INTEGER NOT NULL,
     companies       INTEGER NOT NULL,
     cases           INTEGER NOT NULL,
-    notes           TEXT
+    notes           TEXT,
+    split_method    TEXT,
+    split_seed      INTEGER,
+    split_cutoff    TEXT,
+    split_validation_cutoff TEXT,
+    exclude_companies_from TEXT
 );
 
 CREATE TABLE IF NOT EXISTS replay_cases (
@@ -418,6 +445,7 @@ CREATE TABLE IF NOT EXISTS replay_cases (
     company_id      TEXT NOT NULL,
     canonical_url   TEXT NOT NULL,
     built_at        TEXT NOT NULL,
+    split           TEXT CHECK (split IN ('dev', 'validation', 'test')),
     PRIMARY KEY (dataset_id, posting_id, replay_at)
 );
 
