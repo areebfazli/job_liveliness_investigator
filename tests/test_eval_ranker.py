@@ -574,3 +574,23 @@ def test_evaluate_ranker_on_realistic_but_small_db_is_insufficient_data(
     assert result.status == "insufficient_data"
     assert result.keep is False
     assert result.rows == 3
+
+
+@pytest.mark.parametrize(
+    ("claim_type", "expected"),
+    [("first_published", 1.0), ("updated_at", 1.0), ("last_published", 1.0), ("other", 0.0)],
+)
+def test_has_publish_evidence_counts_ashby_last_published(
+    cfg: Config, claim_type: str, expected: float
+) -> None:
+    """Ashby's `last_published` is a stated publish date, read like `updated_at`."""
+    from rli.eval.ranker import _features_for
+
+    rows = [{"source_quality": "ats_native", "claim_type": claim_type}]
+    features = _features_for(
+        rows,  # type: ignore[arg-type]
+        probe="company_events",
+        n_probes_before=2,
+        cfg=cfg,
+    )
+    assert features["has_publish_evidence"] == expected

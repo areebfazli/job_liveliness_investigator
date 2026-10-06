@@ -50,8 +50,8 @@ row can never leak the outcome of the probe it is scoring):
   `n_evidence_ats_native`, `n_evidence_page_structured`, `n_evidence_archive`,
   `n_evidence_news`, `n_evidence_enrichment` — the volume and provenance mix
   of everything already known.
-* `has_publish_evidence` (an `evidence.claim_type` of `first_published` or
-  `updated_at` has been seen), `has_board_present`, `has_board_absent` (the
+* `has_publish_evidence` (an `evidence.claim_type` of `first_published`,
+  `updated_at` or `last_published` has been seen), `has_board_present`, `has_board_absent` (the
   `board_snapshot` claims of the same names, see `rli.eval.case`) — coarse
   flags for the policy inputs spec.md §5 cares about most.
 * `n_probes_before` — how many probes (dynamic or the always-run pair) the
@@ -282,12 +282,18 @@ _SOURCE_QUALITIES: tuple[str, ...] = (
 )
 
 #: `evidence.claim_type` values that count as "we have seen a publish-date
-#: claim" (`rli.probes.resolve_posting` emits both). Kept narrow and local
-#: rather than importing `rli.eval.metrics.CLAIM_FAMILIES`'s broader
-#: `"publish"` family, since this feature only needs these two literal
-#: values and importing the family would couple this module's feature
-#: shape to a data-quality taxonomy that may grow independently of it.
-_PUBLISH_CLAIM_TYPES: frozenset[str] = frozenset({"first_published", "updated_at"})
+#: claim" — the stated dates `rli.probes.resolve_posting` (and the replay
+#: builder's board-capture claims) emit. `last_published` (Ashby
+#: `publishedAt`) is included on the same footing as `updated_at`: the policy
+#: reads both only as refresh candidates (`rli.policy.inputs`), and leaving
+#: it out would make every Ashby posting look date-less to the ranker. Kept
+#: narrow and local rather than importing `rli.eval.metrics.CLAIM_FAMILIES`'s
+#: broader `"publish"` family (which also holds the synthesized
+#: `refreshed_at`), so this feature's shape does not move with a
+#: data-quality taxonomy that may grow independently of it.
+_PUBLISH_CLAIM_TYPES: frozenset[str] = frozenset(
+    {"first_published", "updated_at", "last_published"}
+)
 
 #: `board_snapshot`'s two claim types (`rli.eval.case.CLAIM_BOARD_PRESENT` /
 #: `rli.policy.inputs.CLAIM_BOARD_ABSENT`), restated as literals for the

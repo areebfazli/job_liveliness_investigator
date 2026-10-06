@@ -137,6 +137,22 @@ Judgment calls
   datasets — the way to make a company-holdout dataset company-DISJOINT from
   the temporal dev dataset (`rli replay build --exclude-companies-from`).
 
+* **The company holdout is excluded from every build.** Whatever the split
+  kind, every company the STABLE company hash (seed = the build's seed,
+  fractions 0.6/0.2/0.2) assigns to `test` is dropped before cases are
+  planned (`stable_test_companies`), and the dataset records it in
+  `replay_datasets.company_holdout` (JSON: method, seed, fractions, count).
+  Without this a temporal dataset happily used hash-test companies for
+  development (50 of 70 in dev-7d), so no later company-holdout evaluation
+  could be clean. A temporal build's own split is unchanged: its postings are
+  still dev/validation/test by time; only the company holdout is removed
+  from it. `rli.eval.evaluate` re-checks the disjointness at evaluation.
+
+* **Snapshot run windows.** Grid points falling inside a recorded pre-fix
+  snapshot run window are moved to the window's end
+  (`rli.snapshots.run_windows`), and the first-published guard reads its
+  first-sighting bound through the same windows.
+
 * **The grid endpoint is always included, even when it is not on the step.**
   `grid_times` walks `first_observed, +N days, ...` up to
   `min(first_seen_absent, now)` and then appends that endpoint if the walk
@@ -273,6 +289,7 @@ from rli.policy.splits import (
     SPLIT_METHOD_TEMPORAL,
     CompanySplitMethod,
     Split,
+    stable_company_split_of,
 )
 from rli.probes.base import Probe, ProbeClaim, ProbeContext
 from rli.probes.company_events import CompanyEventsProbe
@@ -287,6 +304,11 @@ from rli.replay.mode import (
     open_replay_probe_runner,
 )
 from rli.replay.pit import installed_shadows, point_in_time
+from rli.snapshots.run_windows import (
+    guard_bound,
+    load_stamped_windows,
+    shift_out_of_stamped_windows,
+)
 
 __all__ = [
     "DEFAULT_GRID_STEP_DAYS",
@@ -632,7 +654,11 @@ def capture_date_claims(
                 fetched_at=fetched,
             )
         )
-    return guard_first_published(claims, _first_seen_at(row, replay_at))
+    # A first sighting stamped inside a pre-fix snapshot run window is too
+    # early by up to the run's length (rli.snapshots.run_windows.guard_bound).
+    return guard_first_published(
+        claims, guard_bound(_first_seen_at(row, replay_at), load_stamped_windows(conn))
+    )
 
 
 def _first_seen_at(row: sqlite3.Row, replay_at: datetime) -> datetime | None:
@@ -1051,6 +1077,7 @@ def _upsert_dataset(
     split_cutoff: datetime | None = None,
     split_validation_cutoff: datetime | None = None,
     exclude_companies_from: Sequence[str] = (),
+    company_holdout: dict[str, object] | None = None,
 ) -> None:
     """Write the `replay_datasets` header, creating or updating it in place.
 
@@ -1069,8 +1096,9 @@ def _upsert_dataset(
         INSERT INTO replay_datasets
             (dataset_id, created_at, split_kind, split_name, grid_step_days,
              postings, companies, cases, notes, split_method, split_seed,
-             split_cutoff, split_validation_cutoff, exclude_companies_from)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             split_cutoff, split_validation_cutoff, exclude_companies_from,
+             company_holdout)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (dataset_id) DO UPDATE SET
             created_at = excluded.created_at,
             split_kind = excluded.split_kind,
@@ -1084,7 +1112,8 @@ def _upsert_dataset(
             split_seed = excluded.split_seed,
             split_cutoff = excluded.split_cutoff,
             split_validation_cutoff = excluded.split_validation_cutoff,
-            exclude_companies_from = excluded.exclude_companies_from
+            exclude_companies_from = excluded.exclude_companies_from,
+            company_holdout = excluded.company_holdout
         """,
         (
             dataset_id,
@@ -1101,6 +1130,7 @@ def _upsert_dataset(
             None if split_cutoff is None else to_utc_z(split_cutoff),
             None if split_validation_cutoff is None else to_utc_z(split_validation_cutoff),
             json.dumps(list(exclude_companies_from)) if exclude_companies_from else None,
+            None if company_holdout is None else json.dumps(company_holdout, sort_keys=True),
         ),
     )
     conn.commit()
@@ -1407,6 +1437,13 @@ def build_dataset(
         split_method = SPLIT_METHOD_COMPANY_GREEDY
 
     excluded = _companies_of_datasets(conn, exclude_companies_from, building=dataset_id)
+    # The STABLE company holdout (module docstring, "The company holdout is
+    # excluded from every build"): whatever this build's own split kind, a
+    # company the stable hash assigns to `test` never enters a non-test
+    # dataset, so a later company-holdout evaluation cannot meet a company
+    # that some temporal dataset already used for development.
+    holdout_companies = stable_test_companies(conn, seed=seed)
+    excluded |= holdout_companies
     if split_kind == "company":
         # A company split never puts one company on two sides, so this is
         # empty in practice; it is the structural guarantee that a company
@@ -1428,6 +1465,12 @@ def build_dataset(
         "split_cutoff": split_cutoff if split_kind == "temporal" else None,
         "split_validation_cutoff": validation_cutoff if split_kind == "temporal" else None,
         "exclude_companies_from": tuple(exclude_companies_from),
+        "company_holdout": {
+            "method": SPLIT_METHOD_COMPANY_HASH,
+            "seed": seed,
+            "fractions": list(STABLE_HOLDOUT_FRACTIONS),
+            "test_companies_excluded": len(holdout_companies),
+        },
     }
 
     # The header first: `replay_cases.dataset_id` is a foreign key into it.
@@ -1453,6 +1496,7 @@ def build_dataset(
     conn.commit()
 
     store = ReplayProbeStore()
+    stamped_windows = load_stamped_windows(conn)
     cases = 0
     probe_records = 0
     archive_records = 0
@@ -1489,7 +1533,11 @@ def build_dataset(
         observed_by = max(
             [clock(), *(observation.observed_at for observation in observations.values())]
         )
-        times = plan.times
+        # A grid point inside a pre-fix snapshot run window would read
+        # captures stamped with the run's START that may not have been made
+        # until its end: shift it to the window's end
+        # (rli.snapshots.run_windows; the build-time point is never in one).
+        times = shift_out_of_stamped_windows(plan.times, stamped_windows)
         if times and times[-1] == moment and observed_by > moment:
             times = (*times[:-1], observed_by)
 
@@ -1653,6 +1701,30 @@ def _companies_of_datasets(
             raise ValueError(f"cannot exclude the companies of dataset {other!r}: it has no cases")
         companies.update(str(row["company_id"]) for row in rows)
     return companies
+
+
+#: The fractions the stable company holdout is cut with (dev, validation,
+#: test): `rli.policy.splits.company_split_stable`'s defaults.
+STABLE_HOLDOUT_FRACTIONS: tuple[float, float, float] = (0.6, 0.2, 0.2)
+
+
+def stable_test_companies(conn: sqlite3.Connection, *, seed: int = DEFAULT_SEED) -> set[str]:
+    """Every known company the stable company hash assigns to `test`.
+
+    Companies are read from both `companies` and `postings`, so a company
+    with postings but no target row is still covered.
+    """
+    known = {str(row[0]) for row in conn.execute("SELECT company_id FROM companies")}
+    known |= {
+        str(row[0])
+        for row in conn.execute("SELECT DISTINCT company_id FROM postings")
+        if row[0] is not None
+    }
+    return {
+        company
+        for company in known
+        if stable_company_split_of(company, seed=seed, fractions=STABLE_HOLDOUT_FRACTIONS) == "test"
+    }
 
 
 def _companies_with_split(

@@ -988,7 +988,8 @@ def test_report_headline_gate_shows_dataset_and_corpus_side_by_side(
     text = write_evaluation_report(tmp_path / "evaluation.md", report).read_text(encoding="utf-8")
 
     headline = text.split("## Headline gate (sample sizes)", 1)[1].split("## Systems run", 1)[0]
-    assert "evaluated dataset" in headline
+    assert "built (dataset row)" in headline
+    assert "SCORED (this evaluation)" in headline
     assert "collection corpus" in headline
     assert "NOT MET" in headline
     assert "corpus-wide" in headline

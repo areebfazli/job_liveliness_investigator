@@ -38,6 +38,7 @@ from test_eval_helpers import add_company
 from test_replay_helpers import NOW, dev_everything_cutoff, mock_ats, seed_corpus
 from typer.testing import CliRunner
 
+import rli.replay.build as replay_build
 from rli.agent.explanation import ExplanationOutput
 from rli.agent.investigator import InvestigatorOutput
 from rli.agent.loop import make_system_c
@@ -78,7 +79,10 @@ def template_db(tmp_path_factory: pytest.TempPathFactory) -> Path:
     conn = connect(path)
     try:
         seed_corpus(conn)
-        with respx.mock:
+        # Module scope runs before conftest's function-scoped switch-off of the
+        # stable company holdout, so it is switched off here too.
+        with respx.mock, pytest.MonkeyPatch.context() as patch:
+            patch.setattr(replay_build, "stable_test_companies", lambda _conn, **_kw: set())
             mock_ats()
             summary = build_dataset(
                 conn,

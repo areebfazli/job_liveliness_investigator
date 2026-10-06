@@ -229,3 +229,38 @@ def test_a_fetch_straddling_midnight_into_a_captured_day_writes_nothing(conn, cf
         )
     assert (summary.companies_ok, summary.companies_skipped) == (0, 1)
     assert conn.execute("SELECT COUNT(*) FROM board_snapshots").fetchone()[0] == 1
+
+
+@respx.mock
+def test_an_interrupted_company_leaves_no_partial_lifecycle_rows_but_the_window_is_recorded(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exception between the capture and the lifecycle commit must not be committed."""
+    import rli.snapshots.daily as daily
+
+    _board(ACME_URL, "acme", "11")
+
+    def half_written(conn_: sqlite3.Connection, **_kwargs: object) -> None:
+        conn_.execute(
+            "INSERT INTO postings (posting_id, company_id, ats, canonical_url, created_at) "
+            "VALUES ('greenhouse:acme:half', 'acme.com', 'greenhouse', 'https://x', ?)",
+            (to_utc_z(DAY1),),
+        )
+        raise KeyboardInterrupt("simulated Ctrl-C mid-company")
+
+    monkeypatch.setattr(daily, "_apply_posting_lifecycle", half_written)
+    with pytest.raises(KeyboardInterrupt):
+        run_daily_snapshot(
+            conn, load_config(), [ACME], DAY1, sleep=_no_sleep, clock=_SlowClock(DAY1)
+        )
+
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM postings WHERE posting_id = 'greenhouse:acme:half'"
+        ).fetchone()[0]
+        == 0
+    )
+    window = conn.execute(
+        "SELECT started_at, finished_at, stamped_at_start FROM snapshot_runs"
+    ).fetchall()
+    assert [tuple(row) for row in window] == [(to_utc_z(DAY1), to_utc_z(DAY1), 0)]

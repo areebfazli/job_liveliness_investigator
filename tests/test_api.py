@@ -191,6 +191,30 @@ def test_investigate_system_b_returns_spec_fields_and_writes_run(
 
 
 @respx.mock
+def test_investigate_system_r_runs_without_an_llm(
+    client: TestClient, conn: sqlite3.Connection
+) -> None:
+    job_id = "7002"
+    url = f"https://boards.greenhouse.io/acme/jobs/{job_id}"
+    _seed_history(conn, job_id)
+    conn.commit()
+    _mock_greenhouse(job_id, _gh_job(job_id, first_published_days_ago=5))
+
+    resp = client.post("/investigate", json={"url": url, "system": "R"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["system_used"] == "R"
+    assert data["degraded"] is False
+    run_row = conn.execute("SELECT * FROM runs WHERE id = ?", (data["run_id"],)).fetchone()
+    assert run_row["system"] == "R"
+    model_steps = conn.execute(
+        "SELECT COUNT(*) FROM run_steps WHERE run_id = ? AND component = 'model'",
+        (data["run_id"],),
+    ).fetchone()[0]
+    assert model_steps == 0
+
+
+@respx.mock
 def test_investigate_default_system_without_a_usable_llm_falls_back_to_b(
     client: TestClient, conn: sqlite3.Connection, cfg: Config, monkeypatch: pytest.MonkeyPatch
 ) -> None:

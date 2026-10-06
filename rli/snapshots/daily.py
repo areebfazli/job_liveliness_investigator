@@ -56,6 +56,7 @@ from rli.probes.base import ProbeContext
 from rli.probes.board_snapshot import BoardJob, board_snapshot
 from rli.probes.persist import record_capture_attempt, save_board_snapshot
 from rli.snapshots.page_dates import PageDateSummary, collect_lever_page_dates
+from rli.snapshots.run_windows import finish_run, start_run
 from rli.snapshots.targets import Target
 
 __all__ = ["DailySnapshotSummary", "run_daily_snapshot"]
@@ -272,6 +273,10 @@ def run_daily_snapshot(
     """
     summary = DailySnapshotSummary()
     read_clock: Callable[[], datetime] = clock if clock is not None else (lambda: now)
+    # The run's window (rli.snapshots.run_windows): recorded so a later reader
+    # can bound when this run's captures were really made. Each capture below
+    # carries its own fetch time, so the row says `stamped_at_start = 0`.
+    window_id = start_run(conn, read_clock())
     net_client = NetClient.from_config(cfg, probe="board_snapshot", sleep=sleep)
     # Lever companies captured successfully THIS run, with each one's capture
     # stamp: the only postings the page-date pass may visit (see
@@ -344,5 +349,12 @@ def run_daily_snapshot(
             conn.rollback()
     finally:
         net_client.close()
+        # Every intended write above commits explicitly. Anything still open
+        # here is a company interrupted between its capture and its lifecycle
+        # update (an exception, Ctrl-C): roll it back so the window's own
+        # commit below cannot persist a half-written company.
+        if conn.in_transaction:
+            conn.rollback()
+        finish_run(conn, window_id, read_clock())
 
     return summary

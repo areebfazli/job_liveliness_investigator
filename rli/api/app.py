@@ -50,6 +50,7 @@ from rli.db import connect, init_db
 from rli.eval.runner import RunResult
 from rli.eval.system_a import run_system_a
 from rli.eval.system_b import run_system_b
+from rli.eval.system_r import run_system_r
 from rli.llm.client import (
     CachedClient,
     OpenAICompatibleClient,
@@ -63,7 +64,7 @@ _LOG = logging.getLogger("rli.api")
 
 _UI_INDEX = Path(__file__).parent.parent / "ui" / "index.html"
 
-SystemChoice = Literal["A", "B", "C"]
+SystemChoice = Literal["A", "B", "C", "R"]
 OutcomeType = Literal["applied", "reply", "screen", "interview", "offer", "rejection", "silence"]
 
 
@@ -222,6 +223,9 @@ def create_app(
             elif requested_system == "B":
                 result = run_system_b(conn, cfg, body.url)
                 system_used = "B"
+            elif requested_system == "R":
+                result = run_system_r(conn, cfg, body.url)
+                system_used = "R"
             else:
                 # Availability is decided per REQUEST, on the System C path
                 # only, and never at startup: a bounded (1.5s) `GET

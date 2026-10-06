@@ -41,6 +41,16 @@ The five checks, and why each is the right question
   (a build with the tool cache off) the rule is silent — it can only convict
   on a record that exists.
 
+* **`capture_fetched_after_t`** — a replay case whose `T` lies inside a
+  recorded PRE-FIX daily snapshot run window (`snapshot_runs` with
+  `stamped_at_start = 1`, rli.snapshots.run_windows) in which its company
+  was captured: that capture is stamped with the run's START, so the
+  point-in-time corpus shows it at `T`, but the run may only have fetched the
+  company hours later (up to 18 h on 2026-10-01). Neither `evidence_after_t`
+  nor `evidence_fetched_after_t` can see this — the capture is read through
+  the point-in-time views, not through a network probe's evidence. One finding
+  per run. Silent on a database with no recorded windows.
+
 * **`cache_miss`** — a `run_steps` row of a replay run with
   `cache_status = 'miss'` on a TOOL row, i.e. on any `component` other than
   `'model'`. `rli.eval.runner` defines `'miss'` as "at least one call
@@ -379,6 +389,7 @@ from rli.probes.resolve_posting import ResolvePostingProbe
 from rli.probes.team_signal import TeamSignalProbe
 from rli.replay.mode import STEP_REPLAY_VIOLATION
 from rli.resolvers import ashby, greenhouse, jsonld, lever
+from rli.snapshots.run_windows import load_stamped_windows, uncovered_capture_batches
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from rli.replay.mode import ReplayNetPool
@@ -399,6 +410,7 @@ ViolationKind = str
 VIOLATION_KINDS: tuple[str, ...] = (
     "evidence_after_t",
     "evidence_fetched_after_t",
+    "capture_fetched_after_t",
     "cache_miss",
     "net_call",
     "missing_probe_result",
@@ -750,6 +762,12 @@ class LeakageReport(BaseModel):
     # dataset. See the module docstring's `input_without_evidence` judgment
     # calls for why that makes it a number rather than a gate.
     blob_input_exposures: int = 0
+    # Not a violation either: a DATABASE hazard. Pre-fix own capture batches
+    # (rli.snapshots.run_windows) that no recorded run window covers — their
+    # captures are stamped with an unknown run's start, so the
+    # `capture_fetched_after_t` rule cannot bound them. `rli
+    # import-run-windows` adds fallback windows that bring this to 0.
+    uncovered_capture_batches: int = 0
 
     counts: dict[str, int] = {}
     violations: tuple[Violation, ...] = ()
@@ -778,6 +796,9 @@ class LeakageReport(BaseModel):
             f"  blob input exposures={self.blob_input_exposures} (not a violation: "
             "a served `data` blob answers a policy input no claim backs at T; "
             "a NONZERO count needs a dataset rebuild to clear)",
+            f"  pre-fix capture batches with no recorded run window="
+            f"{self.uncovered_capture_batches} (not a violation: a NONZERO count means "
+            "capture_fetched_after_t cannot see them; run `rli import-run-windows`)",
         ]
         if self.counts:
             lines.append(
@@ -849,6 +870,11 @@ def check_dataset(
                 )
             )
 
+    try:
+        uncovered = len(uncovered_capture_batches(conn))
+    except sqlite3.Error:  # pragma: no cover - no board_snapshots table
+        uncovered = 0
+
     for run in runs:
         if run["replay_at"] is None:
             record(
@@ -859,7 +885,12 @@ def check_dataset(
             )
 
     if not by_id:
-        return LeakageReport(dataset_id=dataset_id, counts=counts, violations=tuple(found))
+        return LeakageReport(
+            dataset_id=dataset_id,
+            counts=counts,
+            violations=tuple(found),
+            uncovered_capture_batches=uncovered,
+        )
 
     placeholders = ",".join("?" for _ in by_id)
     run_ids = list(by_id)
@@ -978,6 +1009,60 @@ def check_dataset(
                 f"available_at={stamp} <= T={replay_at}, but tool_cache shows the fetch "
                 f"behind them completed at {max(real)}, after T",
             )
+
+    # -- rule 1c: a capture stamped with its snapshot run's START ----------
+    # See `capture_fetched_after_t` in the module docstring.
+    windows = load_stamped_windows(conn)
+    if windows:
+        case_company = {
+            (str(row["canonical_url"]), str(row["replay_at"])): str(row["company_id"])
+            for row in conn.execute(
+                "SELECT canonical_url, replay_at, company_id FROM replay_cases "
+                "WHERE dataset_id = ?",
+                (dataset_id,),
+            ).fetchall()
+        }
+        companies = sorted(set(case_company.values()))
+        stamped: dict[str, list[tuple[datetime, datetime]]] = {}
+        for window in windows:
+            for start in range(0, len(companies), 400):
+                chunk = companies[start : start + 400]
+                marks = ",".join("?" for _ in chunk)
+                for row in conn.execute(
+                    f"SELECT company_id, captured_at FROM board_snapshots "
+                    f"WHERE source = 'own' AND company_id IN ({marks}) "
+                    f"AND captured_at >= ? AND captured_at < ?",
+                    (*chunk, to_utc_z(window.started_at), to_utc_z(window.finished_at)),
+                ):
+                    try:
+                        captured = parse_utc(str(row["captured_at"]))
+                    except ValueError:
+                        continue
+                    stamped.setdefault(str(row["company_id"]), []).append(
+                        (captured, window.finished_at)
+                    )
+        for run in runs:
+            if run["replay_at"] is None:
+                continue
+            company = case_company.get((str(run["input_url"]), str(run["replay_at"])))
+            if company is None or company not in stamped:
+                continue
+            try:
+                moment = parse_utc(str(run["replay_at"]))
+            except ValueError:
+                continue
+            hits = [
+                (captured, end) for captured, end in stamped[company] if captured <= moment < end
+            ]
+            if hits:
+                captured, end = hits[0]
+                record(
+                    "capture_fetched_after_t",
+                    run,
+                    f"T={run['replay_at']} reads the own board capture of {company} stamped "
+                    f"{to_utc_z(captured)}, the START of a pre-fix snapshot run that ran "
+                    f"until {to_utc_z(end)}: the capture may have been made after T",
+                )
 
     # -- rules 3 and the dataset-gap check --------------------------------
     steps_checked = int(
@@ -1207,6 +1292,7 @@ def check_dataset(
         failed_runs=failed_runs,
         model_cache_misses=model_cache_misses,
         blob_input_exposures=len(exposed),
+        uncovered_capture_batches=uncovered,
         counts=counts,
         violations=tuple(found),
         truncated=max(0, total - len(found)),

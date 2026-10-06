@@ -31,8 +31,10 @@ __all__ = [
     "MIGRATIONS",
     "POSTING_PAGE_DATES_DDL",
     "RUNS_V5_DDL",
+    "SNAPSHOT_RUNS_DDL",
     "SCHEMA_VERSION",
     "connect",
+    "connect_read_only",
     "init_db",
     "schema_version",
 ]
@@ -58,7 +60,11 @@ BUSY_TIMEOUT_MS = 5000
 #         tables (`replay_cases.split`, `replay_datasets.split_*`,
 #         `.exclude_companies_from`), and `runs.system` also accepts 'R' (the
 #         table is rebuilt: SQLite cannot alter a CHECK constraint in place).
-SCHEMA_VERSION = 5
+# 5 -> 6: `snapshot_runs` (each daily snapshot run's start/end, so captures
+#         stamped with a run's start can be dated honestly) and
+#         `replay_datasets.company_holdout` (the stable company holdout a
+#         build excluded).
+SCHEMA_VERSION = 6
 
 # from-version -> SQL script (or idempotent callable) that upgrades that
 # version to version + 1. `schema.sql` describes only the newest version;
@@ -270,12 +276,31 @@ def _rebuild_runs_for_r(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE runs")
     conn.execute("ALTER TABLE runs_v5_new RENAME TO runs")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_posting_id ON runs (posting_id)")
-    problems = conn.execute("PRAGMA foreign_key_check").fetchall()
+    problems = _runs_foreign_key_problems(conn)
     if problems:
         raise RuntimeError(
             f"runs table rebuild left {len(problems)} foreign-key violation(s); "
             f"first: {tuple(problems[0])!r}"
         )
+
+
+def _runs_foreign_key_problems(conn: sqlite3.Connection) -> list[tuple[object, ...]]:
+    """Foreign-key violations that involve `runs`: its own, and its children's.
+
+    Scoped rather than DB-wide so an unrelated, older violation elsewhere (a
+    `postings` reference from some other table, say) cannot block the rebuild
+    of `runs`. `foreign_key_check(child)` also reports the child's OTHER
+    references (e.g. `evidence.posting_id`), so those rows are filtered to
+    the ones whose parent is `runs`.
+    """
+    problems = [tuple(row) for row in conn.execute("PRAGMA foreign_key_check(runs)")]
+    for child in ("evidence", "run_steps"):
+        problems += [
+            tuple(row)
+            for row in conn.execute(f"PRAGMA foreign_key_check({child})")
+            if row[2] == "runs"
+        ]
+    return problems
 
 
 def _migrate_4_to_5(conn: sqlite3.Connection) -> None:
@@ -335,6 +360,48 @@ def _migrate_4_to_5(conn: sqlite3.Connection) -> None:
 MIGRATIONS[4] = _migrate_4_to_5
 
 
+# 5 -> 6. The same DDL lives in rli/db/schema.sql (the fresh-database path);
+# tests/test_run_windows_and_holdout.py asserts the two stay in sync. Frozen once
+# shipped.
+SNAPSHOT_RUNS_DDL = """
+CREATE TABLE IF NOT EXISTS snapshot_runs (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at          TEXT NOT NULL,
+    finished_at         TEXT,
+    stamped_at_start    INTEGER NOT NULL CHECK (stamped_at_start IN (0, 1)),
+    source              TEXT NOT NULL CHECK (
+        source IN ('snapshot', 'log_import', 'capture_fallback')
+    ),
+    log_file            TEXT,
+    UNIQUE (started_at, source)
+);
+"""
+
+
+def _migrate_5_to_6(conn: sqlite3.Connection) -> None:
+    """Version 6, atomically and idempotently: `snapshot_runs` + `company_holdout`.
+
+    `CREATE TABLE IF NOT EXISTS` and a column added only when missing, so a
+    database whose tables came from a newer `schema.sql` (which `init_db`
+    runs first) passes straight through. One `BEGIN IMMEDIATE` transaction,
+    the `user_version` stamp included: an interrupted upgrade leaves version 5.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(SNAPSHOT_RUNS_DDL)
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(replay_datasets)")}
+        if "company_holdout" not in existing:
+            conn.execute("ALTER TABLE replay_datasets ADD COLUMN company_holdout TEXT")
+        _set_schema_version(conn, 6)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+MIGRATIONS[5] = _migrate_5_to_6
+
+
 def _schema_sql() -> str:
     return resources.files("rli.db").joinpath("schema.sql").read_text(encoding="utf-8")
 
@@ -359,6 +426,25 @@ def connect(path: str | Path, *, busy_timeout_ms: int = BUSY_TIMEOUT_MS) -> sqli
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def connect_read_only(
+    path: str | Path, *, busy_timeout_ms: int = BUSY_TIMEOUT_MS
+) -> sqlite3.Connection:
+    """Open an EXISTING database with SQLite's `mode=ro`: no write can reach the file.
+
+    For reports run against the live database (`rli eval run --read-only`).
+    Unlike `connect` it sets no journal mode (that is a write) and never
+    creates the file: a missing path raises `sqlite3.OperationalError`.
+    """
+    target = Path(path)
+    if not target.exists():
+        raise sqlite3.OperationalError(f"database file not found: {target}")
+    uri = target.resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=int(busy_timeout_ms) / 1000)
+    conn.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)}")
     conn.row_factory = sqlite3.Row
     return conn
 

@@ -3,18 +3,20 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import typer
 
 from rli.agent.cli import app as agent_app
 from rli.archive.cli import app as archive_app
 from rli.config import load_config
-from rli.db import connect, init_db
+from rli.db import connect, connect_read_only, init_db
 from rli.eval.baseline import baseline_report, write_baseline_report
 from rli.eval.metrics import split_map_for_dataset
 from rli.eval.report import summarize_runs
 from rli.eval.system_a import run_system_a
 from rli.eval.system_b import run_system_b
+from rli.eval.system_r import run_system_r
 from rli.history.cli import app as history_app
 from rli.models.time import now_utc, parse_utc
 from rli.replay.build import DEFAULT_GRID_STEP_DAYS, build_dataset
@@ -142,6 +144,51 @@ def snapshot_command(
         conn.close()
 
 
+@app.command("import-run-windows")
+def import_run_windows_command(
+    logs: str = typer.Option(
+        "data/logs", "--logs", help="Directory holding the daily job's daily-*.log files."
+    ),
+    stamped_at_start_before: str = typer.Option(
+        "2026-10-06T21:50:16Z",
+        "--stamped-at-start-before",
+        help="Runs that STARTED before this instant stamped every capture with the run's "
+        "start (pre-fix); they are recorded with stamped_at_start=1.",
+    ),
+    db: str = typer.Option(_DEFAULT_DB_PATH, "--db", help="Path to the SQLite database file."),
+) -> None:
+    """One-off: record past daily snapshot runs' windows from their logs (schema v6).
+
+    Then gives every pre-fix capture batch that no logged window covers a
+    conservative fallback window (its stamp to the next own batch, at most
+    24 h). Idempotent (a window already recorded is skipped). Read by the
+    replay builder, the leakage checker and the first-published guard
+    (rli.snapshots.run_windows).
+    """
+    from pathlib import Path
+
+    from rli.models.time import parse_utc
+    from rli.snapshots.run_windows import add_fallback_windows, import_log_windows
+
+    try:
+        parse_utc(stamped_at_start_before)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--stamped-at-start-before") from exc
+
+    paths = sorted(Path(logs).glob("daily-*.log"))
+    if not paths:
+        raise typer.BadParameter(f"no daily-*.log files under {logs}", param_hint="--logs")
+    init_db(db)
+    conn = connect(db)
+    try:
+        summary = import_log_windows(conn, paths, stamped_at_start_before=stamped_at_start_before)
+        typer.echo(summary.describe())
+        fallback = add_fallback_windows(conn, stamped_at_start_before=stamped_at_start_before)
+        typer.echo(fallback.describe())
+    finally:
+        conn.close()
+
+
 @app.command("snapshot-status")
 def snapshot_status_command(
     db: str = typer.Option(
@@ -187,8 +234,10 @@ def snapshot_status_command(
         conn.close()
 
 
-# The spec.md §6 systems this CLI can drive. C / C2 land in PLAN.md M5.
-_SYSTEMS = ("A", "B")
+# The offline (no-LLM) spec.md §6 systems this CLI can drive directly. System
+# R is C's controller without the LLM (rli.eval.system_r); C is handled by
+# `replay run` (and the API) because it needs a model client.
+_SYSTEMS = ("A", "B", "R")
 
 
 def _normalized_system(system: str) -> str:
@@ -212,7 +261,8 @@ def run_command(
     system: str = typer.Option(
         ...,
         "--system",
-        help="Which system to run: A (full probes) or B (deterministic rules).",
+        help="Which system to run: A (full probes), B (deterministic rules) or R "
+        "(C's controller with no LLM: every eligible probe in rank order).",
     ),
     url: str = typer.Option(..., "--url", help="The job posting URL to investigate."),
     db: str = typer.Option(
@@ -237,7 +287,7 @@ def run_command(
     init_db(db)
     conn = connect(db)
     try:
-        runner = run_system_a if chosen == "A" else run_system_b
+        runner = {"A": run_system_a, "B": run_system_b, "R": run_system_r}[chosen]
         result = runner(conn, cfg, url)
         typer.echo(
             f"run_id={result.run_id} system={result.system} "
@@ -255,7 +305,7 @@ def runs_summary_command(
     system: str = typer.Option(
         ...,
         "--system",
-        help="Which system to summarize: A or B.",
+        help="Which system to summarize: A, B or R.",
     ),
     db: str = typer.Option(
         _DEFAULT_DB_PATH,
@@ -394,7 +444,8 @@ def replay_run_command(
     system: str = typer.Option(
         ...,
         "--system",
-        help="Which system to replay: A (full probes), B (rules), or C (LLM agent, PLAN.md M5).",
+        help="Which system to replay: A (full probes), B (rules), C (LLM agent, PLAN.md M5), "
+        "or R (C's controller with no LLM; offline like A and B).",
     ),
     dataset: str = typer.Option(..., "--dataset", help="Replay dataset id to run against."),
     limit_cases: int | None = typer.Option(
@@ -687,6 +738,17 @@ def _validated_split_kind(value: str | None) -> str | None:
     return value
 
 
+def _eval_connection(db: str, *, read_only: bool):
+    """The evaluation's connection: `mode=ro` (and no `init_db`) under `--read-only`."""
+    if read_only:
+        try:
+            return connect_read_only(db)
+        except sqlite3.OperationalError as exc:
+            raise typer.BadParameter(str(exc), param_hint="--db") from exc
+    init_db(db)
+    return connect(db)
+
+
 @eval_app.command("run")
 def eval_run_command(
     dataset: str = typer.Option(..., "--dataset", help="Replay dataset id to evaluate."),
@@ -704,6 +766,18 @@ def eval_run_command(
         "configured llm.base_url (or an injected client) C is recorded as "
         "'not run: no LLM endpoint configured' and no model call is attempted.",
     ),
+    with_r: bool = typer.Option(
+        False,
+        "--with-r",
+        help="Replay System R (C's controller, no LLM; offline) when the dataset has no "
+        "R runs. Existing R runs are scored either way.",
+    ),
+    read_only: bool = typer.Option(
+        False,
+        "--read-only",
+        help="Open the database with SQLite mode=ro and write nothing: no replay, no "
+        "holdout trace marker. Systems without runs are reported as absent.",
+    ),
     split_kind: str | None = typer.Option(
         None,
         "--split-kind",
@@ -712,8 +786,8 @@ def eval_run_command(
     cutoff: str | None = typer.Option(
         None,
         "--cutoff",
-        help="Temporal-split cutoff (ISO 8601 UTC). Defaults to the dataset's created_at, "
-        "which reproduces the assignment the build used.",
+        help="Temporal-split cutoff (ISO 8601 UTC) for a deliberate re-split over today's "
+        "corpus. By default the split frozen on the dataset at build time is used.",
     ),
     validation_cutoff: str | None = typer.Option(
         None, "--validation-cutoff", help="Temporal-split validation cutoff (ISO 8601 UTC)."
@@ -747,9 +821,12 @@ def eval_run_command(
     # cost seconds to import and neither of which any other command needs.
     from rli.eval.evaluate import evaluate, write_evaluation_report
 
+    if read_only and rerun:
+        raise typer.BadParameter(
+            "--rerun replays systems; --read-only forbids it", param_hint="--rerun"
+        )
     cfg = load_config()
-    init_db(db)
-    conn = connect(db)
+    conn = _eval_connection(db, read_only=read_only)
     try:
         report = evaluate(
             conn,
@@ -759,7 +836,9 @@ def eval_run_command(
             cutoff=_optional_moment(cutoff, "--cutoff"),
             validation_cutoff=_optional_moment(validation_cutoff, "--validation-cutoff"),
             with_c=with_c,
+            with_r=with_r,
             rerun=rerun,
+            read_only=read_only,
             include_survival=survival,
         )
         path = write_evaluation_report(out, report)
@@ -784,7 +863,13 @@ def eval_gates_command(
     cutoff: str | None = typer.Option(
         None,
         "--cutoff",
-        help="Temporal-split cutoff (ISO 8601 UTC). Defaults to the dataset's created_at.",
+        help="Temporal-split cutoff (ISO 8601 UTC) for a deliberate re-split. By default "
+        "the split frozen on the dataset at build time is used.",
+    ),
+    read_only: bool = typer.Option(
+        False,
+        "--read-only",
+        help="Open the database with SQLite mode=ro and write nothing.",
     ),
     db: str = typer.Option(_DEFAULT_DB_PATH, "--db", help="Path to the SQLite database file."),
 ) -> None:
@@ -800,8 +885,7 @@ def eval_gates_command(
     from rli.eval.evaluate import evaluate
 
     cfg = load_config()
-    init_db(db)
-    conn = connect(db)
+    conn = _eval_connection(db, read_only=read_only)
     try:
         report = evaluate(
             conn,
@@ -810,9 +894,12 @@ def eval_gates_command(
             split_kind=_validated_split_kind(split_kind),  # type: ignore[arg-type]
             cutoff=_optional_moment(cutoff, "--cutoff"),
             include_survival=False,
+            read_only=read_only,
         )
         typer.echo(f"agent gate: {report.agent_gate.status.upper()}")
         typer.echo(report.agent_gate.describe())
+        typer.echo("")
+        typer.echo(report.llm_value.describe())
         typer.echo("")
         typer.echo(f"product gate: {report.product_gate.status.upper()}")
         typer.echo(report.product_gate.describe())

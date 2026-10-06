@@ -111,10 +111,12 @@ from rli.eval.metrics import (
     DEFAULT_SPLITS,
     SYSTEM_A_CAVEAT,
     EfficiencyMetrics,
+    MetricsCase,
     MetricsCaseSet,
     agent_efficiency,
     collect_system_runs,
 )
+from rli.probes.registry import DYNAMIC_PROBES
 
 __all__ = [
     "AGENT_GATE_AGREEMENT_MARGIN",
@@ -122,8 +124,18 @@ __all__ = [
     "GATE_TOLERANCE",
     "ActionOutcomeStats",
     "AgentGateResult",
+    "CaseDifference",
+    "LlmValueComparison",
+    "LlmValueStatus",
+    "LLM_MIN_AGREEMENT_GAIN",
+    "LLM_MIN_COMPARED_CASES",
+    "LLM_MIN_DIFFERING_CASES",
+    "LLM_MIN_RELATIVE_PROBE_SAVING",
+    "MAX_LISTED_DIFFERENCES",
+    "SPEC_PREFER_SIMPLER",
     "ProductGateResult",
     "agent_gate",
+    "llm_value_comparison",
     "product_gate",
 ]
 
@@ -467,6 +479,577 @@ def agent_gate(
             "macro_required": macro_required,
             "macro_pass": macro_pass,
             "notes": tuple(notes),
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
+# 1b. Does the LLM add anything? System C vs System R
+# ---------------------------------------------------------------------------
+
+#: How many differing cases `LlmValueComparison.differences` lists in full.
+MAX_LISTED_DIFFERENCES = 50
+
+#: spec.md §6, quoted where the comparison invokes it.
+SPEC_PREFER_SIMPLER = "If rules are equally good and simpler, remove the agent."
+
+#: MATERIALITY thresholds for crediting (or debiting) the LLM. A difference
+#: counts only when BOTH hold: the rate moves by at least this much AND at
+#: least `LLM_MIN_DIFFERING_CASES` compared cases move in that direction.
+#: A float tolerance would let one run's quirk (one investigator that stopped
+#: early, say) be reported as "the LLM's measured contribution".
+#:
+#: probe use: relative change in medium/high probe steps per compared case,
+#: `(R - C) / R`, at least 1%.
+LLM_MIN_RELATIVE_PROBE_SAVING = 0.01
+#: agreement with the reference: at least 1 percentage point, overall or macro.
+LLM_MIN_AGREEMENT_GAIN = 0.01
+#: ...and at least this many compared cases in that direction (cases where C
+#: used fewer medium/high probes than R; cases where C agrees with the
+#: reference and R does not), mirrored for the "worse" direction.
+LLM_MIN_DIFFERING_CASES = 10
+#: Below this many COMPARED paired cases nothing is concluded either way
+#: (`inconclusive`): ten-odd cases cannot show that R is "equally good".
+LLM_MIN_COMPARED_CASES = 30
+
+_DIM_PROBE_USE = "probe use"
+#: A material LOSS charged to C when at least `LLM_MIN_DIFFERING_CASES`
+#: paired C runs had an investigator error: those runs are excluded from the
+#: rates (a failed investigator skips probes; that is not a saving), so their
+#: cost to C has to be charged somewhere.
+_DIM_RELIABILITY = "investigator reliability"
+
+LlmValueStatus = Literal["not_run", "inconclusive", "llm_adds_nothing", "llm_better", "mixed"]
+
+
+class CaseDifference(BaseModel):
+    """One paired case where C and R chose different probes or actions."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    input_url: str
+    replay_at: str
+    split: str
+    candidate_probes: tuple[str, ...] = ()
+    deterministic_probes: tuple[str, ...] = ()
+    candidate_action: str | None = None
+    deterministic_action: str | None = None
+    reference_action: str | None = None
+    candidate_investigator_error: bool = False
+
+
+class LlmValueComparison(BaseModel):
+    """System C (LLM investigator + controller) against System R (controller, no LLM).
+
+    Both run the SAME controller, eligibility, ranking and budgets; the only
+    difference is who proposes candidates. This is NOT a spec.md §6 gate (the
+    agent gate, C vs B, stays as specified); it is what spec.md §6's last
+    sentence needs to be applied honestly.
+
+    Everything is measured on PAIRED cases only (same `(input_url,
+    replay_at)` for C and R), and the C/R rates exclude cases whose C run had
+    an investigator error: such a run skipped probes because the model
+    failed, which is a C FAILURE, not a saving. Those cases are counted
+    separately (`candidate_investigator_error_cases`).
+
+    `status`:
+    * `not_run` — no paired C/R case to compare;
+    * `inconclusive` — fewer than `LLM_MIN_COMPARED_CASES` compared cases, or
+      C wins no dimension materially but beats R's RATE on some dimension
+      without enough cases behind it: the data can neither credit the LLM
+      nor say R is as good;
+    * `llm_adds_nothing` — on a sufficient sample, C's advantage on every
+      dimension is below the RATE thresholds: R is equally good or better;
+    * `llm_better` — C wins on at least one dimension and loses on none;
+    * `mixed` — C wins on at least one dimension and loses on another
+      (including investigator reliability).
+
+    Agreement wins are counted NET and per improving class: for overall
+    agreement, (cases where only C agrees with the reference) minus (only R
+    agrees) must reach `LLM_MIN_DIFFERING_CASES`; for macro agreement, the
+    same net count restricted to the reference classes where C's per-class
+    rate is higher — so a few extra hits in a rare class cannot carry a
+    macro "win" on their own.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    candidate: str = "C"
+    deterministic: str = "R"
+    reference: str = "A"
+    status: LlmValueStatus = "not_run"
+
+    candidate_runs: int = 0
+    deterministic_runs: int = 0
+    #: Cases where both C and R ran.
+    paired_cases: int = 0
+    #: Paired cases whose C run had an investigator error (a C failure).
+    candidate_investigator_error_cases: int = 0
+    #: Paired cases the rates below are computed over (paired minus the above).
+    compared_cases: int = 0
+
+    candidate_medium_high_per_case: float | None = None
+    deterministic_medium_high_per_case: float | None = None
+    candidate_probe_points_per_case: float | None = None
+    deterministic_probe_points_per_case: float | None = None
+    #: `(R - C) / R` on medium/high probe steps; negative = C used more.
+    relative_probe_saving: float | None = None
+    candidate_cheaper_cases: int = 0
+    deterministic_cheaper_cases: int = 0
+
+    candidate_overall_agreement: float | None = None
+    deterministic_overall_agreement: float | None = None
+    candidate_macro_agreement: float | None = None
+    deterministic_macro_agreement: float | None = None
+    #: Compared cases where only C (only R) agrees with the reference.
+    candidate_only_agrees_cases: int = 0
+    deterministic_only_agrees_cases: int = 0
+
+    #: C's action == R's action, over ALL paired cases.
+    action_agreement: float | None = None
+    same_sequence_cases: int = 0
+    same_action_cases: int = 0
+    same_sequence_and_action_cases: int = 0
+    differing_cases_total: int = 0
+    differing_with_investigator_error: int = 0
+    differences: tuple[CaseDifference, ...] = ()
+
+    #: Model usage over ALL of C's scoped runs (R's must be zero).
+    candidate_model_steps: int = 0
+    candidate_model_cost_usd: float = 0.0
+    candidate_input_tokens: int = 0
+    candidate_output_tokens: int = 0
+    deterministic_model_steps: int = 0
+    deterministic_model_cost_usd: float = 0.0
+
+    #: Dimensions (`probe use`, `overall agreement with A`, `macro agreement
+    #: with A`) C won / lost by a material margin.
+    won: tuple[str, ...] = ()
+    lost: tuple[str, ...] = ()
+    min_relative_probe_saving: float = LLM_MIN_RELATIVE_PROBE_SAVING
+    min_agreement_gain: float = LLM_MIN_AGREEMENT_GAIN
+    min_differing_cases: int = LLM_MIN_DIFFERING_CASES
+    min_compared_cases: int = LLM_MIN_COMPARED_CASES
+    #: Dimensions where one side's RATE advantage passes the threshold but too
+    #: few cases support it: `"<dimension> (favours C|R)"`.
+    underpowered: tuple[str, ...] = ()
+
+    candidate_gate_status: str = "not_run"
+    #: The same spec.md §6 legs with R as the candidate (informational).
+    deterministic_gate: AgentGateResult | None = None
+
+    verdict: str = ""
+
+    @property
+    def beats_on_cost(self) -> bool:
+        return _DIM_PROBE_USE in self.won
+
+    @property
+    def worse_on_cost(self) -> bool:
+        return _DIM_PROBE_USE in self.lost
+
+    @property
+    def beats_on_agreement(self) -> bool:
+        return any(dim != _DIM_PROBE_USE for dim in self.won)
+
+    @property
+    def worse_on_agreement(self) -> bool:
+        return any(dim != _DIM_PROBE_USE for dim in self.lost)
+
+    def materiality_rule(self) -> str:
+        return (
+            f"A dimension is credited to (or charged against) {self.candidate} only when the "
+            f"difference is material: medium/high probe use per compared case differs by >= "
+            f"{self.min_relative_probe_saving:.0%} relative, or agreement with "
+            f"{self.reference} (overall or macro) by >= {self.min_agreement_gain:.0%} points, "
+            f"AND at least {self.min_differing_cases} compared cases move in that direction "
+            "(net, per improving class for agreement). Fewer than "
+            f"{self.min_compared_cases} compared cases is inconclusive. Rates are over paired "
+            f"cases only, excluding {self.candidate} investigator-error runs; "
+            f"{self.min_differing_cases} or more such runs is a material loss on investigator "
+            "reliability."
+        )
+
+    def describe(self) -> str:
+        lines = [
+            f"does the LLM add anything? ({self.candidate} vs {self.deterministic}): "
+            f"{self.status.upper()}",
+            f"  paired cases={self.paired_cases}; compared={self.compared_cases} "
+            f"(excluded {self.candidate} investigator-error cases="
+            f"{self.candidate_investigator_error_cases}); same dynamic-probe sequence="
+            f"{self.same_sequence_cases}; same action={self.same_action_cases}",
+            f"  medium/high probes per compared case: {self.candidate}="
+            f"{_num(self.candidate_medium_high_per_case)} {self.deterministic}="
+            f"{_num(self.deterministic_medium_high_per_case)} (relative saving "
+            f"{_pct(self.relative_probe_saving)}; {self.candidate} cheaper on "
+            f"{self.candidate_cheaper_cases}, {self.deterministic} cheaper on "
+            f"{self.deterministic_cheaper_cases})",
+            f"  agreement with {self.reference} (overall/macro): {self.candidate}="
+            f"{_pct(self.candidate_overall_agreement)}/{_pct(self.candidate_macro_agreement)} "
+            f"{self.deterministic}={_pct(self.deterministic_overall_agreement)}/"
+            f"{_pct(self.deterministic_macro_agreement)}",
+            f"  model calls: {self.candidate}={self.candidate_model_steps} "
+            f"(${self.candidate_model_cost_usd:.4f}, tokens "
+            f"{self.candidate_input_tokens}/{self.candidate_output_tokens}) "
+            f"{self.deterministic}={self.deterministic_model_steps}",
+        ]
+        if self.verdict:
+            lines.append(f"  {self.verdict}")
+        return "\n".join(lines)
+
+    def __str__(self) -> str:  # pragma: no cover - trivial delegation
+        return self.describe()
+
+
+def _dynamic_sequence(run: object) -> tuple[str, ...]:
+    probes: tuple[str, ...] = getattr(run, "probes_run", ())
+    return tuple(name for name in probes if name in DYNAMIC_PROBES)
+
+
+def _agreement(
+    pairs: Sequence[tuple[str | None, str | None]],
+) -> tuple[float | None, float | None]:
+    """`(overall, macro)` agreement of `(reference action, system action)` pairs.
+
+    Same definitions as `rli.eval.metrics.agent_efficiency`: classes come
+    from the reference; a `None` reference action is never a match.
+    """
+    if not pairs:
+        return None, None
+    overall = sum(1 for ref, got in pairs if ref is not None and ref == got) / len(pairs)
+    per_class = []
+    for action in sorted({ref for ref, _ in pairs if ref is not None}):
+        in_class = [got for ref, got in pairs if ref == action]
+        per_class.append(sum(1 for got in in_class if got == action) / len(in_class))
+    return overall, (sum(per_class) / len(per_class) if per_class else None)
+
+
+def _net_in_improving_classes(
+    compared: Sequence[MetricsCase], candidate: str, deterministic: str, reference: str
+) -> tuple[int, int]:
+    """Net exclusive agreements inside the classes each side improves.
+
+    Returns `(C-only minus R-only summed over the reference classes where C's
+    per-class rate is higher, R-only minus C-only summed over the classes
+    where R's is higher)`. This is the case count behind a macro-agreement
+    difference.
+    """
+    by_class: dict[str, list[int]] = {}
+    for case in compared:
+        ref_run = case.runs.get(reference)
+        ref_action = ref_run.action if ref_run is not None else None
+        if ref_action is None:
+            continue
+        c_hit = case.runs[candidate].action == ref_action
+        r_hit = case.runs[deterministic].action == ref_action
+        counts = by_class.setdefault(ref_action, [0, 0])
+        counts[0] += c_hit and not r_hit
+        counts[1] += r_hit and not c_hit
+    c_net = sum(c - r for c, r in by_class.values() if c > r)
+    r_net = sum(r - c for c, r in by_class.values() if r > c)
+    return c_net, r_net
+
+
+def llm_value_comparison(
+    case_set: MetricsCaseSet,
+    *,
+    run_costs: Mapping[str, tuple[int, float]],
+    candidate_metrics: EfficiencyMetrics | None = None,
+    deterministic_metrics: EfficiencyMetrics | None = None,
+    candidate: str = "C",
+    deterministic: str = "R",
+    reference: str = "A",
+    investigator_error_run_ids: frozenset[str] | set[str] = frozenset(),
+    candidate_gate_status: str = "not_run",
+    deterministic_gate: AgentGateResult | None = None,
+    max_listed: int = MAX_LISTED_DIFFERENCES,
+    min_relative_probe_saving: float = LLM_MIN_RELATIVE_PROBE_SAVING,
+    min_agreement_gain: float = LLM_MIN_AGREEMENT_GAIN,
+    min_differing_cases: int = LLM_MIN_DIFFERING_CASES,
+    min_compared_cases: int | None = None,
+) -> LlmValueComparison:
+    """Compare C and R on PAIRED cases: probe use, agreement, per-case choices, model cost.
+
+    `run_costs` maps `run_id -> (medium/high probe steps, probe cost points)`
+    (`rli.eval.diagnostics.run_probe_costs`). The metrics objects only supply
+    run totals and model usage. See `LlmValueComparison` for the exclusion of
+    investigator-error runs and the materiality rule. `min_compared_cases`
+    defaults to `LLM_MIN_COMPARED_CASES`, read at call time.
+    """
+    if min_compared_cases is None:
+        min_compared_cases = LLM_MIN_COMPARED_CASES
+    base = LlmValueComparison(
+        candidate=candidate,
+        deterministic=deterministic,
+        reference=reference,
+        candidate_gate_status=candidate_gate_status,
+        deterministic_gate=deterministic_gate,
+        candidate_runs=len(case_set.run_ids.get(candidate, ())),
+        deterministic_runs=len(case_set.run_ids.get(deterministic, ())),
+        min_relative_probe_saving=min_relative_probe_saving,
+        min_agreement_gain=min_agreement_gain,
+        min_differing_cases=min_differing_cases,
+        min_compared_cases=min_compared_cases,
+    )
+    paired = case_set.cases_for(candidate, deterministic)
+    if not paired:
+        missing = [
+            name for name in (candidate, deterministic) if not case_set.run_ids.get(name)
+        ] or [f"{candidate}+{deterministic} on the same cases"]
+        return base.model_copy(
+            update={
+                "verdict": (
+                    f"Not compared: no paired {candidate}/{deterministic} case "
+                    f"({', '.join(missing)} missing). Replay System {deterministic} offline "
+                    f"(`rli replay run --system {deterministic} --dataset "
+                    f"{case_set.dataset_id}`; no LLM) and re-run the evaluation to see "
+                    "whether the LLM adds anything over the deterministic controller."
+                ),
+            }
+        )
+
+    same_sequence = same_action = same_both = 0
+    differences: list[CaseDifference] = []
+    differing_total = differing_errors = error_cases = 0
+    compared = []
+    for case in paired:
+        c_run = case.runs[candidate]
+        r_run = case.runs[deterministic]
+        had_error = c_run.run_id in investigator_error_run_ids
+        error_cases += had_error
+        if not had_error:
+            compared.append(case)
+        sequence_equal = _dynamic_sequence(c_run) == _dynamic_sequence(r_run)
+        action_equal = c_run.action == r_run.action
+        same_sequence += sequence_equal
+        same_action += action_equal
+        same_both += sequence_equal and action_equal
+        if sequence_equal and action_equal:
+            continue
+        differing_total += 1
+        differing_errors += had_error
+        if len(differences) < max_listed:
+            ref_run = case.runs.get(reference)
+            differences.append(
+                CaseDifference(
+                    input_url=case.input_url,
+                    replay_at=case.replay_at,
+                    split=case.split,
+                    candidate_probes=_dynamic_sequence(c_run),
+                    deterministic_probes=_dynamic_sequence(r_run),
+                    candidate_action=c_run.action,
+                    deterministic_action=r_run.action,
+                    reference_action=ref_run.action if ref_run is not None else None,
+                    candidate_investigator_error=had_error,
+                )
+            )
+
+    # --- rates over the compared cases ------------------------------------
+    c_mh = r_mh = 0
+    c_points = r_points = 0.0
+    c_cheaper = r_cheaper = c_only = r_only = 0
+    c_pairs: list[tuple[str | None, str | None]] = []
+    r_pairs: list[tuple[str | None, str | None]] = []
+    for case in compared:
+        c_run, r_run = case.runs[candidate], case.runs[deterministic]
+        c_cost = run_costs.get(c_run.run_id, (0, 0.0))
+        r_cost = run_costs.get(r_run.run_id, (0, 0.0))
+        c_mh += c_cost[0]
+        r_mh += r_cost[0]
+        c_points += c_cost[1]
+        r_points += r_cost[1]
+        c_cheaper += c_cost[0] < r_cost[0]
+        r_cheaper += r_cost[0] < c_cost[0]
+        ref_run = case.runs.get(reference)
+        ref_action = ref_run.action if ref_run is not None else None
+        c_pairs.append((ref_action, c_run.action))
+        r_pairs.append((ref_action, r_run.action))
+        if ref_action is not None:
+            c_hit = c_run.action == ref_action
+            r_hit = r_run.action == ref_action
+            c_only += c_hit and not r_hit
+            r_only += r_hit and not c_hit
+    n = len(compared)
+    c_overall, c_macro = _agreement(c_pairs)
+    r_overall, r_macro = _agreement(r_pairs)
+    relative_saving = None if not n or r_mh == 0 else (r_mh - c_mh) / r_mh
+
+    # --- materiality, per dimension and direction ----------------------------
+    won: list[str] = []
+    lost: list[str] = []
+    underpowered: list[str] = []
+
+    def judge(label: str, *, c_rate_ok: bool, c_count: int, r_rate_ok: bool, r_count: int) -> None:
+        if c_rate_ok:
+            if c_count >= min_differing_cases:
+                won.append(label)
+            else:
+                underpowered.append(f"{label} (favours {candidate})")
+        if r_rate_ok:
+            if r_count >= min_differing_cases:
+                lost.append(label)
+            else:
+                underpowered.append(f"{label} (favours {deterministic})")
+
+    if n:
+        judge(
+            _DIM_PROBE_USE,
+            c_rate_ok=relative_saving is not None and relative_saving >= min_relative_probe_saving,
+            c_count=c_cheaper,
+            r_rate_ok=(
+                relative_saving is not None and -relative_saving >= min_relative_probe_saving
+            )
+            or (r_mh == 0 and c_mh > 0),
+            r_count=r_cheaper,
+        )
+        if c_overall is not None and r_overall is not None:
+            judge(
+                f"overall agreement with {reference}",
+                c_rate_ok=c_overall - r_overall >= min_agreement_gain,
+                c_count=c_only - r_only,
+                r_rate_ok=r_overall - c_overall >= min_agreement_gain,
+                r_count=r_only - c_only,
+            )
+        if c_macro is not None and r_macro is not None:
+            c_net, r_net = _net_in_improving_classes(compared, candidate, deterministic, reference)
+            judge(
+                f"macro agreement with {reference}",
+                c_rate_ok=c_macro - r_macro >= min_agreement_gain,
+                c_count=c_net,
+                r_rate_ok=r_macro - c_macro >= min_agreement_gain,
+                r_count=r_net,
+            )
+    if error_cases >= min_differing_cases:
+        lost.append(_DIM_RELIABILITY)
+
+    status: LlmValueStatus
+    if not paired:
+        status = "not_run"
+    elif n < min_compared_cases:
+        status = "inconclusive"
+    elif won:
+        status = "mixed" if lost else "llm_better"
+    elif any(item.endswith(f"(favours {candidate})") for item in underpowered):
+        status = "inconclusive"
+    else:
+        status = "llm_adds_nothing"
+
+    c_cost_split = candidate_metrics.cost if candidate_metrics is not None else None
+    model_steps = c_cost_split.model_steps if c_cost_split is not None else 0
+    model_usd = c_cost_split.model_cost_usd if c_cost_split is not None else 0.0
+    tokens_in = c_cost_split.input_tokens if c_cost_split is not None else 0
+    tokens_out = c_cost_split.output_tokens if c_cost_split is not None else 0
+
+    def rate(total: float) -> float | None:
+        return total / n if n else None
+
+    numbers = (
+        f"Over {n} compared paired case(s), {deterministic} uses {_num(rate(r_mh))} medium/high "
+        f"probe steps per case vs {candidate}'s {_num(rate(c_mh))} (relative saving by "
+        f"{candidate}: {_pct(relative_saving)}; {candidate} cheaper on {c_cheaper} case(s), "
+        f"{deterministic} cheaper on {r_cheaper}) and agrees with {reference} "
+        f"{_pct(r_overall)} overall / {_pct(r_macro)} macro vs {candidate}'s "
+        f"{_pct(c_overall)} / {_pct(c_macro)} (only {candidate} agrees on {c_only} case(s), only "
+        f"{deterministic} on {r_only}), with 0 model calls; {candidate} made {model_steps} model "
+        f"calls over all its runs (${model_usd:.4f}, {tokens_in}/{tokens_out} tokens in/out). "
+        f"On all {len(paired)} paired cases the two chose the same dynamic-probe sequence "
+        f"{same_sequence} times and the same action {same_action} times."
+    )
+    failures = (
+        f" {error_cases} paired {candidate} run(s) had an investigator error; they are excluded "
+        f"from these rates and counted as {candidate} FAILURES (a failed investigator skips "
+        "probes; that is not a saving)."
+        if error_cases
+        else ""
+    )
+    rule = base.materiality_rule()
+    weak = (
+        f" Rate advantages without enough cases behind them: {', '.join(underpowered)}."
+        if underpowered
+        else ""
+    )
+    if status == "not_run":
+        verdict = (
+            f"Not compared: every paired case's {candidate} run had an investigator error."
+            + failures
+        )
+    elif status == "inconclusive":
+        reason = (
+            f"only {n} compared paired case(s) (minimum {min_compared_cases})"
+            if n < min_compared_cases
+            else f"{candidate} beats {deterministic}'s rate on some dimension, but too few "
+            "cases support it"
+        )
+        verdict = (
+            f"INCONCLUSIVE: {reason}. {numbers}{failures}{weak} {rule} This sample can neither "
+            f"credit the LLM nor show that {deterministic} is equally good; do not attribute "
+            f"the spec.md §6 agent-gate result for {candidate} ({candidate_gate_status}) either "
+            "way from this comparison."
+        )
+    elif status == "llm_adds_nothing":
+        verdict = (
+            f"The LLM adds nothing measurable on this dataset. {numbers}{failures}{weak} "
+            f"On {n} compared cases {candidate}'s advantage on every dimension is below the rate "
+            f"thresholds. {rule} The spec.md §6 agent-gate result for {candidate} "
+            f"({candidate_gate_status}) is therefore attributable to the deterministic controller "
+            "both systems share (eligibility gate, could-change-action filter, cost-aware "
+            f'ranking, budgets), not to the LLM investigator. spec.md §6: "{SPEC_PREFER_SIMPLER}" '
+            f"{deterministic} is equally good or better and simpler, so by spec.md §6 "
+            f"{deterministic} should be preferred to {candidate}."
+        )
+    elif status == "mixed":
+        verdict = (
+            f"Mixed: {candidate} wins on {', '.join(won)} but loses on {', '.join(lost)}. "
+            f"{numbers}{failures}{weak} {rule} Whether that trade is worth an LLM is a judgment "
+            "the agent gate alone does not make; spec.md §6 prefers the simpler system when it "
+            "is equally good."
+        )
+    else:
+        verdict = (
+            f"{candidate} wins on {', '.join(won)} and loses on none. {numbers}{failures}{weak} "
+            f"{rule} That is the LLM's measured contribution, bought at the model cost above."
+        )
+
+    return base.model_copy(
+        update={
+            "status": status,
+            "paired_cases": len(paired),
+            "candidate_investigator_error_cases": error_cases,
+            "compared_cases": n,
+            "candidate_medium_high_per_case": rate(c_mh),
+            "deterministic_medium_high_per_case": rate(r_mh),
+            "candidate_probe_points_per_case": rate(c_points),
+            "deterministic_probe_points_per_case": rate(r_points),
+            "relative_probe_saving": relative_saving,
+            "candidate_cheaper_cases": c_cheaper,
+            "deterministic_cheaper_cases": r_cheaper,
+            "candidate_overall_agreement": c_overall,
+            "deterministic_overall_agreement": r_overall,
+            "candidate_macro_agreement": c_macro,
+            "deterministic_macro_agreement": r_macro,
+            "candidate_only_agrees_cases": c_only,
+            "deterministic_only_agrees_cases": r_only,
+            "action_agreement": _ratio(same_action, len(paired)),
+            "same_sequence_cases": same_sequence,
+            "same_action_cases": same_action,
+            "same_sequence_and_action_cases": same_both,
+            "differing_cases_total": differing_total,
+            "differing_with_investigator_error": differing_errors,
+            "differences": tuple(differences),
+            "candidate_model_steps": model_steps,
+            "candidate_model_cost_usd": model_usd,
+            "candidate_input_tokens": tokens_in,
+            "candidate_output_tokens": tokens_out,
+            "deterministic_model_steps": (
+                deterministic_metrics.cost.model_steps if deterministic_metrics else 0
+            ),
+            "deterministic_model_cost_usd": (
+                deterministic_metrics.cost.model_cost_usd if deterministic_metrics else 0.0
+            ),
+            "won": tuple(won),
+            "lost": tuple(lost),
+            "underpowered": tuple(underpowered),
+            "verdict": verdict,
         }
     )
 

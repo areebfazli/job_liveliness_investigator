@@ -30,6 +30,9 @@ def _schema_sql() -> str:
 def _normalized_ddl(text: str) -> str:
     """The replay DDL with comments stripped and whitespace collapsed."""
     body = text[text.index(REPLAY_START) :]
+    # Later versions' tables follow the replay section in schema.sql.
+    if "-- snapshot_runs (schema version 6)" in body:
+        body = body[: body.index("-- snapshot_runs (schema version 6)")]
     uncommented = "\n".join(line.split("--")[0] for line in body.splitlines())
     return " ".join(uncommented.split())
 
@@ -194,7 +197,7 @@ def test_migration_2_is_registered_and_reaches_the_current_version() -> None:
 # the comparison below removes exactly these from the fresh-schema text.
 _V5_REPLAY_COLUMNS = (
     ", split_method TEXT, split_seed INTEGER, split_cutoff TEXT, "
-    "split_validation_cutoff TEXT, exclude_companies_from TEXT",
+    "split_validation_cutoff TEXT, exclude_companies_from TEXT, company_holdout TEXT",
     " split TEXT CHECK (split IN ('dev', 'validation', 'test')),",
 )
 

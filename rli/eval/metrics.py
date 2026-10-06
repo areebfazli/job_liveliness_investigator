@@ -193,6 +193,8 @@ from rli.eval.runner import STEP_PROBE_RUN
 from rli.models.time import now_utc, parse_utc
 from rli.policy.claim_families import CLAIM_FAMILIES, FAMILY_KEYWORDS
 from rli.policy.claim_families import classify_reason as _classify_reason
+from rli.policy.inputs import CLAIM_FIRST_PUBLISHED as _FIRST_PUBLISHED
+from rli.policy.inputs import PRIMARY_PUBLISH_QUALITIES as _PRIMARY_PUBLISH_QUALITIES
 from rli.policy.splits import DEFAULT_SEED, SPLIT_METHOD_COMPANY_HASH
 from rli.probes.board_snapshot import BoardSnapshotProbe
 from rli.probes.registry import DYNAMIC_PROBES
@@ -215,6 +217,7 @@ __all__ = [
     "MetricsCase",
     "MetricsCaseSet",
     "agent_efficiency",
+    "citation_support_for_runs",
     "collect_system_runs",
     "data_quality",
     "era_boundary",
@@ -223,6 +226,7 @@ __all__ = [
     "resolve_allowed_splits",
     "split_case_set_by_era",
     "split_map_for_dataset",
+    "subset_case_set",
     "FrozenSplitWarning",
 ]
 
@@ -670,6 +674,13 @@ class MetricsCaseSet(BaseModel):
     unassigned: int = 0
     excluded_holdout: int = 0
     duplicates_collapsed: int = 0
+    #: Cases whose runs carry no `posting_id` (the posting's identity never
+    #: resolved) but which ARE a case of this dataset — matched to their
+    #: `replay_cases` row by `(input_url, replay_at)`, which also gives their
+    #: split. Excluded from scoring like `unassigned`, but counted apart
+    #: (by split) because they are not a split-map gap.
+    identity_unresolved: int = 0
+    identity_unresolved_by_split: dict[str, int] = {}
 
     def cases_for(self, *systems: str) -> tuple[MetricsCase, ...]:
         """The cases where EVERY named system produced a surviving run."""
@@ -683,6 +694,7 @@ class MetricsCaseSet(BaseModel):
             f"splits=[{', '.join(self.allowed_splits) or 'none'}] "
             f"systems=[{', '.join(self.systems) or 'none'}]",
             f"  cases={len(self.cases)} unassigned={self.unassigned} "
+            f"identity_unresolved={self.identity_unresolved} "
             f"excluded_holdout={self.excluded_holdout} "
             f"duplicates_collapsed={self.duplicates_collapsed}",
             f"  runs by system: {_render(self.counts_by_system)}",
@@ -805,6 +817,9 @@ def collect_system_runs(
     case_rows: list[tuple[tuple[str, str], str, str, dict[str, sqlite3.Row]]] = []
     unassigned = 0
     excluded_holdout = 0
+    identity_unresolved = 0
+    identity_unresolved_by_split: dict[str, int] = {}
+    dataset_cases = _dataset_case_postings(conn, dataset_id)
 
     for key in sorted(keys):
         present = {
@@ -820,8 +835,26 @@ def collect_system_runs(
                 posting_id = str(row["posting_id"])
                 break
 
-        split = None if posting_id is None else splits.get(posting_id)
-        if posting_id is None or split is None:
+        if posting_id is None:
+            # No run resolved the posting. If the case is a row of this
+            # dataset, its split is known (frozen per case, or the split of
+            # the dataset's own posting id): classify it as identity-
+            # unresolved rather than as a split-map gap.
+            case_posting = dataset_cases.get(key)
+            case_split = None if case_posting is None else splits.get(case_posting)
+            if case_split is None:
+                unassigned += 1
+            elif case_split not in allowed_splits:
+                excluded_holdout += 1
+            else:
+                identity_unresolved += 1
+                identity_unresolved_by_split[case_split] = (
+                    identity_unresolved_by_split.get(case_split, 0) + 1
+                )
+            continue
+
+        split = splits.get(posting_id)
+        if split is None:
             unassigned += 1
             continue
         if split not in allowed_splits:
@@ -872,7 +905,24 @@ def collect_system_runs(
         unassigned=unassigned,
         excluded_holdout=excluded_holdout,
         duplicates_collapsed=duplicates_collapsed,
+        identity_unresolved=identity_unresolved,
+        identity_unresolved_by_split=identity_unresolved_by_split,
     )
+
+
+def _dataset_case_postings(conn: sqlite3.Connection, dataset_id: str) -> dict[tuple[str, str], str]:
+    """`(canonical_url, replay_at) -> replay_cases.posting_id` for one dataset."""
+    try:
+        return {
+            (str(row["canonical_url"]), str(row["replay_at"])): str(row["posting_id"])
+            for row in conn.execute(
+                "SELECT posting_id, replay_at, canonical_url FROM replay_cases "
+                "WHERE dataset_id = ?",
+                (dataset_id,),
+            )
+        }
+    except sqlite3.Error:  # pragma: no cover - pre-replay schema
+        return {}
 
 
 def _case_set_for(
@@ -968,27 +1018,36 @@ def split_case_set_by_era(
     cases_by_era: dict[str, list[MetricsCase]] = {"live-era": [], "archive-era": []}
     for case in case_set.cases:
         cases_by_era[era_for(case.replay_at, boundary)].append(case)
+    return {era: subset_case_set(case_set, cases) for era, cases in cases_by_era.items()}
 
-    result: dict[str, MetricsCaseSet] = {}
-    for era, cases in cases_by_era.items():
-        kept_run_ids_by_system: dict[str, tuple[str, ...]] = {}
-        for system in case_set.systems:
-            kept = {case.runs[system].run_id for case in cases if system in case.runs}
-            kept_run_ids_by_system[system] = tuple(
-                run_id for run_id in case_set.run_ids.get(system, ()) if run_id in kept
-            )
-        result[era] = MetricsCaseSet(
-            dataset_id=case_set.dataset_id,
-            allowed_splits=case_set.allowed_splits,
-            systems=case_set.systems,
-            cases=tuple(cases),
-            run_ids=kept_run_ids_by_system,
-            counts_by_system={system: len(ids) for system, ids in kept_run_ids_by_system.items()},
-            unassigned=0,
-            excluded_holdout=0,
-            duplicates_collapsed=0,
+
+def subset_case_set(case_set: MetricsCaseSet, cases: Iterable[MetricsCase]) -> MetricsCaseSet:
+    """`case_set` narrowed to `cases`, keeping `systems` VERBATIM.
+
+    The one way to build a sub-case-set (an era, the probe-dependent cases):
+    `systems` is never narrowed, for the reason `split_case_set_by_era`
+    gives, and `run_ids` keeps the pooled order restricted to the kept
+    cases. The pre-split-gate bookkeeping (`unassigned`, `excluded_holdout`,
+    `duplicates_collapsed`) has no per-subset reading and is zeroed.
+    """
+    kept_cases = tuple(cases)
+    kept_run_ids_by_system: dict[str, tuple[str, ...]] = {}
+    for system in case_set.systems:
+        kept = {case.runs[system].run_id for case in kept_cases if system in case.runs}
+        kept_run_ids_by_system[system] = tuple(
+            run_id for run_id in case_set.run_ids.get(system, ()) if run_id in kept
         )
-    return result
+    return MetricsCaseSet(
+        dataset_id=case_set.dataset_id,
+        allowed_splits=case_set.allowed_splits,
+        systems=case_set.systems,
+        cases=kept_cases,
+        run_ids=kept_run_ids_by_system,
+        counts_by_system={system: len(ids) for system, ids in kept_run_ids_by_system.items()},
+        unassigned=0,
+        excluded_holdout=0,
+        duplicates_collapsed=0,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1092,9 +1151,23 @@ class DataQuality(BaseModel):
     ats_resolution_rate: float | None = None
     ats_distribution: dict[str, int] = {}
 
+    #: ANY publish-family claim (first publish OR a refresh/last-published
+    #: date). Kept for continuity; read the two splits below instead.
     publish_date_runs: int = 0
     publish_date_coverage: float | None = None
     publish_date_by_source_quality: dict[str, int] = {}
+    #: A dated `first_published` claim from a PRIMARY source (`ats_native` /
+    #: `page_structured`) — the claim `rli.policy.quality`'s Q2 rule and the
+    #: recency rule read as a first publication. Claims the first-published
+    #: guard refused are re-labelled and never count here.
+    first_publish_runs: int = 0
+    first_publish_coverage: float | None = None
+    first_publish_by_source_quality: dict[str, int] = {}
+    #: A refresh-type date only (`updated_at`, `last_published`,
+    #: `refreshed_at`): evidence the posting moved, NOT when it first appeared.
+    refresh_runs: int = 0
+    refresh_coverage: float | None = None
+    refresh_by_claim_type: dict[str, int] = {}
 
     repost_match_precision: float | None = None
     repost_match_precision_note: str = "pending"
@@ -1112,6 +1185,10 @@ class DataQuality(BaseModel):
     # — the same silence that let security review H4 run for 830 runs.
     leakage_model_cache_misses: int = 0
     leakage_blob_input_exposures: int = 0
+    #: Pre-fix own capture batches no recorded snapshot run window covers
+    #: (`rli.snapshots.run_windows.uncovered_capture_batches`): leakage the
+    #: `capture_fetched_after_t` rule cannot see. Reported, not counted.
+    leakage_uncovered_capture_batches: int = 0
 
     def describe(self) -> str:
         lines = [
@@ -1122,7 +1199,13 @@ class DataQuality(BaseModel):
             f"  ATS resolution: {self.ats_resolved_runs}/{self.runs_checked} runs "
             f"= {_pct(self.ats_resolution_rate)} (a resolve_posting probe_run step, error IS NULL)",
             f"  ATS mix: {_render(self.ats_distribution)}",
-            f"  publish-date coverage: {self.publish_date_runs}/{self.runs_checked} runs "
+            f"  first-publish coverage (dated first_published, ats_native/page_structured): "
+            f"{self.first_publish_runs}/{self.runs_checked} runs = "
+            f"{_pct(self.first_publish_coverage)}",
+            f"  refresh / last-published coverage (updated_at, last_published, refreshed_at): "
+            f"{self.refresh_runs}/{self.runs_checked} runs = {_pct(self.refresh_coverage)} "
+            f"({_render(self.refresh_by_claim_type)})",
+            f"  any publish-family claim: {self.publish_date_runs}/{self.runs_checked} runs "
             f"= {_pct(self.publish_date_coverage)}",
             f"  publish-date evidence by source quality (DISTINCT runs, a run may appear "
             f"under two): {_render(self.publish_date_by_source_quality)}",
@@ -1306,6 +1389,18 @@ def _citation_support(
     )
 
 
+def citation_support_for_runs(conn: sqlite3.Connection, run_ids: Sequence[str]) -> CitationSupport:
+    """`CitationSupport` over exactly `run_ids` (one system's scoped runs, say).
+
+    The same measurement `data_quality` makes for its System A scope, exposed
+    so a report can state it per system: A and B cite the deterministic
+    reasons, C cites what survived its explanation guard, R the
+    deterministic reasons again.
+    """
+    decisions, _ = _decisions_for(conn, run_ids)
+    return _citation_support(conn, run_ids, decisions)
+
+
 def _decisions_for(
     conn: sqlite3.Connection, run_ids: Sequence[str]
 ) -> tuple[dict[str, dict[str, object]], int]:
@@ -1410,12 +1505,17 @@ def data_quality(
     publish_types = tuple(sorted(CLAIM_FAMILIES["publish"]))
     publish_runs: set[str] = set()
     by_quality: dict[str, set[str]] = {}
+    first_runs: set[str] = set()
+    first_by_quality: dict[str, set[str]] = {}
+    refresh_runs: set[str] = set()
+    refresh_by_type: dict[str, set[str]] = {}
     for chunk in _chunks(run_ids):
         run_placeholders = ",".join("?" for _ in chunk)
         type_placeholders = ",".join("?" for _ in publish_types)
         rows = conn.execute(
             f"""
-            SELECT DISTINCT run_id, source_quality
+            SELECT DISTINCT run_id, claim_type, source_quality,
+                   source_event_at IS NOT NULL AS dated
             FROM evidence
             WHERE run_id IN ({run_placeholders})
                   AND claim_type IN ({type_placeholders})
@@ -1424,8 +1524,17 @@ def data_quality(
         ).fetchall()
         for row in rows:
             run_id = str(row["run_id"])
+            quality = str(row["source_quality"])
+            claim_type = str(row["claim_type"])
             publish_runs.add(run_id)
-            by_quality.setdefault(str(row["source_quality"]), set()).add(run_id)
+            by_quality.setdefault(quality, set()).add(run_id)
+            if claim_type == _FIRST_PUBLISHED:
+                if row["dated"] and quality in _PRIMARY_PUBLISH_QUALITIES:
+                    first_runs.add(run_id)
+                    first_by_quality.setdefault(quality, set()).add(run_id)
+            else:
+                refresh_runs.add(run_id)
+                refresh_by_type.setdefault(claim_type, set()).add(run_id)
 
     # --- Citations ----------------------------------------------------------
     decisions, _ = _decisions_for(conn, run_ids)
@@ -1439,6 +1548,7 @@ def data_quality(
         leakage_clean = leakage.clean
         leakage_model_cache_misses = leakage.model_cache_misses
         leakage_blob_input_exposures = leakage.blob_input_exposures
+        leakage_uncovered_capture_batches = leakage.uncovered_capture_batches
     except Exception as exc:  # pragma: no cover - defensive
         # An audit that could not run is NOT an audit that passed. Reporting
         # `clean=True` here would be the single most dangerous default in
@@ -1451,6 +1561,7 @@ def data_quality(
         # unexposed, and no caller should read it as one.
         leakage_model_cache_misses = 0
         leakage_blob_input_exposures = 0
+        leakage_uncovered_capture_batches = 0
 
     precision, precision_note = read_match_precision(match_precision_path)
 
@@ -1465,6 +1576,16 @@ def data_quality(
         ats_distribution=ats_distribution,
         publish_date_runs=len(publish_runs),
         publish_date_coverage=_ratio(len(publish_runs), runs_checked),
+        first_publish_runs=len(first_runs),
+        first_publish_coverage=_ratio(len(first_runs), runs_checked),
+        first_publish_by_source_quality={
+            quality: len(runs) for quality, runs in sorted(first_by_quality.items())
+        },
+        refresh_runs=len(refresh_runs),
+        refresh_coverage=_ratio(len(refresh_runs), runs_checked),
+        refresh_by_claim_type={
+            claim_type: len(runs) for claim_type, runs in sorted(refresh_by_type.items())
+        },
         publish_date_by_source_quality={
             quality: len(runs) for quality, runs in sorted(by_quality.items())
         },
@@ -1476,6 +1597,7 @@ def data_quality(
         leakage_clean=leakage_clean,
         leakage_model_cache_misses=leakage_model_cache_misses,
         leakage_blob_input_exposures=leakage_blob_input_exposures,
+        leakage_uncovered_capture_batches=leakage_uncovered_capture_batches,
     )
 
 

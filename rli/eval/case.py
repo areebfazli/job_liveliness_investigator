@@ -370,6 +370,7 @@ from rli.probes.lookups import posting_row
 from rli.probes.registry import build_args
 from rli.probes.resolve_posting import ResolvePostingArgs, ResolvePostingProbe
 from rli.resolvers.common import normalize_domain
+from rli.snapshots.run_windows import guard_bound, load_stamped_windows
 
 __all__ = [
     "BOARD_SNAPSHOT_URL_PLACEHOLDER",
@@ -938,6 +939,10 @@ def build_case_state(
         failures.append(resolver)
 
     evidence_posting_id = posting_id if posting_row_exists else None
+    # The first-published guard's bound: our first sighting, moved to the end
+    # of a pre-fix snapshot run window when the sighting was stamped inside
+    # one (rli.snapshots.run_windows.guard_bound).
+    guard_first_seen = guard_bound(_first_observed(collected_row), load_stamped_windows(conn))
     # `probes.save_evidence`, never `probes.run.save_evidence`: the runner's
     # method is the single choke point the point-in-time gate hangs off
     # (`rli.eval.runner.ProbeRunner.save_evidence`, overridden by
@@ -954,9 +959,7 @@ def build_case_state(
             _posting_state_claim(data, canonical_url, now),
             # A stated first-publication date later than our own first
             # sighting cannot be one (`guard_first_published`).
-            *guard_first_published(
-                list(data.get("evidence") or []), _first_observed(collected_row)
-            ),
+            *guard_first_published(list(data.get("evidence") or []), guard_first_seen),
         ],
         posting_id=evidence_posting_id,
     )
@@ -1010,7 +1013,7 @@ def build_case_state(
     for extra_probe, extra_claims in probes.always_run_extra():
         evidence += probes.save_evidence(
             probe=extra_probe,
-            claims=guard_first_published(extra_claims, _first_observed(collected_row)),
+            claims=guard_first_published(extra_claims, guard_first_seen),
             posting_id=evidence_posting_id,
         )
 

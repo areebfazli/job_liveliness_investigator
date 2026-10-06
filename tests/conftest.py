@@ -97,3 +97,30 @@ def ctx_factory(
         )
 
     return build
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "company_holdout: keep rli.replay.build's stable company-holdout exclusion ON "
+        "(it is switched off for every other test; see _no_stable_company_holdout)",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_stable_company_holdout(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Switch off the stable company-holdout exclusion of replay builds by default.
+
+    Production excludes every company the stable hash puts in `test` from every
+    non-test build (rli.replay.build.stable_test_companies). The shared test
+    corpora predate that rule and use `acme.com`, which hashes to `test`, so
+    they would build nothing. Tests of the exclusion itself opt back in with
+    `@pytest.mark.company_holdout`.
+    """
+    if request.node.get_closest_marker("company_holdout") is not None:
+        return
+    import rli.replay.build as replay_build
+
+    monkeypatch.setattr(replay_build, "stable_test_companies", lambda _conn, **_kw: set())

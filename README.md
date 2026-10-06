@@ -178,7 +178,7 @@ the dataset is built, so evaluation never re-splits a corpus that has grown sinc
 ### 7. Tests
 
 ```bash
-uv run pytest -q && uv run ruff check .    # 1,476 tests
+uv run pytest -q && uv run ruff check .    # 1,530 tests
 ```
 
 ## Built-in safety rules

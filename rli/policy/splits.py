@@ -125,6 +125,7 @@ __all__ = [
     "assign_splits",
     "company_split",
     "company_split_stable",
+    "stable_company_split_of",
     "temporal_split",
     "write_splits_csv",
 ]
@@ -348,24 +349,37 @@ def company_split_stable(
     """
     _check_unique_posting_ids(rows)
     _validate_fractions(fractions)
-    dev_edge = fractions[0]
-    validation_edge = fractions[0] + fractions[1]
     by_company: dict[str, Split] = {}
     result: dict[str, Split] = {}
     for row in rows:
         split = by_company.get(row.company_id)
         if split is None:
-            digest = hashlib.blake2b(f"{seed}:{row.company_id}".encode(), digest_size=8).digest()
-            position = int.from_bytes(digest, "big") / 2.0**64
-            if position < dev_edge:
-                split = "dev"
-            elif position < validation_edge:
-                split = "validation"
-            else:
-                split = "test"
+            split = stable_company_split_of(row.company_id, seed=seed, fractions=fractions)
             by_company[row.company_id] = split
         result[row.posting_id] = split
     return result
+
+
+def stable_company_split_of(
+    company_id: str,
+    *,
+    seed: int = DEFAULT_SEED,
+    fractions: tuple[float, float, float] = (0.6, 0.2, 0.2),
+) -> Split:
+    """The split `company_split_stable` gives every posting of `company_id`.
+
+    A pure function of `(seed, company_id, fractions)`, so a company's side is
+    known without loading any posting — which is what lets every non-test
+    replay build exclude the stable company holdout up front.
+    """
+    _validate_fractions(fractions)
+    digest = hashlib.blake2b(f"{seed}:{company_id}".encode(), digest_size=8).digest()
+    position = int.from_bytes(digest, "big") / 2.0**64
+    if position < fractions[0]:
+        return "dev"
+    if position < fractions[0] + fractions[1]:
+        return "validation"
+    return "test"
 
 
 def assign_splits(

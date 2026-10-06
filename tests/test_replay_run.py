@@ -590,6 +590,30 @@ def test_replaying_system_a_and_b_over_a_fresh_dataset_has_zero_violations(
     assert missing == 0
 
 
+def test_replaying_system_r_is_offline_clean_and_calls_no_model(
+    conn: sqlite3.Connection, cfg: Config
+) -> None:
+    """System R replays like A and B: no runner argument, no LLM, no violation."""
+    from rli.replay.leakage import check_dataset
+
+    _build(conn, cfg)
+    a_summary = run_replay(conn, cfg, dataset_id=DATASET, system="A")
+    r_summary = run_replay(conn, cfg, dataset_id=DATASET, system="R")
+
+    assert r_summary.errors == 0, r_summary.describe()
+    assert r_summary.violations == 0, r_summary.describe()
+    assert r_summary.completed == a_summary.completed
+    model_steps = conn.execute(
+        "SELECT COUNT(*) FROM run_steps s JOIN runs r ON r.id = s.run_id "
+        "WHERE r.system = 'R' AND s.component = 'model'"
+    ).fetchone()[0]
+    assert model_steps == 0
+    report = check_dataset(conn, DATASET)
+    assert "R" in report.systems
+    assert report.counts.get("cache_miss", 0) == 0
+    assert report.counts.get("net_call", 0) == 0
+
+
 def test_team_signal_claims_reach_evidence_at_an_archive_era_t(
     conn: sqlite3.Connection, cfg: Config
 ) -> None:
@@ -1036,7 +1060,7 @@ def test_dataset_status_reports_per_system_completion(
     _build(conn, cfg)
     before = dataset_status(conn, dataset_id=DATASET)
     assert before.total_cases == 8
-    assert {s.system for s in before.by_system} == {"A", "B", "C", "C2"}
+    assert {s.system for s in before.by_system} == {"A", "B", "C", "C2", "R"}
     assert all(s.completed == 0 and s.remaining == s.total for s in before.by_system)
 
     run_replay(conn, cfg, dataset_id=DATASET, system="A", limit_cases=3)

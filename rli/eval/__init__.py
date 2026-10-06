@@ -2,12 +2,16 @@
 
 `rli.eval.system_a.run_system_a` (full probes) and
 `rli.eval.system_b.run_system_b` (deterministic rules, versioned and frozen)
-are the two systems this package ships; `rli.eval.report.summarize_runs`
-reads their traces back. Systems C and C2 (spec.md §6) land in PLAN.md M5 and
-reuse the same `rli.eval.runner` machinery, which is where the invariant that
-makes any of it comparable lives: every system shares one frozen action
-policy, one case-state builder and one trace format, and differs only in
-which dynamic probes it chooses to run.
+are the two systems this package ships, plus
+`rli.eval.system_r.run_system_r` (System C's controller with a deterministic
+"propose every eligible probe" step instead of the LLM investigator; not
+re-exported here, because it imports `rli.agent`, which imports this package);
+`rli.eval.report.summarize_runs` reads their traces back. Systems C and C2
+(spec.md §6) land in PLAN.md M5 and reuse the same `rli.eval.runner`
+machinery, which is where the invariant that makes any of it comparable
+lives: every system shares one frozen action policy, one case-state builder
+and one trace format, and differs only in which dynamic probes it chooses to
+run.
 
 Nothing in this package writes to the collection corpus — see
 `rli.eval.runner`'s write invariant.

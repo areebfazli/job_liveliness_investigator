@@ -36,6 +36,8 @@ EXPECTED_TABLES = {
     "replay_probe_results",
     # schema version 4 (Lever job-page publish dates)
     "posting_page_dates",
+    # schema version 6 (daily snapshot run windows)
+    "snapshot_runs",
 }
 
 

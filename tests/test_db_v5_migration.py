@@ -55,9 +55,12 @@ def _v4_sql() -> str:
         "    split_seed      INTEGER,\n"
         "    split_cutoff    TEXT,\n"
         "    split_validation_cutoff TEXT,\n"
-        "    exclude_companies_from TEXT\n",
+        "    exclude_companies_from TEXT,\n"
+        "    company_holdout TEXT\n",
         "    notes           TEXT\n",
     )
+    # Version 6's table is not part of a version-4 database.
+    sql = sql[: sql.index("-- snapshot_runs (schema version 6)")]
     sql = _cut(
         sql, "    split           TEXT CHECK (split IN ('dev', 'validation', 'test')),\n", ""
     )
@@ -178,8 +181,8 @@ def test_version_4_upgrades_to_5_and_a_second_run_is_a_no_op(tmp_path: Path) -> 
 
     conn = connect(path)
     try:
-        assert SCHEMA_VERSION == 5
-        assert schema_version(conn) == 5
+        # Upgraded through 5 (and on to the current version).
+        assert schema_version(conn) == SCHEMA_VERSION >= 5
         # Every runs row survives the rebuild, byte for byte, and only once.
         assert _runs(conn) == before
         assert (_runs(conn), _runs_sql(conn)) == after_first
@@ -300,7 +303,7 @@ def test_an_interrupted_upgrade_leaves_version_4_untouched(
     init_db(path)  # and a clean retry completes it
     conn = connect(path)
     try:
-        assert schema_version(conn) == 5
+        assert schema_version(conn) == SCHEMA_VERSION
         assert len(_runs(conn)) == 4
     finally:
         conn.close()

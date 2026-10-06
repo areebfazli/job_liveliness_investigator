@@ -435,7 +435,8 @@ CREATE TABLE IF NOT EXISTS replay_datasets (
     split_seed      INTEGER,
     split_cutoff    TEXT,
     split_validation_cutoff TEXT,
-    exclude_companies_from TEXT
+    exclude_companies_from TEXT,
+    company_holdout TEXT
 );
 
 CREATE TABLE IF NOT EXISTS replay_cases (
@@ -467,3 +468,36 @@ CREATE TABLE IF NOT EXISTS replay_probe_results (
 CREATE INDEX IF NOT EXISTS idx_replay_probe_results_lookup
     ON replay_probe_results (dataset_id, posting_id, replay_at);
 CREATE INDEX IF NOT EXISTS idx_replay_cases_dataset ON replay_cases (dataset_id);
+
+-- ---------------------------------------------------------------------------
+-- snapshot_runs (schema version 6)
+--
+-- One row per daily board-snapshot run: when it started and finished. Before
+-- the 2026-10-06 fix every capture of a run was stamped with the run's START
+-- (`stamped_at_start = 1`), although it was fetched at some point up to the
+-- run's end — up to 18 hours later on 2026-10-01. A capture whose
+-- `captured_at` lies inside such a window was therefore only really
+-- available at `finished_at`. The replay builder moves grid points out of
+-- those windows, the leakage checker flags cases that read such a capture
+-- before `finished_at`, and the first-published guard allows a date up to
+-- `finished_at` for a posting first observed inside one
+-- (rli.snapshots.run_windows). Runs after the fix stamp each company with its
+-- real fetch time (`stamped_at_start = 0`) and are recorded live by
+-- `rli snapshot`; earlier runs are imported once from data/logs/daily-*.log
+-- (`source = 'log_import'`). A pre-fix capture batch (a distinct own
+-- `captured_at`) that no logged window covers gets a conservative FALLBACK
+-- window (`source = 'capture_fallback'`): from its stamp to the next own
+-- batch's stamp, capped at 24 hours. The same DDL lives in rli.db.SNAPSHOT_RUNS_DDL
+-- (MIGRATIONS[5]); tests/test_run_windows_and_holdout.py asserts the two stay in sync.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS snapshot_runs (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at          TEXT NOT NULL,
+    finished_at         TEXT,
+    stamped_at_start    INTEGER NOT NULL CHECK (stamped_at_start IN (0, 1)),
+    source              TEXT NOT NULL CHECK (
+        source IN ('snapshot', 'log_import', 'capture_fallback')
+    ),
+    log_file            TEXT,
+    UNIQUE (started_at, source)
+);

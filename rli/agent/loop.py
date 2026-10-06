@@ -419,6 +419,7 @@ from dataclasses import dataclass
 from dataclasses import replace as dataclasses_replace
 from datetime import datetime
 from pathlib import Path
+from typing import Protocol
 
 from pydantic import ValidationError
 
@@ -451,7 +452,7 @@ from rli.net.client import hash_args
 from rli.policy.action import decide as policy_decide
 from rli.policy.inputs import could_change_action, last_publish_or_refresh
 from rli.policy.quality import evidence_quality_detail
-from rli.probes.base import Probe
+from rli.probes.base import Probe, ProbeContext
 from rli.probes.registry import DYNAMIC_PROBES, build_args
 
 __all__ = [
@@ -466,7 +467,9 @@ __all__ = [
     "c_config_hash",
     "investigator_error_run_ids",
     "make_system_c",
+    "Proposer",
     "parse_tokens",
+    "run_agent_loop",
     "run_system_c",
     "with_tokens",
 ]
@@ -1133,19 +1136,49 @@ def run_system_c(
     )
 
 
+class Proposer(Protocol):
+    """A deterministic stand-in for the investigator (spec.md §4 step 3).
+
+    Called with the CURRENT case state, the controller's `could_change` set
+    and the probes already executed; returns the candidate list the
+    controller then filters, ranks and budgets exactly as it does a model's
+    output. `rli.eval.system_r` supplies one that proposes every eligible
+    probe in rank order, which is how System R reuses C's controller,
+    eligibility, ranking and loop with zero model calls.
+    """
+
+    def __call__(
+        self,
+        *,
+        case: CaseState,
+        cfg: Config,
+        ctx: ProbeContext,
+        could_change: set[str],
+        executed: Sequence[ExecutedProbe],
+    ) -> InvestigatorOutput: ...
+
+
 def _run_loop(
     *,
     case: CaseState,
     cfg: Config,
     probes: ProbeRunner,
     run: Run,
-    llm: LLMClient,
+    llm: LLMClient | None,
     moment: datetime,
     budget: Budget,
     executed: list[ExecutedProbe],
     probes_run: list[str],
+    propose: Proposer | None = None,
 ) -> _ModelLedger:
     """spec.md §4 steps 3-8: the bounded loop. Mutates `case`/`executed`/`probes_run`.
+
+    `propose=None` (System C) asks the LLM investigator `llm` at step 3.
+    A `Proposer` (System R) replaces that call: no model is called, no model
+    step is written, and the model-call budget gate (step 3c) is skipped
+    because there is no model call to pay for. Every other line — the
+    pre-flight hard stops, the controller's filter/rank/budget, probe
+    execution and retry — is the same code for both.
 
     Split out of `run_system_c` so the run's lifecycle (open, always-run
     pair, policy, explanation, close) reads as one page and the loop reads as
@@ -1236,44 +1269,35 @@ def _run_loop(
             _trace_decision(probes, preflight)
             break
 
-        # -- step 3c: can we afford another investigator call? --------------
-        # The same gate `run_system_c` applies to the explanation, from the
-        # same estimator — one rule, two call sites.
-        unaffordable = ledger.unaffordable_cap()
-        if unaffordable is not None:
-            cap, detail = unaffordable
-            probes.note(f"{STEP_CONTROLLER_DECISION}:stop:{cap}", error=detail)
-            break
-
-        # -- step 3d: the investigator call ---------------------------------
-        structured_input, untrusted = build_investigator_input(
-            case,
-            cfg,
-            ctx=probes.ctx,
-            now=moment,
-            could_change=could_change,
-            executed=executed,
-            steps_remaining=ledger.budget.remaining_steps(),
-            # Probe-only, rounded — NOT `budget.remaining_*()`. See the
-            # module docstring: those carry measured wall-clock latency and
-            # cache-dependent LLM cost, which would make this prompt (and
-            # therefore its cache key) nondeterministic.
-            cost_remaining_usd=round(
-                ledger.budget.remaining_cost_usd() + llm_cost_usd, _REPORTED_PRECISION
-            ),
-            latency_remaining_s=round(
-                ledger.budget.remaining_latency_s() + llm_latency_s, _REPORTED_PRECISION
-            ),
-        )
-        prompt = build_investigator_prompt(structured_input=structured_input, untrusted=untrusted)
-        output, investigator_error, cost_usd, latency_s = _call_investigator(
-            llm=llm, run=run, prompt=prompt, moment=moment
-        )
-        # The ENFORCEMENT ledger charges the call in full: spec.md §4's caps
-        # bound the whole run, model spend included.
-        ledger = ledger.charge_model_call(cost_usd, latency_s)
-        llm_cost_usd += cost_usd
-        llm_latency_s += latency_s
+        output: InvestigatorOutput | None
+        investigator_error: str | None
+        if propose is not None:
+            # -- step 3 (System R): a deterministic proposal, no model ------
+            output = propose(
+                case=case,
+                cfg=cfg,
+                ctx=probes.ctx,
+                could_change=could_change,
+                executed=executed,
+            )
+            investigator_error = None
+        else:
+            output, investigator_error, ledger, llm_cost_usd, llm_latency_s = _investigate(
+                case=case,
+                cfg=cfg,
+                probes=probes,
+                run=run,
+                llm=llm,
+                moment=moment,
+                could_change=could_change,
+                executed=executed,
+                ledger=ledger,
+                llm_cost_usd=llm_cost_usd,
+                llm_latency_s=llm_latency_s,
+            )
+            if output is None and investigator_error is None:
+                # The model-call budget gate fired; the stop row is written.
+                break
 
         # -- steps 4-6: the controller decides ------------------------------
         decision = controller_decide(
@@ -1320,6 +1344,81 @@ def _run_loop(
         probes_run.append(name)
 
     return ledger
+
+
+#: The public name of the bounded loop, for System R (`rli.eval.system_r`).
+run_agent_loop = _run_loop
+
+
+def _investigate(
+    *,
+    case: CaseState,
+    cfg: Config,
+    probes: ProbeRunner,
+    run: Run,
+    llm: LLMClient | None,
+    moment: datetime,
+    could_change: set[str],
+    executed: list[ExecutedProbe],
+    ledger: _ModelLedger,
+    llm_cost_usd: float,
+    llm_latency_s: float,
+) -> tuple[InvestigatorOutput | None, str | None, _ModelLedger, float, float]:
+    """System C's step 3c-3d: the model-call budget gate, then one investigator call.
+
+    Returns `(output, investigator_error, ledger, llm_cost_usd, llm_latency_s)`.
+    `output is None and investigator_error is None` means the budget gate
+    stopped the loop (its `controller_decision:stop:<cap>` row is written
+    here); the caller breaks.
+    """
+    if llm is None:  # pragma: no cover - run_system_c always resolves a client
+        raise ValueError("the LLM investigator path needs an LLM client")
+
+    # -- step 3c: can we afford another investigator call? --------------
+    # The same gate `run_system_c` applies to the explanation, from the
+    # same estimator — one rule, two call sites.
+    unaffordable = ledger.unaffordable_cap()
+    if unaffordable is not None:
+        cap, detail = unaffordable
+        probes.note(f"{STEP_CONTROLLER_DECISION}:stop:{cap}", error=detail)
+        return None, None, ledger, llm_cost_usd, llm_latency_s
+
+    # -- step 3d: the investigator call ---------------------------------
+    structured_input, untrusted = build_investigator_input(
+        case,
+        cfg,
+        ctx=probes.ctx,
+        now=moment,
+        could_change=could_change,
+        executed=executed,
+        steps_remaining=ledger.budget.remaining_steps(),
+        # Probe-only, rounded — NOT `budget.remaining_*()`. See the
+        # module docstring: those carry measured wall-clock latency and
+        # cache-dependent LLM cost, which would make this prompt (and
+        # therefore its cache key) nondeterministic.
+        cost_remaining_usd=round(
+            ledger.budget.remaining_cost_usd() + llm_cost_usd, _REPORTED_PRECISION
+        ),
+        latency_remaining_s=round(
+            ledger.budget.remaining_latency_s() + llm_latency_s, _REPORTED_PRECISION
+        ),
+    )
+    prompt = build_investigator_prompt(structured_input=structured_input, untrusted=untrusted)
+    output, investigator_error, cost_usd, latency_s = _call_investigator(
+        llm=llm, run=run, prompt=prompt, moment=moment
+    )
+    # The ENFORCEMENT ledger charges the call in full: spec.md §4's caps
+    # bound the whole run, model spend included.
+    ledger = ledger.charge_model_call(cost_usd, latency_s)
+    if output is None and investigator_error is None:  # pragma: no cover - defensive
+        investigator_error = "investigator produced no valid output"
+    return (
+        output,
+        investigator_error,
+        ledger,
+        llm_cost_usd + cost_usd,
+        llm_latency_s + latency_s,
+    )
 
 
 def _trace_decision(probes: ProbeRunner, decision: ControllerDecision) -> None:

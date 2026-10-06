@@ -17,7 +17,9 @@ system itself can see:
    (`rli.replay.mode.ReplayNetClient`).
 
 The system under test is passed in, not branched on: `SYSTEM_RUNNERS` maps
-`'A'` and `'B'` to `rli.eval.system_a` / `rli.eval.system_b`, and any callable
+`'A'`, `'B'` and `'R'` to `rli.eval.system_a` / `rli.eval.system_b` /
+`rli.eval.system_r` (R makes no model call, so it is offline like A and B),
+and any callable
 with the same keyword contract can be handed in as `runner=` — which is how
 System C (PLAN.md M5) is replayed on this dataset without this module
 learning anything about it.
@@ -150,6 +152,7 @@ from rli.config import Config
 from rli.eval.runner import ReplayHook, RunResult, SystemName
 from rli.eval.system_a import run_system_a
 from rli.eval.system_b import run_system_b
+from rli.eval.system_r import run_system_r
 from rli.models.time import now_utc, parse_utc, to_utc_z
 from rli.replay.build import archive_state_args_hash, dataset_case_rows
 from rli.replay.mode import (
@@ -262,6 +265,8 @@ class SystemRunner(Protocol):
 SYSTEM_RUNNERS: dict[str, Callable[..., RunResult]] = {
     "A": run_system_a,
     "B": run_system_b,
+    # No LLM: offline like A and B (rli.eval.system_r).
+    "R": run_system_r,
 }
 
 
@@ -1114,9 +1119,9 @@ class ReplayDatasetStatus(BaseModel):
         return self.describe()
 
 
-#: systems `runs.system`'s CHECK constraint allows; status is reported for all four
+#: systems `runs.system`'s CHECK constraint allows; status is reported for all of them
 #: unconditionally so a fresh, never-replayed dataset still shows "remaining = total".
-_ALL_SYSTEMS = ("A", "B", "C", "C2")
+_ALL_SYSTEMS = ("A", "B", "C", "C2", "R")
 
 
 def _completed_case_keys(
