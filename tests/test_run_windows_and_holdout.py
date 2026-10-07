@@ -547,7 +547,7 @@ def test_version_5_upgrades_to_6_and_a_second_run_is_a_no_op(tmp_path: Path) -> 
     init_db(path)
     conn = connect(path)
     try:
-        assert schema_version(conn) == SCHEMA_VERSION == 6
+        assert schema_version(conn) == SCHEMA_VERSION >= 6
         assert conn.execute("SELECT COUNT(*) FROM snapshot_runs").fetchone()[0] == 0
         columns = {row[1] for row in conn.execute("PRAGMA table_info(replay_datasets)")}
         assert "company_holdout" in columns

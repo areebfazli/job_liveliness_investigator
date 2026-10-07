@@ -2,7 +2,13 @@
 
 Steps (spec.md §4 "Always run" table + this task's spec):
 
-1. `detect_ats(url)` to classify the ATS and extract tenant/job id.
+1. `detect_ats(url)` to classify the ATS and extract tenant/job id, then
+   `rli.probes.lookups.known_ats_ref` for what the corpus already knows: a
+   company careers-page URL of a Greenhouse board we collect (the board
+   API's own `absolute_url`, e.g. `careers.airbnb.com/...?gh_jid=1`) is
+   resolved to that board and job, and an ATS tenant is spelled the way the
+   collector spells it. `data["identity_source"]` says which (`"url"` /
+   `"corpus"`).
 2. If the ATS has an adapter (Greenhouse/Ashby/Lever), fetch it and look for
    the target job — its documented `ats_native` dates become evidence:
    Greenhouse `first_published` / `updated_at`, and Ashby `publishedAt` as
@@ -38,6 +44,7 @@ from pydantic import BaseModel
 
 from rli.models.probe import ProbeResult
 from rli.probes.base import Probe, ProbeClaim, ProbeContext
+from rli.probes.lookups import known_ats_ref
 from rli.resolvers import ashby, greenhouse, jsonld, lever
 from rli.resolvers.detect import AtsRef, detect_ats
 
@@ -267,9 +274,17 @@ def resolve_posting(url: str, ctx: ProbeContext) -> ProbeResult:
                 "title": None,
                 "company_domain": None,
                 "posting_state": "unknown",
+                "identity_source": "url",
                 "evidence": [],
             },
         )
+
+    # A careers-page URL of a board we collect, or a tenant spelled
+    # differently from the collector's (module docstring, step 1).
+    identity_source = "url"
+    known = known_ats_ref(ctx.conn, url, ref)
+    if known is not None:
+        ref, identity_source = known, "corpus"
 
     claims: list[ProbeClaim] = []
     title: str | None = None
@@ -328,6 +343,7 @@ def resolve_posting(url: str, ctx: ProbeContext) -> ProbeResult:
             "title": title,
             "company_domain": company_domain,
             "posting_state": posting_state,
+            "identity_source": identity_source,
             "evidence": claims,
         },
     )

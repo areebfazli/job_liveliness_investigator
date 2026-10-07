@@ -64,7 +64,12 @@ BUSY_TIMEOUT_MS = 5000
 #         stamped with a run's start can be dated honestly) and
 #         `replay_datasets.company_holdout` (the stable company holdout a
 #         build excluded).
-SCHEMA_VERSION = 6
+# 6 -> 7: `replay_datasets.retired_at` / `.retired_reason` — a reversible
+#         "retired" state (`rli replay retire` / `unretire`, rli.replay.retire):
+#         a retired dataset is ignored by the company-holdout breach check and
+#         refused by `replay run` / `eval run` without an explicit override.
+#         No data is deleted.
+SCHEMA_VERSION = 7
 
 # from-version -> SQL script (or idempotent callable) that upgrades that
 # version to version + 1. `schema.sql` describes only the newest version;
@@ -400,6 +405,39 @@ def _migrate_5_to_6(conn: sqlite3.Connection) -> None:
 
 
 MIGRATIONS[5] = _migrate_5_to_6
+
+
+# 6 -> 7. Nullable, no default: schema-only ADD COLUMNs (no table rewrite).
+# The same columns are spelled in rli/db/schema.sql (the fresh-database path).
+_V7_ADD_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("replay_datasets", "retired_at", "TEXT"),
+    ("replay_datasets", "retired_reason", "TEXT"),
+)
+
+
+def _migrate_6_to_7(conn: sqlite3.Connection) -> None:
+    """Version 7, atomically and idempotently: the replay-dataset retired state.
+
+    Each column is added only when missing (a table created from a newer
+    `schema.sql`, which `init_db` runs first, already has both). One
+    `BEGIN IMMEDIATE` transaction, the `user_version` stamp included: an
+    interrupted upgrade leaves version 6.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for table, name, sql_type in _V7_ADD_COLUMNS:
+            existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if name not in existing:
+                # Names/types come from the fixed tuple above, never from input.
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
+        _set_schema_version(conn, 7)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+MIGRATIONS[6] = _migrate_6_to_7
 
 
 def _schema_sql() -> str:

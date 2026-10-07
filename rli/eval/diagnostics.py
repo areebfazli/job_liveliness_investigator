@@ -77,6 +77,7 @@ from rli.policy.quality import evidence_quality_detail
 from rli.probes.board_snapshot import BoardSnapshotProbe
 from rli.probes.registry import DYNAMIC_PROBES
 from rli.probes.resolve_posting import ResolvePostingProbe
+from rli.replay.retire import retired_datasets
 
 __all__ = [
     "AgentTraceStats",
@@ -865,6 +866,10 @@ class CompanyHoldoutCheck(BaseModel):
     (`breaches`: dataset -> `{"companies": n, "cases": m}`). The evaluated
     dataset's own overlap is reported apart (`self_overlap`): it means the
     dataset's cases and its holdout disagree, which is a different defect.
+
+    A dataset retired with `rli replay retire` (schema v7) is not checked:
+    it is listed in `retired_ignored` (dataset -> the overlap it WOULD have
+    counted, possibly zero) and reported as "retired, ignored".
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -879,6 +884,8 @@ class CompanyHoldoutCheck(BaseModel):
     self_overlap: dict[str, int] = {}
     #: The evaluated dataset's recorded build-time exclusion (schema v6).
     build_exclusion: str | None = None
+    #: Retired non-test datasets left out of the check (schema v7).
+    retired_ignored: dict[str, dict[str, int]] = {}
 
     @property
     def clean(self) -> bool:
@@ -914,6 +921,14 @@ class CompanyHoldoutCheck(BaseModel):
                 f"the evaluated dataset's OWN non-test cases include "
                 f"{self.self_overlap['companies']} of its test companies "
                 f"({self.self_overlap['cases']} cases)"
+            )
+        if self.retired_ignored:
+            parts.append(
+                "retired, ignored: "
+                + ", ".join(
+                    f"{name} ({entry['companies']} test companies, {entry['cases']} cases)"
+                    for name, entry in sorted(self.retired_ignored.items())
+                )
             )
         return " - ".join(parts)
 
@@ -988,6 +1003,8 @@ def company_holdout_check(
     breaches: dict[str, dict[str, int]] = {}
     self_overlap: dict[str, int] = {}
     datasets = 0
+    retired = set(retired_datasets(conn)) - {dataset_id}
+    retired_ignored: dict[str, dict[str, int]] = {}
     try:
         rows = conn.execute(
             """
@@ -998,17 +1015,27 @@ def company_holdout_check(
             GROUP BY c.dataset_id, c.company_id
             """
         ).fetchall()
-        datasets = int(
-            conn.execute(
-                "SELECT COUNT(*) FROM replay_datasets WHERE split_name != 'test' "
+        others = [
+            str(row[0])
+            for row in conn.execute(
+                "SELECT dataset_id FROM replay_datasets WHERE split_name != 'test' "
                 "AND dataset_id != ?",
                 (dataset_id,),
-            ).fetchone()[0]
-        )
+            )
+        ]
+        datasets = sum(1 for other in others if other not in retired)
+        retired_ignored = {
+            other: {"companies": 0, "cases": 0} for other in others if other in retired
+        }
     except sqlite3.Error:  # pragma: no cover - pre-replay schema
         rows = []
     for row in rows:
         if str(row["company_id"]) not in test_companies:
+            continue
+        if str(row["dataset_id"]) in retired:
+            entry = retired_ignored.setdefault(str(row["dataset_id"]), {"companies": 0, "cases": 0})
+            entry["companies"] += 1
+            entry["cases"] += int(row["n"])
             continue
         if str(row["dataset_id"]) == dataset_id:
             self_overlap["companies"] = self_overlap.get("companies", 0) + 1
@@ -1027,4 +1054,5 @@ def company_holdout_check(
         breaches=breaches,
         self_overlap=self_overlap,
         build_exclusion=build_exclusion,
+        retired_ignored=retired_ignored,
     )

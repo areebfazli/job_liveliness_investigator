@@ -56,7 +56,9 @@ def _v4_sql() -> str:
         "    split_cutoff    TEXT,\n"
         "    split_validation_cutoff TEXT,\n"
         "    exclude_companies_from TEXT,\n"
-        "    company_holdout TEXT\n",
+        "    company_holdout TEXT,\n"
+        "    retired_at      TEXT,\n"
+        "    retired_reason  TEXT\n",
         "    notes           TEXT\n",
     )
     # Version 6's table is not part of a version-4 database.

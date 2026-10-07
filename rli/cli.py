@@ -21,6 +21,14 @@ from rli.history.cli import app as history_app
 from rli.models.time import now_utc, parse_utc
 from rli.replay.build import DEFAULT_GRID_STEP_DAYS, build_dataset
 from rli.replay.leakage import check_dataset
+from rli.replay.retire import (
+    RetiredDatasetError,
+    dataset_rows,
+    ensure_not_retired,
+    retire_dataset,
+    retirement_of,
+    unretire_dataset,
+)
 from rli.replay.run import (
     REPLAY_BUSY_TIMEOUT_S,
     SYSTEM_RUNNERS,
@@ -491,6 +499,11 @@ def replay_run_command(
         min=0.0,
         help="Seconds a write waits on a locked database before failing.",
     ),
+    allow_retired: bool = typer.Option(
+        False,
+        "--allow-retired",
+        help="Replay a dataset retired with `rli replay retire` anyway.",
+    ),
     db: str = typer.Option(_DEFAULT_DB_PATH, "--db", help="Path to the SQLite database file."),
 ) -> None:
     """Replay one system over every (posting, T) case of a dataset."""
@@ -526,6 +539,8 @@ def replay_run_command(
     conn = connect(db, busy_timeout_ms=int(busy_timeout * 1000))
     llm_inner = None
     try:
+        # Refuse a retired dataset before any model client is built.
+        _refuse_retired(conn, dataset, allow_retired=allow_retired)
         runner = None
         if chosen == "C":
             from rli.agent.loop import make_system_c  # lazy: no agent stack for A/B
@@ -553,6 +568,7 @@ def replay_run_command(
             resume=effective_resume,
             stop_on_quota=effective_stop_on_quota,
             shard=shard_spec,
+            allow_retired=allow_retired,
         )
         typer.echo(summary.describe())
         if summary.stopped_reason == "quota_exhausted":
@@ -627,9 +643,95 @@ def replay_status_command(
     conn = connect(db)
     try:
         status = dataset_status(conn, dataset_id=dataset, shards=shards)
+        retirement = retirement_of(conn, dataset)
+        if retirement is not None:
+            typer.echo(f"dataset {dataset}: {retirement.describe()}")
         typer.echo(status.describe())
     finally:
         conn.close()
+
+
+def _refuse_retired(conn: sqlite3.Connection, dataset: str, *, allow_retired: bool) -> None:
+    """`--dataset` is a bad parameter when it names a retired dataset (no override)."""
+    try:
+        retirement = ensure_not_retired(conn, dataset, allow_retired=allow_retired)
+    except RetiredDatasetError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--dataset") from exc
+    if retirement is not None:
+        typer.echo(f"warning: dataset {dataset} is {retirement.describe()}", err=True)
+
+
+@replay_app.command("list")
+def replay_list_command(
+    db: str = typer.Option(_DEFAULT_DB_PATH, "--db", help="Path to the SQLite database file."),
+) -> None:
+    """Every replay dataset, oldest first, with its size and retired state. Read-only."""
+    try:
+        conn = connect_read_only(db)
+    except sqlite3.OperationalError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--db") from exc
+    try:
+        rows = dataset_rows(conn)
+    finally:
+        conn.close()
+    if not rows:
+        typer.echo("no replay datasets")
+        return
+    for row in rows:
+        if row["retired_at"]:
+            reason = f": {row['retired_reason']}" if row["retired_reason"] else ""
+            state = f"RETIRED {row['retired_at']}{reason}"
+        else:
+            state = "active"
+        typer.echo(
+            f"{row['dataset_id']}  {row['split_kind']}/{row['split_name']}  "
+            f"postings={row['postings']} companies={row['companies']} cases={row['cases']}  "
+            f"created={row['created_at']}  {state}"
+        )
+
+
+@replay_app.command("retire")
+def replay_retire_command(
+    dataset: str = typer.Option(..., "--dataset", help="Replay dataset id to retire."),
+    reason: str = typer.Option(..., "--reason", help="Why it is retired (recorded)."),
+    db: str = typer.Option(_DEFAULT_DB_PATH, "--db", help="Path to the SQLite database file."),
+) -> None:
+    """Mark a dataset retired (reversible; deletes nothing).
+
+    A retired dataset is ignored by the company-holdout breach check and refused
+    by `replay run` / `eval run` unless `--allow-retired` is passed.
+    """
+    init_db(db)
+    conn = connect(db)
+    try:
+        retirement = retire_dataset(conn, dataset, reason=reason)
+    except LookupError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--dataset") from exc
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--reason") from exc
+    finally:
+        conn.close()
+    typer.echo(f"dataset {dataset}: {retirement.describe()}")
+
+
+@replay_app.command("unretire")
+def replay_unretire_command(
+    dataset: str = typer.Option(..., "--dataset", help="Replay dataset id to un-retire."),
+    db: str = typer.Option(_DEFAULT_DB_PATH, "--db", help="Path to the SQLite database file."),
+) -> None:
+    """Clear a dataset's retired state."""
+    init_db(db)
+    conn = connect(db)
+    try:
+        previous = unretire_dataset(conn, dataset)
+    except LookupError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--dataset") from exc
+    finally:
+        conn.close()
+    if previous is None:
+        typer.echo(f"dataset {dataset}: was not retired; nothing changed")
+    else:
+        typer.echo(f"dataset {dataset}: active again (was {previous.describe()})")
 
 
 # ---------------------------------------------------------------------------
@@ -804,6 +906,11 @@ def eval_run_command(
         help="Include the corpus-wide posting-behaviour summary. --no-survival skips the "
         "lifelines import entirely.",
     ),
+    allow_retired: bool = typer.Option(
+        False,
+        "--allow-retired",
+        help="Evaluate a dataset retired with `rli replay retire` anyway (the report says so).",
+    ),
     db: str = typer.Option(_DEFAULT_DB_PATH, "--db", help="Path to the SQLite database file."),
 ) -> None:
     """Write the spec.md §6 final evaluation report for one replay dataset (PLAN.md M6).
@@ -840,10 +947,13 @@ def eval_run_command(
             rerun=rerun,
             read_only=read_only,
             include_survival=survival,
+            allow_retired=allow_retired,
         )
         path = write_evaluation_report(out, report)
         typer.echo(report.describe())
         typer.echo(f"wrote {path}", err=True)
+    except RetiredDatasetError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--dataset") from exc
     except LookupError as exc:
         # `run_replay` raises this for a dataset with no cases — i.e. a
         # dataset id that was never built. A bad parameter, not a crash.
@@ -871,6 +981,11 @@ def eval_gates_command(
         "--read-only",
         help="Open the database with SQLite mode=ro and write nothing.",
     ),
+    allow_retired: bool = typer.Option(
+        False,
+        "--allow-retired",
+        help="Grade a dataset retired with `rli replay retire` anyway.",
+    ),
     db: str = typer.Option(_DEFAULT_DB_PATH, "--db", help="Path to the SQLite database file."),
 ) -> None:
     """Print the two spec.md §6 gate verdicts for one replay dataset.
@@ -895,6 +1010,7 @@ def eval_gates_command(
             cutoff=_optional_moment(cutoff, "--cutoff"),
             include_survival=False,
             read_only=read_only,
+            allow_retired=allow_retired,
         )
         typer.echo(f"agent gate: {report.agent_gate.status.upper()}")
         typer.echo(report.agent_gate.describe())
@@ -903,6 +1019,8 @@ def eval_gates_command(
         typer.echo("")
         typer.echo(f"product gate: {report.product_gate.status.upper()}")
         typer.echo(report.product_gate.describe())
+    except RetiredDatasetError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--dataset") from exc
     except LookupError as exc:
         raise typer.BadParameter(str(exc), param_hint="--dataset") from exc
     finally:

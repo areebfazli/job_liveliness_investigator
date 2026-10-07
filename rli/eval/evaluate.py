@@ -248,6 +248,7 @@ from rli.eval.ranker import RankerConfig, RankerResult, evaluate_ranker
 from rli.llm.client import endpoint_unavailable_reason
 from rli.models.time import now_utc, to_utc_z
 from rli.policy.action import policy_version
+from rli.replay.retire import ensure_not_retired
 
 __all__ = [
     "C_NOT_RUN_REASON",
@@ -785,6 +786,8 @@ def _run_or_reuse(
         limit_cases=limit_cases,
         collection_status_csv=collection_status_csv,
         replace=True,
+        # `evaluate` already refused a retired dataset unless it was allowed.
+        allow_retired=True,
     )
     return "ran"
 
@@ -1055,6 +1058,7 @@ def evaluate(
     match_precision_path: str | Path = DEFAULT_MATCH_PRECISION_PATH,
     include_survival: bool = True,
     ranker_config: RankerConfig | None = None,
+    allow_retired: bool = False,
 ) -> EvaluationReport:
     """Run the whole spec.md §6 evaluation over one replay dataset.
 
@@ -1087,12 +1091,18 @@ def evaluate(
             no runs are reported as `READ_ONLY_SKIP`.
         include_survival: include the corpus-wide posting-behaviour summary.
             `False` skips the lifelines import entirely.
+        allow_retired: evaluate a dataset retired with `rli replay retire`
+            anyway (the report then says so). Without it a retired dataset
+            raises `rli.replay.retire.RetiredDatasetError` before anything
+            is read or replayed.
 
     Never raises for corrupt stored data; a failing survival fit degrades to
     `survival=None` plus a `survival_note`.
     """
     if read_only and rerun:
         raise ValueError("rerun=True replays systems, which read_only=True forbids")
+    # A retired dataset (`rli replay retire`) is refused unless allowed.
+    retirement = ensure_not_retired(conn, dataset_id, allow_retired=allow_retired)
 
     resolved_splits = resolve_allowed_splits(allowed_splits, allow_test=allow_test)
 
@@ -1296,6 +1306,11 @@ def evaluate(
     )
     holdout_check = company_holdout_check(conn, dataset_id=dataset_id, split_kind=split_kind_used)
     extra_notes: list[str] = []
+    if retirement is not None:
+        extra_notes.append(
+            f"RETIRED DATASET: {dataset_id} is {retirement.describe()}; evaluated only "
+            "because allow_retired / --allow-retired was passed."
+        )
     if holdout_check.applicable and not holdout_check.clean:
         extra_notes.append(
             "COMPANY HOLDOUT BREACHED: "

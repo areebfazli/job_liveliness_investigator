@@ -414,6 +414,13 @@ CREATE TABLE IF NOT EXISTS posting_page_dates (
 -- version 5 (rli.eval.metrics.split_map_for_dataset reconstructs those).
 -- Version-4 databases gain the columns via rli.db.MIGRATIONS[4].
 --
+-- Retired state (schema version 7): `replay_datasets.retired_at` /
+-- `retired_reason`, set by `rli replay retire` and cleared by `rli replay
+-- unretire` (rli.replay.retire). A retired dataset keeps every row; it is
+-- ignored by the company-holdout breach check and refused by `replay run` /
+-- `eval run` unless explicitly overridden. Version-6 databases gain the
+-- columns via rli.db.MIGRATIONS[6].
+--
 -- posting_id deliberately carries NO foreign key to `postings`: a replay
 -- subject may be a posting the collector has not committed a row for, and the
 -- eval layer is forbidden from creating one (rli/eval/runner.py's write
@@ -436,7 +443,9 @@ CREATE TABLE IF NOT EXISTS replay_datasets (
     split_cutoff    TEXT,
     split_validation_cutoff TEXT,
     exclude_companies_from TEXT,
-    company_holdout TEXT
+    company_holdout TEXT,
+    retired_at      TEXT,
+    retired_reason  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS replay_cases (

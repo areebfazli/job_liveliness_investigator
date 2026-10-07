@@ -163,6 +163,7 @@ from rli.replay.mode import (
     replay_hook,
 )
 from rli.replay.pit import point_in_time
+from rli.replay.retire import ensure_not_retired
 
 __all__ = [
     "REPLAY_BUSY_TIMEOUT_S",
@@ -577,6 +578,7 @@ def run_replay(
     resume: bool = False,
     stop_on_quota: bool = False,
     shard: tuple[int, int] | None = None,
+    allow_retired: bool = False,
 ) -> ReplayRunSummary:
     """Replay `system` over every case of `dataset_id` (spec.md §6).
 
@@ -618,8 +620,12 @@ def run_replay(
             of `N` (0-based), so N processes can replay one dataset
             concurrently against one database. Requires `resume=True`
             (`ValueError` otherwise); see the module docstring.
+        allow_retired: replay a dataset retired with `rli replay retire`
+            anyway. Without it a retired dataset raises
+            `rli.replay.retire.RetiredDatasetError` before anything runs.
 
-    Raises `LookupError` if the dataset has no cases, and `ValueError` for a
+    Raises `LookupError` if the dataset has no cases, `RetiredDatasetError`
+    for a retired dataset (see `allow_retired`), and `ValueError` for a
     system with no runner or an invalid/unsafe `shard` — all before any case
     runs. Once the walk starts, a per-case failure (the system raising, a
     `ReplayViolation`, or a `sqlite3.Error` in the resume/quota bookkeeping
@@ -632,6 +638,7 @@ def run_replay(
         raise LookupError(
             f"replay dataset {dataset_id!r} has no cases; build it first (`rli replay build`)"
         )
+    ensure_not_retired(conn, dataset_id, allow_retired=allow_retired)
 
     system_name = str(system)
     execute = runner if runner is not None else SYSTEM_RUNNERS.get(system_name)

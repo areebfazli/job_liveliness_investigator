@@ -13,11 +13,11 @@ from __future__ import annotations
 
 import re
 from typing import Literal
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from pydantic import BaseModel
 
-__all__ = ["AtsName", "AtsRef", "detect_ats"]
+__all__ = ["AtsName", "AtsRef", "detect_ats", "greenhouse_job_id_from_query"]
 
 AtsName = Literal["greenhouse", "ashby", "lever", "generic"]
 
@@ -25,15 +25,29 @@ AtsName = Literal["greenhouse", "ashby", "lever", "generic"]
 # (spec.md §10): the legacy `boards.greenhouse.io` and the newer
 # `job-boards.greenhouse.io`.
 _GREENHOUSE_BOARD_HOSTS = {"boards.greenhouse.io", "job-boards.greenhouse.io"}
+# Greenhouse's EU boards. The daily collector reads these tenants' boards
+# through the same `boards-api.greenhouse.io` job-board API (the live corpus
+# holds hundreds of collected postings whose URL is on
+# `job-boards.eu.greenhouse.io`), so an EU job URL resolves through that API
+# too. The canonical URL keeps the EU host.
+_GREENHOUSE_EU_BOARD_HOSTS = {"boards.eu.greenhouse.io", "job-boards.eu.greenhouse.io"}
 _GREENHOUSE_API_HOST = "boards-api.greenhouse.io"
 
 _SLUG = r"[A-Za-z0-9][\w-]*"
+# Ashby and Lever organisation slugs may contain dots (`checkout.com`,
+# `careers.azx.io` and `mistral.ai` are real Ashby boards in the corpus). The
+# slug must start with an alphanumeric character, so it can never be a `.` or
+# `..` path segment.
+_ORG_SLUG = r"[A-Za-z0-9][\w.-]*"
 _UUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+# Greenhouse's embedded job board links each job on the company's own careers
+# page as `...?gh_jid=<id>` (e.g. `careers.airbnb.com/positions/1?gh_jid=1`).
+_GH_JID = re.compile(r"[0-9]{1,20}")
 
 _GREENHOUSE_BOARD_PATH = re.compile(rf"^/(?P<board>{_SLUG})/jobs/(?P<job_id>\d+)/?$")
 _GREENHOUSE_API_PATH = re.compile(rf"^/v1/boards/(?P<board>{_SLUG})/jobs/(?P<job_id>\d+)/?$")
-_ASHBY_PATH = re.compile(rf"^/(?P<org>{_SLUG})/(?P<job_id>{_UUID})/?$")
-_LEVER_PATH = re.compile(rf"^/(?P<org>{_SLUG})/(?P<job_id>{_UUID})(?:/.*)?$")
+_ASHBY_PATH = re.compile(rf"^/(?P<org>{_ORG_SLUG})/(?P<job_id>{_UUID})/?$")
+_LEVER_PATH = re.compile(rf"^/(?P<org>{_ORG_SLUG})/(?P<job_id>{_UUID})(?:/.*)?$")
 
 _ASHBY_HOST = "jobs.ashbyhq.com"
 _LEVER_HOST = "jobs.lever.co"
@@ -82,15 +96,20 @@ def detect_ats(url: str) -> AtsRef | None:
         return None
     _scheme, host, path = normalized
 
-    if host in _GREENHOUSE_BOARD_HOSTS:
+    if host in _GREENHOUSE_BOARD_HOSTS or host in _GREENHOUSE_EU_BOARD_HOSTS:
         match = _GREENHOUSE_BOARD_PATH.match(path)
         if match:
             board, job_id = match["board"], match["job_id"]
+            board_host = (
+                "job-boards.eu.greenhouse.io"
+                if host in _GREENHOUSE_EU_BOARD_HOSTS
+                else "boards.greenhouse.io"
+            )
             return AtsRef(
                 ats="greenhouse",
                 tenant=board,
                 job_id=job_id,
-                canonical_url=f"https://boards.greenhouse.io/{board}/jobs/{job_id}",
+                canonical_url=f"https://{board_host}/{board}/jobs/{job_id}",
             )
     elif host == _GREENHOUSE_API_HOST:
         match = _GREENHOUSE_API_PATH.match(path)
@@ -124,3 +143,25 @@ def detect_ats(url: str) -> AtsRef | None:
             )
 
     return AtsRef(ats="generic", tenant=None, job_id=None, canonical_url=url.strip())
+
+
+def greenhouse_job_id_from_query(url: str) -> str | None:
+    """The Greenhouse job id in a careers-page URL's `gh_jid` query parameter.
+
+    A company that embeds its Greenhouse board on its own site links each job
+    as `<careers page>?gh_jid=<id>`, and the board API's `absolute_url` is
+    then that page, not a Greenhouse URL. The id alone does not name the
+    board (tenant); `rli.probes.lookups.known_ats_ref` supplies that from the
+    corpus. Returns the first all-digit value (some boards repeat the
+    parameter), or None. Never touches the network.
+    """
+    if not url or not isinstance(url, str):
+        return None
+    try:
+        query = urlparse(url.strip()).query
+    except ValueError:
+        return None
+    for value in parse_qs(query).get("gh_jid", []):
+        if _GH_JID.fullmatch(value):
+            return value
+    return None
