@@ -62,6 +62,18 @@ min_history_days = 30
 # `freeze_or_pause` policy inputs (spec.md §5). PLACEHOLDER — not yet tuned.
 negative_event_window_days = 180
 
+# spec.md §3 amendment 2026-10-07. Ashby documents `publishedAt` as "when the
+# job was LAST published", so on its own it is never first-publish evidence.
+# It counts as the first publication (an `ats_native` `first_published`
+# claim) only when (1) the last complete OWN board capture before the
+# posting's first sighting did not list the job (archive captures and failed
+# fetches never count as an absence), (2) the stated date lies after that
+# capture and at or before the first sighting (pre-fix run-window slack as
+# for the first-published guard), and (3) the first sighting is at most this
+# many days after the stated date. Read by rli.eval.ashby_first_publish (live
+# and replay). PLACEHOLDER — not yet tuned.
+ashby_first_seen_max_lag_days = 2
+
 [matching]
 # Repost/version matching (spec.md §4: "Match reposted/versioned roles using
 # title, team, location, and description similarity. Keep thresholds
@@ -290,7 +302,7 @@ team_signal = []
 # PLACEHOLDER — not yet tuned.
 contradiction_days = 3
 
-# The six keys below are OVERRIDES of the identically named [thresholds]
+# The seven keys below are OVERRIDES of the identically named [thresholds]
 # keys, not copies: when unset (the default), the policy reads the
 # [thresholds] value, so there is exactly one source of truth. Set one here
 # only to pin the POLICY's notion of a term at freeze time (spec.md §5)
@@ -299,12 +311,13 @@ contradiction_days = 3
 # long_lived_days = 180
 # recheck_default_days = 14
 # recheck_cap_days = 14
-# The last two are applied upstream of the policy function (rli.eval.case
-# and rli.events.policy_signals) but are resolved through
-# rli.policy.action.PolicyThresholds there, so an override set here really
-# does change behaviour — and, like the rest, changes policy_version().
+# The last three are applied upstream of the policy function (rli.eval.case,
+# rli.events.policy_signals, rli.eval.ashby_first_publish) but are resolved
+# through rli.policy.action.PolicyThresholds there, so an override set here
+# really does change behaviour — and, like the rest, changes policy_version().
 # refresh_match_days = 3
 # negative_event_window_days = 180
+# ashby_first_seen_max_lag_days = 2
 
 # Numeric cost tiers + rough latency estimates for the dynamic probes
 # (spec.md §4 "Dynamic probes" cost column; PLAN.md M3). rli.probes.registry

@@ -192,7 +192,9 @@ CLAIM_REFRESHED_AT = "refreshed_at"
 # old posting look new); it is an ATS update timestamp, read only as a refresh
 # candidate by `rli.eval.case._refresh_claim` (spec.md §5 amendment
 # 2026-09-10: it counts toward recency only when it coincides with an observed
-# content-hash change).
+# content-hash change). Exception, spec.md §3 amendment 2026-10-07: a value
+# our own captures prove was not a re-publish is ALSO cited as a separate
+# `first_published` claim (`rli.eval.ashby_first_publish`).
 CLAIM_LAST_PUBLISHED = "last_published"
 # A `first_published` claim whose stated date is LATER than our own
 # `first_observed` for the posting. It cannot be the first publication — we

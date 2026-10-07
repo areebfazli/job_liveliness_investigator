@@ -419,6 +419,12 @@ class PolicyThresholds(BaseModel):
     # implementation detail; whether it changes the action is not.
     refresh_match_days: int = Field(3, ge=0)
     negative_event_window_days: int = Field(180, ge=1)
+    # `ashby_first_seen_max_lag_days` — spec.md §3 amendment 2026-10-07: the
+    # longest gap between an Ashby `publishedAt` and our first sighting for
+    # the date to count as the first publication. Consumed upstream, in
+    # `rli.eval.ashby_first_publish`, and part of `fingerprint()` for the same
+    # reason as the two above.
+    ashby_first_seen_max_lag_days: int = Field(2, ge=0)
 
     frozen_at: datetime | None = None
 
@@ -457,6 +463,11 @@ class PolicyThresholds(BaseModel):
                 if policy.negative_event_window_days is not None
                 else thresholds.negative_event_window_days
             ),
+            ashby_first_seen_max_lag_days=(
+                policy.ashby_first_seen_max_lag_days
+                if policy.ashby_first_seen_max_lag_days is not None
+                else thresholds.ashby_first_seen_max_lag_days
+            ),
             frozen_at=policy.frozen_at,
         )
 
@@ -493,6 +504,7 @@ class PolicyThresholds(BaseModel):
                 "recheck_cap_days",
                 "refresh_match_days",
                 "negative_event_window_days",
+                "ashby_first_seen_max_lag_days",
             )
         )
 

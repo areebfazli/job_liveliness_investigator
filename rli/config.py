@@ -102,6 +102,13 @@ class Thresholds(BaseModel):
     # to 3 for the same reason the field above does.
     refresh_match_days: int = Field(3, ge=0)
 
+    # spec.md §3 amendment 2026-10-07: an Ashby `publishedAt` ("last
+    # published") counts as the first publication only when the job was
+    # absent from an earlier own capture and first seen at most this many
+    # days after the stated date (`rli.eval.ashby_first_publish`). Defaults
+    # to 2 for the same reason the fields above do.
+    ashby_first_seen_max_lag_days: int = Field(2, ge=0)
+
 
 class Matching(BaseModel):
     """`[matching]` — repost/version matching knobs (spec.md §4).
@@ -405,6 +412,9 @@ class Policy(BaseModel):
     # `policy_version()`. Both are part of that fingerprint.
     refresh_match_days: int | None = Field(None, ge=0)
     negative_event_window_days: int | None = Field(None, ge=1)
+    # Applied upstream too (`rli.eval.ashby_first_publish`, reached from
+    # `rli.eval.case` and `rli.replay.build`), resolved the same way.
+    ashby_first_seen_max_lag_days: int | None = Field(None, ge=0)
 
     @field_validator("frozen_at")
     @classmethod

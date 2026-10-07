@@ -93,7 +93,8 @@ backdated publish claim from it would be the single most damaging thing this
 module could do. What it DOES get, since schema version 4, is the publish
 evidence our own collection really held at `T` (`capture_date_claims`): the
 ATS-stated `first_published` / `updated_at` (Greenhouse) and `last_published`
-(Ashby `publishedAt`, a refresh candidate only, never first-publish evidence)
+(Ashby `publishedAt`, a refresh candidate, and first-publish evidence only
+under spec.md §3 amendment 2026-10-07 — `rli.eval.ashby_first_publish`)
 our daily board captures recorded, available from the earliest own capture at
 or before `T` that carried the value, and a Lever job page's JSON-LD
 `datePosted`,
@@ -268,6 +269,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict
 
 from rli.config import Config
+from rli.eval.ashby_first_publish import ashby_first_publish_claim
 from rli.eval.baseline import HoldoutSplitRequestedError, load_split_map
 from rli.eval.case import CaseState, build_case_state, extend_case_state, guard_first_published
 from rli.eval.runner import ProbeRunner, Run, config_hash, decide_and_finish, open_probe_runner
@@ -276,6 +278,7 @@ from rli.history.closures import Capture, load_captures
 from rli.models.probe import ProbeResult
 from rli.models.time import ensure_aware, now_utc, parse_utc, to_utc_z
 from rli.net import hash_args
+from rli.policy.action import PolicyThresholds
 from rli.policy.inputs import (
     CLAIM_BOARD_ABSENT,
     CLAIM_FIRST_PUBLISHED,
@@ -551,7 +554,11 @@ def _capture_dated_claim(
 
 
 def capture_date_claims(
-    conn: sqlite3.Connection, posting_id: str, replay_at: datetime
+    conn: sqlite3.Connection,
+    posting_id: str,
+    replay_at: datetime,
+    *,
+    cfg: Config | PolicyThresholds | None = None,
 ) -> list[ProbeClaim]:
     """Publish evidence our OWN collection already held at `T`.
 
@@ -564,9 +571,16 @@ def capture_date_claims(
       (`_capture_dated_claim`).
     * `last_published` (`ats_native`) — Ashby `publishedAt`, stored in
       `board_snapshot_jobs.last_published` (schema v5) and cited the same
-      way. Ashby documents it as "when the job was LAST published", so it is
-      never a `first_published` claim: `rli.eval.case._refresh_claim` reads
-      it only as a refresh candidate.
+      way. Ashby documents it as "when the job was LAST published", so on its
+      own it is never a `first_published` claim: `rli.eval.case._refresh_claim`
+      reads it as a refresh candidate.
+    * `first_published` (`ats_native`) inferred from an Ashby
+      `last_published` value — spec.md §3 amendment 2026-10-07: the job was
+      absent from the last complete own capture before its first sighting,
+      and the value lies between that capture and the first sighting, at
+      most `ashby_first_seen_max_lag_days` (from `cfg`; the project config
+      when None) before it. Available from the earliest own capture at or
+      before `T` that carried the value (`rli.eval.ashby_first_publish`).
     * `first_published` (`page_structured`) — the JSON-LD `datePosted` read
       once from the posting's job page (Lever; `rli.snapshots.page_dates`),
       with `available_at` = that page fetch's time, and only when it is at or
@@ -597,6 +611,7 @@ def capture_date_claims(
         return []
     stamp = to_utc_z(replay_at)
     company_id = str(row["company_id"])
+    windows = load_stamped_windows(conn)
     claims: list[ProbeClaim] = []
 
     if row["ats_job_id"] is not None:
@@ -627,6 +642,19 @@ def capture_date_claims(
             )
             if claim is not None:
                 claims.append(claim)
+        if row["ats"] == "ashby":
+            inferred = ashby_first_publish_claim(
+                conn,
+                ats=row["ats"],
+                company_id=company_id,
+                job_id=job_id,
+                first_observed=_first_seen_at(row, replay_at),
+                as_of=replay_at,
+                max_lag_days=PolicyThresholds.coerce(cfg).ashby_first_seen_max_lag_days,
+                windows=windows,
+            )
+            if inferred is not None:
+                claims.append(inferred)
 
     page = conn.execute(
         """
@@ -656,9 +684,7 @@ def capture_date_claims(
         )
     # A first sighting stamped inside a pre-fix snapshot run window is too
     # early by up to the run's length (rli.snapshots.run_windows.guard_bound).
-    return guard_first_published(
-        claims, guard_bound(_first_seen_at(row, replay_at), load_stamped_windows(conn))
-    )
+    return guard_first_published(claims, guard_bound(_first_seen_at(row, replay_at), windows))
 
 
 def _first_seen_at(row: sqlite3.Row, replay_at: datetime) -> datetime | None:
@@ -1615,7 +1641,7 @@ def build_dataset(
             # Same record, same delivery path, same gate: see
             # `capture_date_claims`. `observable` keeps meaning "a board state
             # is observable", so it is computed from the state claims alone.
-            dated = capture_date_claims(conn, plan.posting_id, replay_at)
+            dated = capture_date_claims(conn, plan.posting_id, replay_at, cfg=cfg)
             store.save(
                 conn,
                 dataset_id=dataset_id,

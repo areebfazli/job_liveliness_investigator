@@ -142,6 +142,17 @@ Use the normalized company website domain as `company_id`; store ATS board/tenan
 
 Start with Greenhouse, Ashby, Lever, JSON-LD, and Wayback. Add ATS adapters only when the coverage audit justifies them.
 
+#### Amendment 2026-10-07 (Ashby publish dates)
+
+Ashby documents `publishedAt` as "when the job was last published" ([Ashby Public Job Postings API](https://developers.ashbyhq.com/docs/public-job-posting-api)): a re-publish moves it, so on its own it is not a first-publication date. Since the 2026-10-06 correction the code stores and cites it as `last_published`, never as `first_published`. The Ashby line above is kept verbatim as **before**; the version below is **after** and is what the code implements from this date.
+
+| Rule | Before | After |
+|---|---|---|
+| Ashby `publishedAt` | documented public API; `publishedAt` → `ats_native` | documented public API; `publishedAt` is the **last** publish date → `ats_native` `last_published`: a refresh candidate under §5 (it counts toward recency only when it coincides with an observed content-hash change), never first-publish evidence on its own |
+| Ashby first publish (new row) | — | an Ashby `publishedAt` value `v` is also an `ats_native` `first_published` claim when (1) our own collection captured the company's board before the posting's first own sighting `first_observed`, and the last complete own capture before it (time `t_absent`) did not list the job — archive captures never count, and a failed or partial capture is a coverage gap, not an absence; (2) `t_absent < v <= first_observed`, with the first-published guard's pre-fix snapshot run-window slack on `first_observed`, and an absence stamped inside a pre-fix run window taken at that window's end; and (3) `first_observed − v <= ashby_first_seen_max_lag_days` (config, initially 2). `v` may come from any own capture that carried it; `source_event_at = v`, and `available_at` is the earliest own capture at or before `T` that carried `v`, never earlier. Every other Ashby posting keeps `last_published` only. Greenhouse and Lever are unchanged. |
+
+A job absent from our earlier capture and first seen shortly after its stated publish time cannot have been published earlier and re-published in between, so its last publication is its first. A later re-publish changes the value, so an unchanged early value proves no re-publish happened in between, and a later value never changes what an earlier `T` sees.
+
 ---
 
 ## 4. Evidence Collection and Agent Loop
@@ -311,6 +322,17 @@ otherwise                                          → quick_apply
 ```
 
 The new row sits after the recency `apply_now` row so a recent role never needs the probe. `corroborating_hiring_signal` keeps its single source (`team_signal`, first-party board history) and its cost tier. The deterministic rules baseline (System B) is re-versioned to route `team_signal` whenever this row is reachable, so A, B and C are compared under the same table.
+
+#### Amendment 2026-10-07 (Ashby publish dates in recency, before freeze)
+
+§3's amendment of the same date changes what counts as an ATS first publish for Ashby. The two 2026-09-10 rows that name it are kept verbatim as **before**; the versions below are **after** and are what the code implements from this date. The action table itself is unchanged.
+
+| Rule | Before | After |
+|---|---|---|
+| `recent` | latest of first publish **or** an ATS `updated_at` that coincides with an observed content-hash change, ≤ 30 days ago | latest of first publish (for Ashby, only a `publishedAt` that qualifies under §3's amendment 2026-10-07) **or** an ATS `updated_at` or Ashby `publishedAt` (last published) that coincides with an observed content-hash change, ≤ 30 days ago |
+| `long-lived` | days since the earliest of ATS first publish / earliest archive capture / own `first_observed` ≥ 180 | days since the earliest of ATS first publish (for Ashby, only a qualifying `publishedAt`) / earliest archive capture / own `first_observed` ≥ 180 |
+
+The new threshold `ashby_first_seen_max_lag_days` lives in `config.toml` and is frozen with the rest of the policy.
 
 ### Outcome data
 

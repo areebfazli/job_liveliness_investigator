@@ -160,7 +160,12 @@ the job was LAST published", so it is not first-publish evidence (it arrives
 as a `last_published` claim, never `first_published`); a re-publish is an
 update of the posting, so it is a refresh CANDIDATE exactly like Greenhouse's
 `updated_at` — corroborated by an observed content-hash change it counts, on
-its own it never makes an old posting recent.
+its own it never makes an old posting recent. The one exception (spec.md §3
+amendment 2026-10-07, `rli.eval.ashby_first_publish`): a value our own
+captures show could not have been a re-publish — the job was absent from the
+last complete own capture before its first sighting, and the value lies
+between the two, within `ashby_first_seen_max_lag_days` of the sighting —
+is ALSO cited as a `first_published` claim.
 
 When several `updated_at` claims match, ONE claim is emitted, for the LATEST
 of them: the question the policy asks is "when did this posting last show a
@@ -345,6 +350,7 @@ from typing import Any, NamedTuple
 from pydantic import BaseModel, ConfigDict
 
 from rli.config import Config
+from rli.eval.ashby_first_publish import ASHBY_FIRST_PUBLISH_PROBE, ashby_first_publish_claim
 from rli.eval.runner import STEP_PROBE_SKIPPED, ProbeRunner
 from rli.history.features import PostingHistoryFeatures, posting_features
 from rli.models.case_file import CaseFile
@@ -896,6 +902,19 @@ def _refresh_claim(
     )
 
 
+def _already_cited(evidence: Sequence[EvidenceItem], claim: ProbeClaim) -> bool:
+    """Whether `evidence` already holds this very claim (same type, source,
+    dates) — e.g. delivered by the replay environment."""
+    return any(
+        item.claim_type == claim.claim_type
+        and item.source_quality == claim.source_quality
+        and item.value == claim.value
+        and item.source_event_at == claim.source_event_at
+        and item.available_at == claim.available_at
+        for item in evidence
+    )
+
+
 # ---------------------------------------------------------------------------
 # build_case_state
 # ---------------------------------------------------------------------------
@@ -942,7 +961,8 @@ def build_case_state(
     # The first-published guard's bound: our first sighting, moved to the end
     # of a pre-fix snapshot run window when the sighting was stamped inside
     # one (rli.snapshots.run_windows.guard_bound).
-    guard_first_seen = guard_bound(_first_observed(collected_row), load_stamped_windows(conn))
+    windows = load_stamped_windows(conn)
+    guard_first_seen = guard_bound(_first_observed(collected_row), windows)
     # `probes.save_evidence`, never `probes.run.save_evidence`: the runner's
     # method is the single choke point the point-in-time gate hangs off
     # (`rli.eval.runner.ProbeRunner.save_evidence`, overridden by
@@ -1016,6 +1036,30 @@ def build_case_state(
             claims=guard_first_published(extra_claims, guard_first_seen),
             posting_id=evidence_posting_id,
         )
+
+    # -- Ashby first publication (spec.md §3 amendment 2026-10-07) ---------
+    # An Ashby `last_published` value counts as the first publication when the
+    # job was absent from the last complete own capture before its first
+    # sighting and first seen within `ashby_first_seen_max_lag_days` of the
+    # stated date (`rli.eval.ashby_first_publish`). Read from own captures at
+    # or before the run clock, so live and replay compute the same claim. In
+    # replay the builder already delivered it inside the archive-state record
+    # (`rli.replay.build.capture_date_claims`); it is then not cited twice.
+    if collected_row is not None and collected_row["ats"] == "ashby":
+        inferred = ashby_first_publish_claim(
+            conn,
+            ats=collected_row["ats"],
+            company_id=collected_row["company_id"],
+            job_id=collected_row["ats_job_id"],
+            first_observed=_first_observed(collected_row),
+            as_of=now,
+            max_lag_days=PolicyThresholds.coerce(cfg).ashby_first_seen_max_lag_days,
+            windows=windows,
+        )
+        if inferred is not None and not _already_cited(evidence, inferred):
+            evidence += probes.save_evidence(
+                probe=ASHBY_FIRST_PUBLISH_PROBE, claims=[inferred], posting_id=evidence_posting_id
+            )
 
     # -- the refresh match (module docstring: "The refresh match") --------
     # Computed ONCE, here, because only the always-run `resolve_posting`
