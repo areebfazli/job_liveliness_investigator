@@ -138,6 +138,18 @@ def test_shift_moves_grid_points_out_of_pre_fix_windows() -> None:
     )
 
 
+def test_shift_chains_through_back_to_back_windows() -> None:
+    """A point moved to one window's end must not land at the start of the next."""
+    start = datetime(2026, 9, 7, 17, tzinfo=UTC)
+    first = RunWindow(start, start + 6 * H)
+    second = RunWindow(start + 6 * H, start + 30 * H)
+    times = [start + H, start + 6 * H, start + 2 * D]
+    assert shift_out_of_stamped_windows(times, [first, second]) == (
+        start + 30 * H,
+        start + 2 * D,
+    )
+
+
 def test_guard_allows_a_first_publish_up_to_the_run_end() -> None:
     """M2: a first sighting stamped at a long run's START is too early."""
     start = datetime(2026, 10, 1, 13, 37, 21, tzinfo=UTC)

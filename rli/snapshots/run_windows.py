@@ -120,11 +120,16 @@ def window_containing(windows: Sequence[RunWindow], moment: datetime) -> RunWind
 def shift_out_of_stamped_windows(
     times: Iterable[datetime], windows: Sequence[RunWindow]
 ) -> tuple[datetime, ...]:
-    """Move every time inside a pre-fix window to the window's end; dedupe, keep order."""
+    """Move every time inside a pre-fix window to the window's end; dedupe, keep order.
+
+    Windows can be back to back (a fallback window ends where the next batch's
+    begins), so a moved time is checked again until no window contains it.
+    """
     shifted: list[datetime] = []
     for moment in times:
-        window = window_containing(windows, moment)
-        value = window.finished_at if window is not None else moment
+        value = moment
+        while (window := window_containing(windows, value)) is not None:
+            value = window.finished_at
         if value not in shifted:
             shifted.append(value)
     return tuple(sorted(shifted))
