@@ -2,6 +2,11 @@
 
 > **Is this job worth applying to right now, and what should I do next?**
 
+**Status: research project, concluded 2026-10-08.** The system is built and
+evaluated. The honest result is that it works as engineered but the public
+signals it relies on are too weak to give clearly useful advice. The findings
+are below; daily collection has been stopped.
+
 ## What it is
 
 Many job postings online are not what they seem. Some were filled months ago
@@ -55,44 +60,72 @@ answers as the full system (A) while running fewer expensive checks than the
 rules (B), and whether the LLM adds anything over the same controller without
 it (R).
 
-## Key numbers
+## Findings
 
-Status as of 2026-10-07.
-
-**Data collected**
+**Data collected** (2026-09-07 to 2026-10-08)
 
 | | |
 |---|---|
-| Companies tracked | 351 |
-| Job postings seen | 39,696 |
-| Posting closures observed | ~21,000 |
-| Days of own daily collection | 23 (since 2026-09-07) |
-| Wayback board captures | 1,452 |
-| Dated company events | 773 |
+| Companies tracked (Greenhouse, Ashby, Lever) | 351 |
+| Job postings seen | 40,846 |
+| Posting closures observed (as date ranges) | 24,494 |
+| Days of own collection | 27 |
+| Wayback board captures / repost links / dated company events | 1,452 / 2,348 / 773 |
 
-**Evaluation status: no valid result yet.** The first full evaluation
-(2026-09-30) reported that the agent passed its gate. Two independent reviews
-then found that result does not hold:
+**1. A leak-checked evaluation was built and passes.** Each test case is a job
+at a past date, and every system may only see evidence available on that date.
+Final test sets (2026-10-08): `dev-7d-v4` (330 jobs, 196 companies, 8,891 cases)
+and `company-7d-v4` (330 jobs, 64 different companies, 1,452 cases). Both meet the
+size targets, pass the leak check, and keep the held-back test companies out.
+Reports: `reports/evaluation.md`, `reports/evaluation_company_split.md`.
 
-| Finding | What it means |
+**2. The LLM agent adds nothing.** The same controller without the LLM (system R)
+reproduced the agent's checks and answers on 10,587 of 10,588 cases. R makes the
+same decisions as the full system while running 5–31% fewer expensive checks
+than the hand-written rules (B). Following the spec, the simpler system (R) is the one to keep.
+
+**3. Most answers fall back to `quick_apply`.** On recent cases, 85–95% of the
+evidence is weak, so `apply_now` is only 3–6% of answers:
+
+| Recent cases | apply_now | quick_apply | wait | skip |
+|---|---|---|---|---|
+| Time split (525) | 16 | 338 | 9 | 162 |
+| Company split (1,447) | 85 | 1,228 | 50 | 84 |
+
+The main reason is missing publish dates: dates were only saved from 2026-10-04,
+and older jobs have no dated history.
+
+**4. The signals barely predict whether a job is a real, active hire.** A pilot
+(branch `pilot/wayback-job-pages`) pulled a year of archived job pages for 20
+companies and tested whether a job closes within 60 days (AUC: 0.5 = coin flip):
+
+| Predictor | AUC |
 |---|---|
-| A no-LLM run of the same controller reproduced the agent on 10,587 of 10,588 cases | The savings came from the controller's rules, not the LLM. The agent is not shown to add anything. |
-| Only 46 of 7,618 time-split cases (0.6%) depend on any probe result | The 100% agreement with the full system was close to automatic. |
-| 74 held-back test companies (2,000 cases) were also in the time split's tuning data | The company-split result is not an independent test. |
-| Some evidence was stamped earlier than it was fetched (by up to ~18 h) | The "0 leaks" result was wrong. The leak checker now catches this, and the old datasets fail it. |
-| Ashby's date is "last published", not "first published" | Re-posted jobs looked new. |
-| 286 postings were scored, not 300 | The time split misses its 300-posting target. |
-| Every strong-evidence case sits at the moment the dataset was built | There is no real history of strong evidence yet. Only 0.8% of time-split cases had a first-publish date. |
+| Job age alone | 0.49–0.55 |
+| Age + company habits + reposts + team hiring | 0.53–0.67, unstable |
 
-All of these are fixed in the code (2026-10-06/07). The datasets will be rebuilt
-on correctly dated data and A, B, C and R rerun. The old reports in `reports/`
-are kept for the record but should not be cited.
+Only company habits help, and only between companies. Reposted jobs close at
+about the same rate as others once age is accounted for.
 
-**What is still unproven**
+**5. Archived job pages fix dates, not signal.** Archived Greenhouse pages give
+the real first-publish date (342 of 342 matched) and would turn about half the
+affected time-split cases strong, but they add no predictive power.
 
-- **Whether the advice is right.** No real application outcomes are logged yet, so **product value is unproven**.
-- **Whether the LLM adds value** over the same controller without it (R). If it does not, the spec says to prefer the simpler system.
-- **The policy is not frozen yet.** The time-based held-out test split has not been read.
+**6. Proving the advice would need real outcomes at scale.** Detecting a
+difference in reply rates between `apply_now` and `quick_apply` needs roughly
+1,000–3,000 logged applications from 10+ people. None were logged, so
+**product value is unproven**.
+
+**Mistakes found and fixed along the way.** Two independent reviews found that an
+earlier evaluation (2026-09-30) overstated the agent and leaked data: evidence
+stamped hours before it was fetched, Ashby's "last published" date read as
+"first published", a company split that overlapped the time split, and an
+agreement score that was close to automatic. All were fixed, the leak checker was
+extended to catch them, and the test sets were rebuilt. Details: `PROGRESS.md`.
+
+**What would be worth building instead.** An alert for brand-new postings (most
+applications go to jobs from the last 48 hours), and simple company facts such as
+"this company keeps 35% of its jobs open over 90 days", without prediction claims.
 
 ## Run it yourself
 
