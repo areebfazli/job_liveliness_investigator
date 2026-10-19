@@ -2,15 +2,30 @@
 
 Three demo scripts per spec.md §8 Phase 5 / PLAN.md M7: a clear case, an
 ambiguous case, and a failure/recovery case. Every command below was
-actually run against a scratch database (never `data/rli.db`) while writing
-this document; output shown is real output, lightly trimmed for length,
-not a mockup. Live-data demos (1) will drift over time as real postings
-open/close — the shapes described are what to expect, not a guarantee of
-the exact values shown.
+re-run on 2026-10-19 (schema v7) against a scratch database, never
+`data/rli.db`; output shown is real output, lightly trimmed for length, not
+a mockup. Live-data demos (1, 3) will drift over time as real postings
+open/close and the board grows or shrinks (for example the "days ago" and
+"N job(s) listed" figures) — the shapes described are what to expect, not a
+guarantee of the exact values shown.
 
-All commands assume you are in the repo root and have run `uv sync`. Use a
-scratch path for `--db` / `RLI_DB_PATH`, e.g. under `/tmp`, so nothing here
-touches `data/rli.db`.
+All commands assume you are in the repo root and have run `uv sync`. Define
+the scratch database once as `$DB`, under `data/scratch/` (git-ignored
+scratch space), so nothing here touches `data/rli.db`. Delete it when done.
+
+**Systems.** `--system` / `"system"` accepts:
+
+- `A` — full probes: every eligible probe, then the frozen policy.
+- `B` — deterministic rules: a fixed probe set chosen by the rule router.
+- `R` — System C's controller with no LLM: every eligible probe, in rank
+  order. The "no-agent" ablation of C.
+- `C` — the bounded LLM agent (the API default when `system` is omitted).
+  It needs an OpenAI-compatible LLM endpoint configured in `config.toml`
+  `[llm]` (the default is Mistral, `base_url = https://api.mistral.ai/v1`,
+  `model_id = ministral-8b-latest`, key read from the `MISTRAL_API_KEY`
+  environment variable, e.g. set in `.env`). Through the API, if no endpoint
+  is usable, the request falls back to System B and the response carries
+  `degraded: true` (demo 3b). These demos never call System C live.
 
 **If you have set `RLI_API_TOKEN`,** every `curl` call below against
 `POST /investigate` or `GET /watch*` needs an extra header:
@@ -20,8 +35,10 @@ is the default for a scratch demo database; add the header to each call if
 you have configured a token.
 
 ```bash
-export DB=/tmp/rli-demo.db
+mkdir -p data/scratch/demo
+export DB=data/scratch/demo/demo.db
 uv run rli init-db --path "$DB"
+# Initialized database at data/scratch/demo/demo.db
 ```
 
 ## 1. Clear case: a healthy, recently-posted, still-open role
@@ -32,14 +49,14 @@ directly:
 
 ```bash
 grep greenhouse scripts/targets.csv | head -3
-# Affirm,affirm.com,greenhouse,affirm,...
+# Affirm,affirm.com,greenhouse,affirm,204,2026-09-07T03:22:59.492376+00:00
 curl -s "https://boards-api.greenhouse.io/v1/boards/affirm/jobs?content=false" \
   | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['jobs'][0])"
 ```
 
 This demo used **Affirm** (`tenant=affirm`), job id `7850544003`
-("Administrative Assistant IV", first published 2026-08-19, 19 days before
-this demo was run), i.e. the URL
+("Administrative Assistant IV", first published 2026-08-19, 60 days before
+this demo was re-run on 2026-10-19), i.e. the URL
 `https://boards.greenhouse.io/affirm/jobs/7850544003`.
 
 ### CLI form
@@ -48,8 +65,10 @@ this demo was run), i.e. the URL
 uv run rli run --system B --url "https://boards.greenhouse.io/affirm/jobs/7850544003" --db "$DB"
 ```
 
-Actual output (trimmed to the decision; the run also printed 4 evidence
-items, all `source_quality: ats_native`):
+Actual output (trimmed to the decision; stderr first printed
+`run_id=... system=B probes=(none) route=R1_repost_suspicious`, and the run
+returned 4 evidence items, all `source_quality: ats_native`, from
+`resolve_posting` and `board_snapshot`):
 
 ```json
 {
@@ -60,37 +79,55 @@ items, all `source_quality: ats_native`):
   "hypotheses": [],
   "reason": [
     {"text": "The posting was still listed on the company's job board when we checked.", "evidence_ids": ["e1"]},
-    {"text": "The role was first published 19 days ago, according to ats-native evidence.", "evidence_ids": ["e2"]}
+    {"text": "The role was first published 60 days ago, according to ats-native evidence.", "evidence_ids": ["e2"]}
   ],
-  "evidence": ["... 4 items, all ats_native, from resolve_posting + board_snapshot ..."]
+  "evidence": ["... 4 items: posting_state=open, first_published, updated_at, board_present ..."]
 }
 ```
 
 `recommended_action` came out `quick_apply` rather than `apply_now` because
-this scratch database has no board history for Affirm yet (a fresh
-`init-db`, not the long-running snapshot corpus) — System B's `R1` route
-falls through to the policy's default when history-gated inputs are
-`Unknown`, per spec.md §4 ("missing history never means flat hiring"). On a
-database with real running history, `evidence_quality: strong` +
-`posting_state: open` + a genuinely recent, uncontested publish date can
-instead reach `apply_now`. Either way, the **shape** is what to expect for
-a clear case: `posting_state: open`, `evidence_quality: strong`, at least
-one `reason` citing a `resolve_posting` evidence item, and an action of
-`apply_now` or `quick_apply` — never `wait` or `skip`.
+a 60-day-old publish date is not "recent" under the policy's recency
+threshold, and `apply_now` needs recent primary publish evidence (or a
+corroborating hiring signal) on top of strong evidence — see the table in
+`rli/policy/action.py`. This scratch database also has no board history for
+Affirm (a fresh `init-db`, not the long-running snapshot corpus), and
+history-gated inputs fall to `Unknown` rather than "flat hiring" (spec.md
+§4: missing history never means flat hiring); that is why the router's
+repost-suspicion route ran no extra probes (`probes=(none)`). Pick a
+posting published within the last couple of weeks and the same command can
+reach `apply_now`. Either way, the **shape** to expect for a clear case is
+`posting_state: open`, `evidence_quality: strong`, at least one `reason`
+citing a `resolve_posting` evidence item, and an action of `apply_now` or
+`quick_apply` — never `wait` or `skip`.
+
+System R gives the same decision here (its stderr line is
+`run_id=... system=R probes=(none)`; no further probe was eligible):
+
+```bash
+uv run rli run --system R --url "https://boards.greenhouse.io/affirm/jobs/7850544003" --db "$DB"
+```
+
+**Publish dates.** The `first_published` evidence is ATS-native. For Ashby
+boards, `publishedAt` counts as a first-publish date only when the job was
+absent from our previous own capture of the board and was first seen within
+2 days of it (spec amendment 2026-10-07); otherwise it is not treated as
+first-publish evidence. Greenhouse's `first_published` is used directly.
 
 ### API form
 
 ```bash
-RLI_DB_PATH="$DB" RLI_WATCH_STORE_PATH=/tmp/rli-demo-watches.json uv run python -m rli.api &
-sleep 2
+RLI_DB_PATH="$DB" RLI_WATCH_STORE_PATH=data/scratch/demo/watches.json \
+  uv run python -m rli.api &
+sleep 4
 curl -s -X POST http://127.0.0.1:8000/investigate \
   -H 'Content-Type: application/json' \
-  -d '{"url": "https://boards.greenhouse.io/affirm/jobs/7850544003", "system": "B"}'
+  -d '{"url": "https://boards.greenhouse.io/affirm/jobs/7850544003", "system": "R"}'
 kill %1
 ```
 
-Actual output (same decision fields as the CLI form, plus the API's own
-envelope fields):
+(`"system"` may be `"A"`, `"B"`, `"R"` or `"C"`.) Actual output (same
+decision fields as the CLI form, plus the API's own envelope fields; the
+server logs a warning at startup when `RLI_API_TOKEN` is unset):
 
 ```json
 {
@@ -101,8 +138,8 @@ envelope fields):
   "hypotheses": [],
   "reason": ["... same two reasons as above ..."],
   "evidence": ["... same 4 items ..."],
-  "run_id": "937277da7c3641b0b82f31f4222ae663",
-  "system_used": "B",
+  "run_id": "8b4a51312ff348f2831491393877a9c3",
+  "system_used": "R",
   "degraded": false,
   "degraded_reason": null
 }
@@ -129,7 +166,8 @@ deterministic and reproducible.
 
 ### CLI-equivalent form (direct Python, no server)
 
-Save as `ambiguous_demo.py` and run with `uv run python ambiguous_demo.py`:
+Save as `ambiguous_demo.py` in the repo root and run with `uv run python ambiguous_demo.py`
+(it reuses the scratch directory from the top of this document):
 
 ```python
 from __future__ import annotations
@@ -144,7 +182,7 @@ from rli.config import load_config
 from rli.db import init_db, connect
 from rli.eval.system_b import run_system_b
 
-NOW = datetime(2026, 9, 8, tzinfo=UTC)
+NOW = datetime(2026, 10, 19, tzinfo=UTC)
 JOB_ID, TENANT = "9001", "acme"
 URL = f"https://boards.greenhouse.io/{TENANT}/jobs/{JOB_ID}"
 
@@ -168,8 +206,9 @@ jsonld_html = f"""<html><head><script type="application/ld+json">{
     )
 }</script></head><body>Senior Backend Engineer</body></html>"""
 
-init_db("ambiguous_demo.db")
-conn = connect("ambiguous_demo.db")
+DB_PATH = "data/scratch/demo/ambiguous.db"
+init_db(DB_PATH)
+conn = connect(DB_PATH)
 cfg = load_config()
 
 with respx.mock:
@@ -185,7 +224,7 @@ with respx.mock:
 print(json.dumps(result.decision.model_dump(mode="json"), indent=2, default=str))
 ```
 
-Actual output:
+Actual output (evidence ids/summaries condensed from the full evidence objects):
 
 ```json
 {
@@ -200,8 +239,8 @@ Actual output:
   ],
   "evidence": [
     "e1: resolve_posting/posting_state=open (ats_native)",
-    "e2: resolve_posting/first_published=2026-09-03 (ats_native)",
-    "e3: resolve_posting/first_published=2026-05-11 (page_structured) <- the conflicting date",
+    "e2: resolve_posting/first_published=2026-10-14 (ats_native)",
+    "e3: resolve_posting/first_published=2026-06-21 (page_structured) <- the conflicting date",
     "e4: board_snapshot/board_present=9001 (ats_native)"
   ]
 }
@@ -213,14 +252,16 @@ expected shape for conflicting evidence per spec.md §5's policy table
 
 **Note on hypotheses:** run this same case through System C
 (`uv run rli agent run --url ... --db ...` or `POST /investigate` with
-`system: "C"`) and, with a reachable LLM endpoint configured (a local
-Ollama or any other OpenAI-compatible server — see the README's "LLM
-setup"), the investigator may populate `hypotheses` with plausible
-interpretations of the conflict (e.g. "the career page may show a different
-posting date than the ATS record"). **With no LLM endpoint reachable,
-`hypotheses` will always be empty** — this is an honest, current limitation
-of this environment (see the main README's Limitations section), not a bug
-in the ambiguous case itself.
+`system: "C"`) and, with the `[llm]` endpoint reachable and its key set
+(default: Mistral `ministral-8b-latest`, `MISTRAL_API_KEY`; see the
+README's "LLM setup"), the investigator may populate `hypotheses` with
+plausible interpretations of the conflict (e.g. "the career page may show a
+different posting date than the ATS record"). Systems A, B and R never
+populate `hypotheses`, and neither does C when the LLM is unavailable: through
+the API it falls back to B (`degraded: true`, demo 3b); through
+`rli agent run` the decision comes from the deterministic frozen policy with
+fallback reasons and a stderr warning that the model calls failed. This
+demo does not call System C.
 
 ### API form
 
@@ -241,7 +282,7 @@ from fastapi.testclient import TestClient
 
 from rli.api.app import create_app
 
-NOW = datetime(2026, 9, 8, tzinfo=UTC)
+NOW = datetime(2026, 10, 19, tzinfo=UTC)
 JOB_ID, TENANT = "9002", "acme"
 URL = f"https://boards.greenhouse.io/{TENANT}/jobs/{JOB_ID}"
 
@@ -265,7 +306,7 @@ jsonld_html = f"""<html><head><script type="application/ld+json">{
     )
 }</script></head><body>Senior Backend Engineer</body></html>"""
 
-app = create_app(db_path="ambiguous_demo_api.db", watch_store_path="ambiguous_demo_watches.json")
+app = create_app(db_path="data/scratch/demo/api.db", watch_store_path="data/scratch/demo/watches.json")
 
 with TestClient(app) as client, respx.mock:
     respx.get(f"https://boards-api.greenhouse.io/v1/boards/{TENANT}/jobs/{JOB_ID}").mock(
@@ -292,19 +333,19 @@ All three sub-cases below return a well-formed HTTP response — none of them
 crash the server. Start the API once for all three:
 
 ```bash
-RLI_DB_PATH=/tmp/rli-demo-fail.db RLI_WATCH_STORE_PATH=/tmp/rli-demo-fail-watches.json \
+RLI_DB_PATH="$DB" RLI_WATCH_STORE_PATH=data/scratch/demo/watches.json \
   uv run python -m rli.api &
-sleep 2
+sleep 4
 ```
 
 ### 3a. A nonexistent Greenhouse job id (404 from the ATS)
 
 ```bash
-curl -s -o /tmp/resp.json -w "STATUS:%{http_code}\n" \
+curl -s -o data/scratch/demo/resp.json -w "STATUS:%{http_code}\n" \
   -X POST http://127.0.0.1:8000/investigate \
   -H 'Content-Type: application/json' \
   -d '{"url": "https://boards.greenhouse.io/affirm/jobs/1", "system": "B"}'
-cat /tmp/resp.json
+cat data/scratch/demo/resp.json
 ```
 
 Actual result: **`STATUS:200`** (not an error — a missing job id is a
@@ -323,7 +364,7 @@ finding, not a fault):
   ],
   "evidence": [
     {"id": "e1", "probe": "resolve_posting", "claim_type": "posting_state", "value": "closed", "source_quality": "ats_native"},
-    {"id": "e2", "probe": "board_snapshot", "claim_type": "board_absent", "value": "1", "raw_excerpt": "205 job(s) listed, none with id 1", "source_quality": "ats_native"}
+    {"id": "e2", "probe": "board_snapshot", "claim_type": "board_absent", "value": "1", "raw_excerpt": "214 job(s) listed, none with id 1", "source_quality": "ats_native"}
   ],
   "system_used": "B",
   "degraded": false,
@@ -343,19 +384,19 @@ uv run rli run --system B --url "https://boards.greenhouse.io/affirm/jobs/1" --d
 # stderr: run_id=... system=B probes=(none) route=R0_terminal
 ```
 
-### 3b. System C requested (or defaulted) with no reachable LLM endpoint
+### 3b. System C requested (or defaulted) with no usable LLM endpoint
 
 ```bash
-# With nothing serving [llm].base_url (no `ollama serve`, no API key for a
-# remote endpoint), System C is unavailable and the API says so.
+# MISTRAL_API_KEY is unset and [llm].base_url is not a local endpoint, so
+# System C is unavailable and the API says so.
 curl -s -X POST http://127.0.0.1:8000/investigate \
   -H 'Content-Type: application/json' \
   -d '{"url": "https://boards.greenhouse.io/affirm/jobs/7850544003"}'
 ```
 
 (`system` is omitted, so it defaults to `"C"`.) Actual result:
-**`STATUS:200`**, deterministic and offline-reproducible (no live network
-flakiness — this path never reaches a model):
+**`STATUS:200`**, and no LLM call is made (the endpoint check fails before
+any request is sent):
 
 ```json
 {
@@ -365,18 +406,18 @@ flakiness — this path never reaches a model):
   "...": "... full spec.md §1 decision fields ...",
   "system_used": "B",
   "degraded": true,
-  "degraded_reason": "LLM endpoint http://localhost:11434/v1 is not reachable: ...; ran System B instead of System C"
+  "degraded_reason": "no LLM API key: $MISTRAL_API_KEY is unset and [llm].base_url (https://api.mistral.ai/v1) is not local; ran System B instead of System C"
 }
 ```
 
 `system_used: "B"` and `degraded: true` confirm the fallback actually
 happened rather than silently returning a System-C-shaped but empty
-response. The exact `degraded_reason` text is whatever the endpoint probe
-reported — an unreachable endpoint, or a missing API key for a non-local
-`base_url`. `GET /health` reports the CONFIGURED endpoint ahead of time
-without probing it (so it always answers instantly):
-`{"status": "ok", "llm_configured": true, "llm_base_url":
-"http://localhost:11434/v1", "llm_model_id": "qwen3:8b"}`.
+response. The exact `degraded_reason` text is whatever the endpoint check
+reported: a missing API key for a non-local `base_url` (as here), or an
+unreachable local endpoint. `GET /health` reports the CONFIGURED endpoint
+ahead of time without probing it (so it always answers instantly):
+`{"status":"ok","llm_configured":false,"llm_base_url":"https://api.mistral.ai/v1","llm_model_id":"ministral-8b-latest"}`
+(`llm_configured` is `true` once the key is set).
 
 ### 3c. A disallowed URL
 
@@ -385,27 +426,28 @@ any network call (`rli.net.check_allowed`), both returning **HTTP 422**:
 
 ```bash
 # http:// instead of https://
-curl -s -o /tmp/resp.json -w "STATUS:%{http_code}\n" \
+curl -s -o data/scratch/demo/resp.json -w "STATUS:%{http_code}\n" \
   -X POST http://127.0.0.1:8000/investigate \
   -H 'Content-Type: application/json' \
   -d '{"url": "http://boards.greenhouse.io/affirm/jobs/7850544003"}'
-cat /tmp/resp.json
+cat data/scratch/demo/resp.json
 # STATUS:422
 # {"detail":"scheme 'http' is not https"}
 
 # IP-literal host instead of a named public host
-curl -s -o /tmp/resp.json -w "STATUS:%{http_code}\n" \
+curl -s -o data/scratch/demo/resp.json -w "STATUS:%{http_code}\n" \
   -X POST http://127.0.0.1:8000/investigate \
   -H 'Content-Type: application/json' \
   -d '{"url": "https://127.0.0.1/jobs/1"}'
-cat /tmp/resp.json
+cat data/scratch/demo/resp.json
 # STATUS:422
 # {"detail":"host is an IP literal (only named public hosts are allowed)"}
 ```
 
 Both are exact, real output from this environment. Stop the demo server
-when done:
+when done, and delete the scratch directory:
 
 ```bash
 kill %1
+rm -rf data/scratch/demo ambiguous_demo.py
 ```

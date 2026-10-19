@@ -2,10 +2,15 @@
 
 > **Is this job worth applying to right now, and what should I do next?**
 
-**Status: research project, concluded 2026-10-08.** The system is built and
-evaluated. The honest result is that it works as engineered but the public
-signals it relies on are too weak to give clearly useful advice. The findings
-are below; daily collection has been stopped.
+**Status: research project, concluded 2026-10-08.**
+
+**At a glance**
+
+- Built an evidence-backed job-posting investigator: 351 companies, 40,846 postings, a month of daily collection, 1,598 tests.
+- Built an LLM agent to choose which checks to run, inside a deterministic controller with budgets, tool allowlists and schema-checked output.
+- Built a leak-checked, point-in-time evaluation and an ablation that removes the LLM.
+- **Result:** the controller without the LLM matched the agent on **10,587 of 10,588 cases**, so the simpler system is the one to ship. Two independent reviews overturned an earlier, over-optimistic evaluation; every issue they found was fixed and the leak checker now catches it.
+- **Product result:** the public signals are too weak to give clearly useful advice (`apply_now` on 3–6% of recent cases; closure prediction barely beats a coin flip). The findings and the reasons are below.
 
 ## What it is
 
@@ -47,18 +52,36 @@ what the evidence shows and how strong that evidence is.
    four answers. The decision is always made by these rules, never by an AI.
 4. **Explain.** The answer comes with reasons that cite the evidence.
 
-There are four ways to choose which probes to run. They are compared in the
-evaluation:
+## Agent engineering and evaluation
 
-- **A: full.** Runs every probe. This is the most thorough and most expensive option, and it is the reference the others are measured against.
-- **B: rules.** A fixed checklist decides which probes to run.
-- **C: agent.** An LLM proposes which probes to run, then writes the explanation. A deterministic controller enforces budgets and allowed tools, and stops once nothing left could change the answer.
-- **R: controller without the LLM.** The same controller as C, but it simply runs every probe that could still change the answer. It makes no AI calls.
+```mermaid
+flowchart LR
+    URL[Job URL] --> AR[Always-run probes<br/>resolve posting, board snapshot]
+    AR --> CTRL{Deterministic controller}
+    INV[LLM investigator<br/>proposes next probe] -->|candidates| CTRL
+    CTRL -->|eligible, in budget,<br/>allow-listed, not repeated| PR[Dynamic probes<br/>reposts, drift, news, team]
+    PR -->|timestamped evidence| CTRL
+    CTRL -->|stop: nothing left<br/>could change the answer| POL[Fixed action policy]
+    POL --> OUT[Answer + reasons<br/>citing evidence]
+    EXP[LLM explanation<br/>citations verified] --> OUT
+```
 
-The question the project answers is whether the agent (C) reaches the same
-answers as the full system (A) while running fewer expensive checks than the
-rules (B), and whether the LLM adds anything over the same controller without
-it (R).
+**How the agent is built**
+
+- **The LLM never decides.** It proposes which probe to run next and drafts the explanation. A fixed policy makes the decision.
+- **A deterministic controller decides what actually runs.** It only allows a probe that could still change the answer, enforces step, token and cost budgets, blocks repeated calls, checks every argument against a schema, and stops when no remaining probe can change the outcome.
+- **Safe tool use.** Every network call goes through a per-probe domain allowlist with SSRF checks. Job and news text reaches the LLM only inside a delimited "untrusted" block, never as instructions.
+- **Checked output.** LLM output must match a Pydantic schema. Every reason must cite evidence IDs that exist and support the claim; unsupported citations are dropped and counted.
+- **Reproducible runs.** Tool calls and LLM answers are cached (LLM cache keyed by model, prompt hash and input hash), so a full evaluation replays offline, with cost tracked per call. A sharded runner ran 10,588 agent cases with 4 parallel workers.
+
+**How it was evaluated**
+
+- **Point-in-time replay.** Each test case is a job at a past date T. Systems see only evidence available at T; live network calls are blocked during replay.
+- **A leak checker** audits every run, including evidence stamped before it was really fetched.
+- **Frozen splits.** A time split and a company split (no shared companies), with held-back test companies excluded from every tuning set.
+- **Four systems compared:** A runs every probe (the reference), B is a hand-written checklist, C is the LLM agent, and R is C's controller with the LLM removed.
+- **Honest metrics.** Agreement is also reported on the cases where a probe could change the answer, because agreement over all cases is close to automatic.
+- **Adversarial review.** Two independent reviews found that an earlier evaluation leaked data and over-credited the agent. Everything they found was fixed and re-verified before the final numbers.
 
 ## Findings
 
@@ -79,10 +102,13 @@ and `company-7d-v4` (330 jobs, 64 different companies, 1,452 cases). Both meet t
 size targets, pass the leak check, and keep the held-back test companies out.
 Reports: `reports/evaluation.md`, `reports/evaluation_company_split.md`.
 
-**2. The LLM agent adds nothing.** The same controller without the LLM (system R)
-reproduced the agent's checks and answers on 10,587 of 10,588 cases. R makes the
-same decisions as the full system while running 5–31% fewer expensive checks
-than the hand-written rules (B). Following the spec, the simpler system (R) is the one to keep.
+**2. The ablation removed the LLM, and nothing changed.** The controller without
+the LLM (system R) reproduced the agent's checks and answers on 10,587 of 10,588
+cases. The value came from the controller's rule "only run a probe that could still
+change the answer", not from the model. R makes the same decisions as the full
+system while running 5–31% fewer expensive checks than the hand-written rules (B).
+So the system to ship is R: same answers, no LLM cost, no model risk. The spec
+required this outcome whenever rules prove equally good.
 
 **3. Most answers fall back to `quick_apply`.** On recent cases, 85–95% of the
 evidence is weak, so `apply_now` is only 3–6% of answers:
@@ -196,9 +222,10 @@ uv run rli replay build --dataset my-set --split dev --split-kind temporal --gri
 uv run rli replay build --dataset my-company-set --split dev --split-kind company --grid-days 7 --exclude-companies-from my-set --db ./data/rli.db
 uv run rli replay run --system A --dataset my-set --db ./data/rli.db
 uv run rli replay run --system B --dataset my-set --db ./data/rli.db
+uv run rli replay run --system R --dataset my-set --db ./data/rli.db   # controller without the LLM
 WORKERS=4 TOTAL_RPM=160 scripts/replay_c_parallel.sh my-set   # agent, 4 workers in parallel
 uv run rli replay check --dataset my-set --db ./data/rli.db   # must report 0 leaks
-uv run rli eval run --dataset my-set --with-c --out reports/evaluation.md --db ./data/rli.db
+uv run rli eval run --dataset my-set --with-c --with-r --out reports/evaluation.md --db ./data/rli.db
 ```
 
 `replay build` is the only replay step that uses the network. Every later step
@@ -228,7 +255,7 @@ uv run pytest -q && uv run ruff check .    # 1,598 tests
 | `PLAN.md` | Build order |
 | `PROGRESS.md` | Running log of status and decisions |
 | `config.toml` | All thresholds, budgets, rate limits and allowlists |
-| `reports/` | Generated evaluation reports |
+| `reports/` | Final evaluation reports (`reports/archive/` holds earlier ones) |
 | `docs/` | Deployment and demo walkthroughs |
 
 ```
